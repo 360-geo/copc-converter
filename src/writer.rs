@@ -64,6 +64,7 @@ pub fn write_copc(
     output_path: &Path,
     builder: &OctreeBuilder,
     node_keys: &[(VoxelKey, usize)],
+    memory_budget: u64,
 ) -> Result<()> {
     let scale_x = builder.scale_x;
     let scale_y = builder.scale_y;
@@ -243,32 +244,56 @@ pub fn write_copc(
         .collect();
 
     info!(
-        "Encoding {} data nodes ({} empty ancestors) in parallel",
+        "Encoding {} data nodes ({} empty ancestors) in batches (budget {} MiB)",
         data_keys.len(),
         ordered_keys.len() - data_keys.len(),
+        memory_budget / 1_048_576,
     );
-    let all_encoded: Vec<Vec<u8>> = data_keys
-        .par_iter()
-        .map(|key| -> Result<Vec<u8>> {
-            let mut pts = builder.read_node(key)?;
-            // Sort by GPS time, then by Morton code as a tiebreaker.
-            pts.sort_unstable_by(|a, b| {
-                a.gps_time.partial_cmp(&b.gps_time)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut raw_bytes =
-                Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
-            for rp in &pts {
-                encode_point_fmt7(rp, &mut raw_bytes);
-            }
-            Ok(raw_bytes)
-        })
-        .collect::<Result<Vec<_>>>()?;
 
-    // Compress all chunks in a single call.
-    compressor
-        .compress_chunks(all_encoded)
-        .context("compress_chunks")?;
+    // Split data_keys into batches whose total uncompressed bytes fit within
+    // memory_budget, then encode+compress each batch before moving to the next.
+    let mut batch_start = 0;
+    while batch_start < data_keys.len() {
+        let mut batch_bytes: u64 = 0;
+        let mut batch_end = batch_start;
+        while batch_end < data_keys.len() {
+            let key = &data_keys[batch_end];
+            let node_bytes =
+                (point_counts.get(key).copied().unwrap_or(0) as u64)
+                * POINT_RECORD_LENGTH as u64;
+            // Always include at least one node per batch to avoid stalling.
+            if batch_end > batch_start && batch_bytes + node_bytes > memory_budget {
+                break;
+            }
+            batch_bytes += node_bytes;
+            batch_end += 1;
+        }
+
+        let batch = &data_keys[batch_start..batch_end];
+        let encoded: Vec<Vec<u8>> = batch
+            .par_iter()
+            .map(|key| -> Result<Vec<u8>> {
+                let mut pts = builder.read_node(key)?;
+                pts.sort_unstable_by(|a, b| {
+                    a.gps_time
+                        .partial_cmp(&b.gps_time)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut raw_bytes =
+                    Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
+                for rp in &pts {
+                    encode_point_fmt7(rp, &mut raw_bytes);
+                }
+                Ok(raw_bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        compressor
+            .compress_chunks(encoded)
+            .context("compress_chunks")?;
+
+        batch_start = batch_end;
+    }
 
     compressor.done().context("compressor done")?;
 

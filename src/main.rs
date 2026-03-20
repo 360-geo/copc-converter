@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     let node_keys = builder.build_node_map(&config)?;
 
     info!("=== Writing COPC file: {:?} ===", args.output);
-    writer::write_copc(&args.output, &builder, &node_keys)?;
+    writer::write_copc(&args.output, &builder, &node_keys, config.memory_budget)?;
 
     builder.cleanup();
     info!("Done.");
