@@ -25,6 +25,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
+/// Task fed into the parallel grid-sampling step: parent key, child keys, and
+/// indexed points (child-index, point).
+type SampleTask = (VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>);
+
+/// Result coming back from parallel grid-sampling: parent key, child keys,
+/// promoted points, and per-child remaining points.
+type SampleResult = (VoxelKey, Vec<VoxelKey>, Vec<RawPoint>, Vec<Vec<RawPoint>>);
+
 // ---------------------------------------------------------------------------
 // Morton code helper (used for spatially coherent traversal order)
 // ---------------------------------------------------------------------------
@@ -603,9 +611,10 @@ impl OctreeBuilder {
 
         let oversized = |k: &VoxelKey| -> bool {
             k.level < max_level
-                && self.node_path(k).metadata().is_ok_and(|m| {
-                    m.len() as usize / RawPoint::BYTE_SIZE > MAX_NODE_POINTS
-                })
+                && self
+                    .node_path(k)
+                    .metadata()
+                    .is_ok_and(|m| m.len() as usize / RawPoint::BYTE_SIZE > MAX_NODE_POINTS)
         };
 
         let mut to_split: Vec<VoxelKey> = self
@@ -762,16 +771,17 @@ impl OctreeBuilder {
             let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
             for k in nodes.keys() {
                 if k.level as u32 == d + 1
-                    && let Some(p) = k.parent() {
-                        parent_children.entry(p).or_default().push(*k);
-                    }
+                    && let Some(p) = k.parent()
+                {
+                    parent_children.entry(p).or_default().push(*k);
+                }
             }
             if parent_children.is_empty() {
                 continue;
             }
 
             // Snapshot children data for parallel processing (immutable borrow of `nodes`).
-            let tasks: Vec<(VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>)> = parent_children
+            let tasks: Vec<SampleTask> = parent_children
                 .into_iter()
                 .map(|(parent, children)| {
                     let all_pts = children
@@ -789,7 +799,7 @@ impl OctreeBuilder {
                 .collect();
 
             // Grid-sample in parallel.
-            let results: Vec<(VoxelKey, Vec<VoxelKey>, Vec<RawPoint>, Vec<Vec<RawPoint>>)> = tasks
+            let results: Vec<SampleResult> = tasks
                 .into_par_iter()
                 .map(|(parent, children, all_pts)| -> Result<_> {
                     if all_pts.is_empty() {
@@ -991,11 +1001,13 @@ impl OctreeBuilder {
         // This prevents zero-point intermediate nodes in the COPC hierarchy
         // (which confuse validators that check point_count > 0 for all entries).
         for ci in 0..n_children {
-            if child_has_pts[ci] && remaining[ci].is_empty()
-                && let Some(pos) = parent_pts.iter().rposition(|(c, _)| *c == ci) {
-                    let (_, p) = parent_pts.remove(pos);
-                    remaining[ci].push(p);
-                }
+            if child_has_pts[ci]
+                && remaining[ci].is_empty()
+                && let Some(pos) = parent_pts.iter().rposition(|(c, _)| *c == ci)
+            {
+                let (_, p) = parent_pts.remove(pos);
+                remaining[ci].push(p);
+            }
         }
 
         let parent_pts = parent_pts.into_iter().map(|(_, p)| p).collect();
@@ -1005,13 +1017,4 @@ impl OctreeBuilder {
     pub fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
-}
-
-/// Sub-sample a point vector to at most `max_count` points using stride sampling.
-pub fn thin_sample(pts: &[RawPoint], max_count: usize) -> Vec<RawPoint> {
-    if pts.len() <= max_count {
-        return pts.to_vec();
-    }
-    let step = pts.len() / max_count;
-    pts.iter().step_by(step).take(max_count).cloned().collect()
 }

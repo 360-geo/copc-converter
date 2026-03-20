@@ -21,73 +21,6 @@ pub struct VoxelKey {
 }
 
 impl VoxelKey {
-    pub fn root() -> Self {
-        VoxelKey {
-            level: 0,
-            x: 0,
-            y: 0,
-            z: 0,
-        }
-    }
-
-    /// Eight children of this node.
-    pub fn children(self) -> [VoxelKey; 8] {
-        let l = self.level + 1;
-        let x2 = self.x * 2;
-        let y2 = self.y * 2;
-        let z2 = self.z * 2;
-        [
-            VoxelKey {
-                level: l,
-                x: x2,
-                y: y2,
-                z: z2,
-            },
-            VoxelKey {
-                level: l,
-                x: x2 + 1,
-                y: y2,
-                z: z2,
-            },
-            VoxelKey {
-                level: l,
-                x: x2,
-                y: y2 + 1,
-                z: z2,
-            },
-            VoxelKey {
-                level: l,
-                x: x2 + 1,
-                y: y2 + 1,
-                z: z2,
-            },
-            VoxelKey {
-                level: l,
-                x: x2,
-                y: y2,
-                z: z2 + 1,
-            },
-            VoxelKey {
-                level: l,
-                x: x2 + 1,
-                y: y2,
-                z: z2 + 1,
-            },
-            VoxelKey {
-                level: l,
-                x: x2,
-                y: y2 + 1,
-                z: z2 + 1,
-            },
-            VoxelKey {
-                level: l,
-                x: x2 + 1,
-                y: y2 + 1,
-                z: z2 + 1,
-            },
-        ]
-    }
-
     /// Parent key (None for root).
     pub fn parent(self) -> Option<VoxelKey> {
         if self.level == 0 {
@@ -205,9 +138,6 @@ pub fn write_vlr<W: Write>(
     w.write_all(payload)?;
     Ok(())
 }
-
-/// VLR header size in bytes (54).
-pub const VLR_HEADER_SIZE: usize = 54;
 
 /// Write a LAS 1.4 EVLR header + payload.
 pub fn write_evlr<W: Write>(
