@@ -431,7 +431,7 @@ impl OctreeBuilder {
         for (key, raw) in classified {
             buffers.entry(key).or_default().push(raw);
             *point_idx += 1;
-            if *point_idx % flush_every as u64 == 0 {
+            if (*point_idx).is_multiple_of(flush_every as u64) {
                 Self::flush_buffers(buffers, writers, tmp_dir)?;
             }
         }
@@ -603,7 +603,7 @@ impl OctreeBuilder {
 
         let oversized = |k: &VoxelKey| -> bool {
             k.level < max_level
-                && self.node_path(k).metadata().map_or(false, |m| {
+                && self.node_path(k).metadata().is_ok_and(|m| {
                     m.len() as usize / RawPoint::BYTE_SIZE > MAX_NODE_POINTS
                 })
         };
@@ -761,11 +761,10 @@ impl OctreeBuilder {
             // Group children at level d+1 by parent (iterate keys, no disk I/O).
             let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
             for k in nodes.keys() {
-                if k.level as u32 == d + 1 {
-                    if let Some(p) = k.parent() {
+                if k.level as u32 == d + 1
+                    && let Some(p) = k.parent() {
                         parent_children.entry(p).or_default().push(*k);
                     }
-                }
             }
             if parent_children.is_empty() {
                 continue;
@@ -899,7 +898,7 @@ impl OctreeBuilder {
 
         // Enumerate result from the in-memory key map (no directory scan needed).
         let mut result = Vec::new();
-        for (_, level_keys) in &keys_by_level {
+        for level_keys in keys_by_level.values() {
             for key in level_keys {
                 let file_len = self.node_path(key).metadata().map_or(0, |m| m.len());
                 let count = file_len as usize / RawPoint::BYTE_SIZE;
@@ -992,12 +991,11 @@ impl OctreeBuilder {
         // This prevents zero-point intermediate nodes in the COPC hierarchy
         // (which confuse validators that check point_count > 0 for all entries).
         for ci in 0..n_children {
-            if child_has_pts[ci] && remaining[ci].is_empty() {
-                if let Some(pos) = parent_pts.iter().rposition(|(c, _)| *c == ci) {
+            if child_has_pts[ci] && remaining[ci].is_empty()
+                && let Some(pos) = parent_pts.iter().rposition(|(c, _)| *c == ci) {
                     let (_, p) = parent_pts.remove(pos);
                     remaining[ci].push(p);
                 }
-            }
         }
 
         let parent_pts = parent_pts.into_iter().map(|(_, p)| p).collect();
