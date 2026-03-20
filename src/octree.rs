@@ -90,42 +90,76 @@ impl RawPoint {
     pub const BYTE_SIZE: usize = 4 + 4 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 8 + 2 + 2 + 2 + 2; // 38
 
     pub fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
-        w.write_i32::<LittleEndian>(self.x)?;
-        w.write_i32::<LittleEndian>(self.y)?;
-        w.write_i32::<LittleEndian>(self.z)?;
-        w.write_u16::<LittleEndian>(self.intensity)?;
-        w.write_u8(self.return_number)?;
-        w.write_u8(self.number_of_returns)?;
-        w.write_u8(self.classification)?;
-        w.write_i16::<LittleEndian>(self.scan_angle)?;
-        w.write_u8(self.user_data)?;
-        w.write_u16::<LittleEndian>(self.point_source_id)?;
-        w.write_f64::<LittleEndian>(self.gps_time)?;
-        w.write_u16::<LittleEndian>(self.red)?;
-        w.write_u16::<LittleEndian>(self.green)?;
-        w.write_u16::<LittleEndian>(self.blue)?;
-        w.write_u16::<LittleEndian>(self.nir)?;
+        let mut buf = [0u8; Self::BYTE_SIZE];
+        {
+            use std::io::Cursor;
+            let mut c = Cursor::new(&mut buf[..]);
+            c.write_i32::<LittleEndian>(self.x)?;
+            c.write_i32::<LittleEndian>(self.y)?;
+            c.write_i32::<LittleEndian>(self.z)?;
+            c.write_u16::<LittleEndian>(self.intensity)?;
+            c.write_u8(self.return_number)?;
+            c.write_u8(self.number_of_returns)?;
+            c.write_u8(self.classification)?;
+            c.write_i16::<LittleEndian>(self.scan_angle)?;
+            c.write_u8(self.user_data)?;
+            c.write_u16::<LittleEndian>(self.point_source_id)?;
+            c.write_f64::<LittleEndian>(self.gps_time)?;
+            c.write_u16::<LittleEndian>(self.red)?;
+            c.write_u16::<LittleEndian>(self.green)?;
+            c.write_u16::<LittleEndian>(self.blue)?;
+            c.write_u16::<LittleEndian>(self.nir)?;
+        }
+        w.write_all(&buf)?;
         Ok(())
     }
 
     pub fn read<R: std::io::Read>(r: &mut R) -> Result<Self> {
+        let mut buf = [0u8; Self::BYTE_SIZE];
+        r.read_exact(&mut buf)?;
+        let mut c = std::io::Cursor::new(&buf[..]);
         Ok(RawPoint {
-            x: r.read_i32::<LittleEndian>()?,
-            y: r.read_i32::<LittleEndian>()?,
-            z: r.read_i32::<LittleEndian>()?,
-            intensity: r.read_u16::<LittleEndian>()?,
-            return_number: r.read_u8()?,
-            number_of_returns: r.read_u8()?,
-            classification: r.read_u8()?,
-            scan_angle: r.read_i16::<LittleEndian>()?,
-            user_data: r.read_u8()?,
-            point_source_id: r.read_u16::<LittleEndian>()?,
-            gps_time: r.read_f64::<LittleEndian>()?,
-            red: r.read_u16::<LittleEndian>()?,
-            green: r.read_u16::<LittleEndian>()?,
-            blue: r.read_u16::<LittleEndian>()?,
-            nir: r.read_u16::<LittleEndian>()?,
+            x: c.read_i32::<LittleEndian>()?,
+            y: c.read_i32::<LittleEndian>()?,
+            z: c.read_i32::<LittleEndian>()?,
+            intensity: c.read_u16::<LittleEndian>()?,
+            return_number: c.read_u8()?,
+            number_of_returns: c.read_u8()?,
+            classification: c.read_u8()?,
+            scan_angle: c.read_i16::<LittleEndian>()?,
+            user_data: c.read_u8()?,
+            point_source_id: c.read_u16::<LittleEndian>()?,
+            gps_time: c.read_f64::<LittleEndian>()?,
+            red: c.read_u16::<LittleEndian>()?,
+            green: c.read_u16::<LittleEndian>()?,
+            blue: c.read_u16::<LittleEndian>()?,
+            nir: c.read_u16::<LittleEndian>()?,
         })
+    }
+
+    /// Write multiple points to a writer in a single bulk operation.
+    pub fn write_bulk<W: std::io::Write>(points: &[RawPoint], w: &mut W) -> Result<()> {
+        let mut buf = vec![0u8; Self::BYTE_SIZE * points.len()];
+        let mut c = std::io::Cursor::new(&mut buf[..]);
+        for p in points {
+            c.write_i32::<LittleEndian>(p.x)?;
+            c.write_i32::<LittleEndian>(p.y)?;
+            c.write_i32::<LittleEndian>(p.z)?;
+            c.write_u16::<LittleEndian>(p.intensity)?;
+            c.write_u8(p.return_number)?;
+            c.write_u8(p.number_of_returns)?;
+            c.write_u8(p.classification)?;
+            c.write_i16::<LittleEndian>(p.scan_angle)?;
+            c.write_u8(p.user_data)?;
+            c.write_u16::<LittleEndian>(p.point_source_id)?;
+            c.write_f64::<LittleEndian>(p.gps_time)?;
+            c.write_u16::<LittleEndian>(p.red)?;
+            c.write_u16::<LittleEndian>(p.green)?;
+            c.write_u16::<LittleEndian>(p.blue)?;
+            c.write_u16::<LittleEndian>(p.nir)?;
+        }
+        w.write_all(&buf)?;
+        Ok(())
     }
 }
 
@@ -539,9 +573,7 @@ impl OctreeBuilder {
                     .expect("Cannot open leaf file");
                 BufWriter::new(f)
             });
-            for p in pts.iter() {
-                p.write(w)?;
-            }
+            RawPoint::write_bulk(pts, w)?;
             pts.clear();
         }
         Ok(())
@@ -550,14 +582,15 @@ impl OctreeBuilder {
     /// Read all raw points for a given node key from disk.
     pub fn read_node(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
         let path = self.node_path(key);
-        if !path.exists() {
-            return Ok(vec![]);
-        }
-        let f = File::open(&path)?;
+        let f = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        let file_len = f.metadata()?.len();
+        let count = file_len as usize / RawPoint::BYTE_SIZE;
         let mut r = BufReader::new(f);
-        let file_len = path.metadata()?.len();
-        let count = file_len / RawPoint::BYTE_SIZE as u64;
-        let mut pts = Vec::with_capacity(count as usize);
+        let mut pts = Vec::with_capacity(count);
         for _ in 0..count {
             pts.push(RawPoint::read(&mut r)?);
         }
@@ -570,9 +603,7 @@ impl OctreeBuilder {
         let path = self.node_path(key);
         let f = File::create(&path)?;
         let mut w = BufWriter::new(f);
-        for p in points {
-            p.write(&mut w)?;
-        }
+        RawPoint::write_bulk(points, &mut w)?;
         w.flush().context("flush node temp file")?;
         Ok(())
     }
@@ -780,18 +811,19 @@ impl OctreeBuilder {
                 continue;
             }
 
-            // Snapshot children data for parallel processing (immutable borrow of `nodes`).
+            // Remove children data from `nodes` and build owned tasks (no cloning).
             let tasks: Vec<SampleTask> = parent_children
                 .into_iter()
                 .map(|(parent, children)| {
-                    let all_pts = children
+                    let all_pts: Vec<(usize, RawPoint)> = children
                         .iter()
                         .enumerate()
                         .flat_map(|(ci, ck)| {
                             nodes
-                                .get(ck)
+                                .remove(ck)
+                                .unwrap_or_default()
                                 .into_iter()
-                                .flat_map(move |pts| pts.iter().map(move |p| (ci, p.clone())))
+                                .map(move |p| (ci, p))
                         })
                         .collect();
                     (parent, children, all_pts)
@@ -808,7 +840,7 @@ impl OctreeBuilder {
                     }
                     let n = children.len();
                     let (parent_pts, remaining) =
-                        self.grid_sample(&parent, &all_pts, n, MAX_NODE_POINTS);
+                        self.grid_sample(&parent, all_pts, n, MAX_NODE_POINTS);
                     Ok((parent, children, parent_pts, remaining))
                 })
                 .collect::<Result<_>>()?;
@@ -816,9 +848,7 @@ impl OctreeBuilder {
             // Apply updates to `nodes` (sequential, needs &mut).
             for (parent, children, parent_pts, remaining) in results {
                 for (ck, rem) in children.into_iter().zip(remaining.into_iter()) {
-                    if rem.is_empty() {
-                        nodes.remove(&ck);
-                    } else {
+                    if !rem.is_empty() {
                         nodes.insert(ck, rem);
                     }
                 }
@@ -889,7 +919,7 @@ impl OctreeBuilder {
                         return Ok(());
                     }
                     let (parent_pts, per_child) =
-                        self.grid_sample(parent, &all_pts, children.len(), MAX_NODE_POINTS);
+                        self.grid_sample(parent, all_pts, children.len(), MAX_NODE_POINTS);
                     for (ci, ck) in children.iter().enumerate() {
                         self.write_node_to_temp(ck, &per_child[ci])?;
                     }
@@ -931,7 +961,7 @@ impl OctreeBuilder {
     fn grid_sample(
         &self,
         parent: &VoxelKey,
-        pts: &[(usize, RawPoint)], // (child_index, point)
+        mut pts: Vec<(usize, RawPoint)>, // takes ownership — no cloning
         n_children: usize,
         max_count: usize,
     ) -> (Vec<RawPoint>, Vec<Vec<RawPoint>>) {
@@ -961,8 +991,7 @@ impl OctreeBuilder {
         let cell = (int_size / r).max(1);
 
         // Sort by Morton code within the parent voxel for spatially coherent traversal.
-        let mut indexed: Vec<(usize, &RawPoint)> = pts.iter().map(|(ci, p)| (*ci, p)).collect();
-        indexed.sort_unstable_by_key(|(_, p)| {
+        pts.sort_unstable_by_key(|(_, p)| {
             let dx = (p.x as i64 - origin_x).max(0) as u32;
             let dy = (p.y as i64 - origin_y).max(0) as u32;
             let dz = (p.z as i64 - origin_z).max(0) as u32;
@@ -979,21 +1008,20 @@ impl OctreeBuilder {
 
         // Track which children actually have points so we can protect them.
         let mut child_has_pts = vec![false; n_children];
-        for (ci, _) in pts {
+        for (ci, _) in &pts {
             child_has_pts[*ci] = true;
         }
 
-        // Collect parent samples together with their source child index so we
-        // can move one back if a child gets completely drained.
+        // Partition: accepted for parent vs remaining for children. No cloning.
         let mut occupied: HashSet<(i32, i32, i32)> = HashSet::new();
         let mut parent_pts: Vec<(usize, RawPoint)> = Vec::with_capacity(max_count);
         let mut remaining: Vec<Vec<RawPoint>> = vec![Vec::new(); n_children];
 
-        for (ci, p) in indexed {
-            if parent_pts.len() < max_count && occupied.insert(grid_key(p)) {
-                parent_pts.push((ci, p.clone()));
+        for (ci, p) in pts {
+            if parent_pts.len() < max_count && occupied.insert(grid_key(&p)) {
+                parent_pts.push((ci, p));
             } else {
-                remaining[ci].push(p.clone());
+                remaining[ci].push(p);
             }
         }
 
@@ -1016,5 +1044,90 @@ impl OctreeBuilder {
 
     pub fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.tmp_dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_point() -> RawPoint {
+        RawPoint {
+            x: -123456,
+            y: 789012,
+            z: -1,
+            intensity: 65535,
+            return_number: 3,
+            number_of_returns: 5,
+            classification: 6,
+            scan_angle: -15000,
+            user_data: 42,
+            point_source_id: 1001,
+            gps_time: 123456789.987654,
+            red: 255,
+            green: 0,
+            blue: 65535,
+            nir: 32768,
+        }
+    }
+
+    #[test]
+    fn rawpoint_roundtrip_single() {
+        let p = sample_point();
+        let mut buf = Vec::new();
+        p.write(&mut buf).unwrap();
+        assert_eq!(buf.len(), RawPoint::BYTE_SIZE);
+        let p2 = RawPoint::read(&mut &buf[..]).unwrap();
+        assert_eq!(p.x, p2.x);
+        assert_eq!(p.y, p2.y);
+        assert_eq!(p.z, p2.z);
+        assert_eq!(p.intensity, p2.intensity);
+        assert_eq!(p.return_number, p2.return_number);
+        assert_eq!(p.number_of_returns, p2.number_of_returns);
+        assert_eq!(p.classification, p2.classification);
+        assert_eq!(p.scan_angle, p2.scan_angle);
+        assert_eq!(p.user_data, p2.user_data);
+        assert_eq!(p.point_source_id, p2.point_source_id);
+        assert_eq!(p.gps_time, p2.gps_time);
+        assert_eq!(p.red, p2.red);
+        assert_eq!(p.green, p2.green);
+        assert_eq!(p.blue, p2.blue);
+        assert_eq!(p.nir, p2.nir);
+    }
+
+    #[test]
+    fn rawpoint_roundtrip_bulk() {
+        let points = vec![sample_point(), RawPoint {
+            x: 0, y: 0, z: 0,
+            intensity: 0, return_number: 0, number_of_returns: 0,
+            classification: 0, scan_angle: 0, user_data: 0,
+            point_source_id: 0, gps_time: 0.0,
+            red: 0, green: 0, blue: 0, nir: 0,
+        }, sample_point()];
+
+        let mut buf = Vec::new();
+        RawPoint::write_bulk(&points, &mut buf).unwrap();
+        assert_eq!(buf.len(), RawPoint::BYTE_SIZE * 3);
+
+        // Read them back one at a time
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        for orig in &points {
+            let p = RawPoint::read(&mut cursor).unwrap();
+            assert_eq!(orig.x, p.x);
+            assert_eq!(orig.gps_time, p.gps_time);
+            assert_eq!(orig.nir, p.nir);
+        }
+    }
+
+    #[test]
+    fn rawpoint_bulk_matches_single() {
+        let p = sample_point();
+        let mut single_buf = Vec::new();
+        p.write(&mut single_buf).unwrap();
+
+        let mut bulk_buf = Vec::new();
+        RawPoint::write_bulk(&[p.clone()], &mut bulk_buf).unwrap();
+
+        assert_eq!(single_buf, bulk_buf, "bulk write must produce identical bytes to single write");
     }
 }
