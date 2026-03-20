@@ -14,7 +14,6 @@
 /// 6. Produce the list of (VoxelKey, point_count) for the writer, which reads from disk.
 ///
 /// Memory usage is bounded by the configurable memory budget.
-
 use crate::PipelineConfig;
 use crate::copc_types::VoxelKey;
 use anyhow::{Context, Result};
@@ -36,9 +35,9 @@ fn morton3(x: u32, y: u32, z: u32) -> u64 {
         v &= 0x1F_FFFF;
         v = (v | (v << 32)) & 0x1F00000000FFFF;
         v = (v | (v << 16)) & 0x1F0000FF0000FF;
-        v = (v | (v <<  8)) & 0x100F00F00F00F00F;
-        v = (v | (v <<  4)) & 0x10C30C30C30C30C3;
-        v = (v | (v <<  2)) & 0x1249249249249249;
+        v = (v | (v << 8)) & 0x100F00F00F00F00F;
+        v = (v | (v << 4)) & 0x10C30C30C30C30C3;
+        v = (v | (v << 2)) & 0x1249249249249249;
         v
     }
     spread(x as u64) | (spread(y as u64) << 1) | (spread(z as u64) << 2)
@@ -149,21 +148,45 @@ impl Bounds {
     }
 
     pub fn expand_with(&mut self, x: f64, y: f64, z: f64) {
-        if x < self.min_x { self.min_x = x; }
-        if y < self.min_y { self.min_y = y; }
-        if z < self.min_z { self.min_z = z; }
-        if x > self.max_x { self.max_x = x; }
-        if y > self.max_y { self.max_y = y; }
-        if z > self.max_z { self.max_z = z; }
+        if x < self.min_x {
+            self.min_x = x;
+        }
+        if y < self.min_y {
+            self.min_y = y;
+        }
+        if z < self.min_z {
+            self.min_z = z;
+        }
+        if x > self.max_x {
+            self.max_x = x;
+        }
+        if y > self.max_y {
+            self.max_y = y;
+        }
+        if z > self.max_z {
+            self.max_z = z;
+        }
     }
 
     pub fn merge(&mut self, other: &Bounds) {
-        if other.min_x < self.min_x { self.min_x = other.min_x; }
-        if other.min_y < self.min_y { self.min_y = other.min_y; }
-        if other.min_z < self.min_z { self.min_z = other.min_z; }
-        if other.max_x > self.max_x { self.max_x = other.max_x; }
-        if other.max_y > self.max_y { self.max_y = other.max_y; }
-        if other.max_z > self.max_z { self.max_z = other.max_z; }
+        if other.min_x < self.min_x {
+            self.min_x = other.min_x;
+        }
+        if other.min_y < self.min_y {
+            self.min_y = other.min_y;
+        }
+        if other.min_z < self.min_z {
+            self.min_z = other.min_z;
+        }
+        if other.max_x > self.max_x {
+            self.max_x = other.max_x;
+        }
+        if other.max_y > self.max_y {
+            self.max_y = other.max_y;
+        }
+        if other.max_z > self.max_z {
+            self.max_z = other.max_z;
+        }
     }
 
     /// Cube that contains this AABB.
@@ -187,8 +210,13 @@ impl Bounds {
 /// Assign a point to the voxel at the given tree depth.
 #[allow(clippy::too_many_arguments)]
 pub fn point_to_key(
-    x: f64, y: f64, z: f64,
-    cx: f64, cy: f64, cz: f64, halfsize: f64,
+    x: f64,
+    y: f64,
+    z: f64,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+    halfsize: f64,
     depth: u32,
 ) -> VoxelKey {
     let mut vx = 0i32;
@@ -201,15 +229,38 @@ pub fn point_to_key(
 
     for _ in 0..depth {
         half /= 2.0;
-        let bx = if x >= ox { vx = vx * 2 + 1; ox + half } else { vx *= 2; ox - half };
-        let by = if y >= oy { vy = vy * 2 + 1; oy + half } else { vy *= 2; oy - half };
-        let bz = if z >= oz { vz = vz * 2 + 1; oz + half } else { vz *= 2; oz - half };
+        let bx = if x >= ox {
+            vx = vx * 2 + 1;
+            ox + half
+        } else {
+            vx *= 2;
+            ox - half
+        };
+        let by = if y >= oy {
+            vy = vy * 2 + 1;
+            oy + half
+        } else {
+            vy *= 2;
+            oy - half
+        };
+        let bz = if z >= oz {
+            vz = vz * 2 + 1;
+            oz + half
+        } else {
+            vz *= 2;
+            oz - half
+        };
         ox = bx;
         oy = by;
         oz = bz;
     }
 
-    VoxelKey { level: depth as i32, x: vx, y: vy, z: vz }
+    VoxelKey {
+        level: depth as i32,
+        x: vx,
+        y: vy,
+        z: vz,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +304,7 @@ impl OctreeBuilder {
                 let point_count = hdr.number_of_points();
                 let t = hdr.transforms();
                 let transforms = (
-                    t.x.scale, t.y.scale, t.z.scale,
-                    t.x.offset, t.y.offset, t.z.offset,
+                    t.x.scale, t.y.scale, t.z.scale, t.x.offset, t.y.offset, t.z.offset,
                 );
                 Ok((bounds, point_count, transforms))
             })
@@ -279,7 +329,9 @@ impl OctreeBuilder {
             let mut d = 0u32;
             while (total_points as f64) / (8u64.pow(d) as f64) > MAX_LEAF_POINTS as f64 {
                 d += 1;
-                if d > 16 { break; }
+                if d > 16 {
+                    break;
+                }
             }
             d.max(1)
         };
@@ -291,15 +343,27 @@ impl OctreeBuilder {
         std::fs::create_dir_all(&tmp_dir)?;
 
         Ok(OctreeBuilder {
-            bounds, total_points, cx, cy, cz, halfsize, depth,
-            scale_x, scale_y, scale_z, offset_x, offset_y, offset_z,
+            bounds,
+            total_points,
+            cx,
+            cy,
+            cz,
+            halfsize,
+            depth,
+            scale_x,
+            scale_y,
+            scale_z,
+            offset_x,
+            offset_y,
+            offset_z,
             tmp_dir,
         })
     }
 
     /// Path for a node's temp file.
     fn node_path(&self, key: &VoxelKey) -> PathBuf {
-        self.tmp_dir.join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z))
+        self.tmp_dir
+            .join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z))
     }
 
     /// Convert a `las::Point` to a `RawPoint` using the builder's scale/offset.
@@ -308,7 +372,9 @@ impl OctreeBuilder {
         let iy = ((p.y - self.offset_y) / self.scale_y).round() as i32;
         let iz = ((p.z - self.offset_z) / self.scale_z).round() as i32;
         RawPoint {
-            x: ix, y: iy, z: iz,
+            x: ix,
+            y: iy,
+            z: iz,
             intensity: p.intensity,
             return_number: p.return_number,
             number_of_returns: p.number_of_returns,
@@ -331,14 +397,26 @@ impl OctreeBuilder {
     /// what the validator computes from the stored integers always falls inside the
     /// assigned voxel, even when input files use different scales/offsets.
     fn classify_points_parallel(&self, points: &[las::Point]) -> Vec<(VoxelKey, RawPoint)> {
-        points.par_iter().map(|p| {
-            let raw = self.convert_point(p);
-            let rx = raw.x as f64 * self.scale_x + self.offset_x;
-            let ry = raw.y as f64 * self.scale_y + self.offset_y;
-            let rz = raw.z as f64 * self.scale_z + self.offset_z;
-            let key = point_to_key(rx, ry, rz, self.cx, self.cy, self.cz, self.halfsize, self.depth);
-            (key, raw)
-        }).collect()
+        points
+            .par_iter()
+            .map(|p| {
+                let raw = self.convert_point(p);
+                let rx = raw.x as f64 * self.scale_x + self.offset_x;
+                let ry = raw.y as f64 * self.scale_y + self.offset_y;
+                let rz = raw.z as f64 * self.scale_z + self.offset_z;
+                let key = point_to_key(
+                    rx,
+                    ry,
+                    rz,
+                    self.cx,
+                    self.cy,
+                    self.cz,
+                    self.halfsize,
+                    self.depth,
+                );
+                (key, raw)
+            })
+            .collect()
     }
 
     /// Merge classified points into per-key buffers and flush periodically.
@@ -378,8 +456,8 @@ impl OctreeBuilder {
 
         for path in input_files {
             info!("Distributing {:?}", path);
-            let mut reader = las::Reader::from_path(path)
-                .with_context(|| format!("Cannot open {:?}", path))?;
+            let mut reader =
+                las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
 
             let file_point_count = reader.header().number_of_points();
             // Estimated memory per las::Point (~120 bytes)
@@ -392,25 +470,36 @@ impl OctreeBuilder {
                 let classified = self.classify_points_parallel(&points);
                 drop(points);
                 Self::merge_into_buffers(
-                    classified, &mut buffers, &mut writers,
-                    &self.tmp_dir, &mut point_idx, flush_every,
+                    classified,
+                    &mut buffers,
+                    &mut writers,
+                    &self.tmp_dir,
+                    &mut point_idx,
+                    flush_every,
                 )?;
             } else {
                 // Batched path: read in chunks to stay within budget
                 let batch_size = (half_budget / 120).max(10_000) as usize;
                 info!(
                     "File too large (~{} MB), using batched reads of {} points",
-                    estimated_mem / (1024 * 1024), batch_size
+                    estimated_mem / (1024 * 1024),
+                    batch_size
                 );
                 let mut points: Vec<las::Point> = Vec::new();
                 loop {
                     points.clear();
                     let n = reader.read_points_into(batch_size as u64, &mut points)?;
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     let classified = self.classify_points_parallel(&points);
                     Self::merge_into_buffers(
-                        classified, &mut buffers, &mut writers,
-                        &self.tmp_dir, &mut point_idx, flush_every,
+                        classified,
+                        &mut buffers,
+                        &mut writers,
+                        &self.tmp_dir,
+                        &mut point_idx,
+                        flush_every,
                     )?;
                 }
             }
@@ -430,10 +519,15 @@ impl OctreeBuilder {
         tmp_dir: &Path,
     ) -> Result<()> {
         for (key, pts) in buffers.iter_mut() {
-            if pts.is_empty() { continue; }
+            if pts.is_empty() {
+                continue;
+            }
             let w = writers.entry(*key).or_insert_with(|| {
                 let path = tmp_dir.join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z));
-                let f = OpenOptions::new().create(true).append(true).open(&path)
+                let f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
                     .expect("Cannot open leaf file");
                 BufWriter::new(f)
             });
@@ -509,12 +603,16 @@ impl OctreeBuilder {
 
         let oversized = |k: &VoxelKey| -> bool {
             k.level < max_level
-                && self.node_path(k).metadata()
-                    .map_or(false, |m| m.len() as usize / RawPoint::BYTE_SIZE > MAX_NODE_POINTS)
+                && self.node_path(k).metadata().map_or(false, |m| {
+                    m.len() as usize / RawPoint::BYTE_SIZE > MAX_NODE_POINTS
+                })
         };
 
-        let mut to_split: Vec<VoxelKey> = self.all_node_keys()?
-            .into_iter().filter(|k| oversized(k)).collect();
+        let mut to_split: Vec<VoxelKey> = self
+            .all_node_keys()?
+            .into_iter()
+            .filter(|k| oversized(k))
+            .collect();
 
         while !to_split.is_empty() {
             // All nodes in `to_split` are in disjoint voxels → safe to split in parallel.
@@ -531,8 +629,14 @@ impl OctreeBuilder {
                         let wy = p.y as f64 * self.scale_y + self.offset_y;
                         let wz = p.z as f64 * self.scale_z + self.offset_z;
                         let ck = point_to_key(
-                            wx, wy, wz,
-                            self.cx, self.cy, self.cz, self.halfsize, child_level as u32,
+                            wx,
+                            wy,
+                            wz,
+                            self.cx,
+                            self.cy,
+                            self.cz,
+                            self.halfsize,
+                            child_level as u32,
                         );
                         children.entry(ck).or_default().push(p);
                     }
@@ -544,7 +648,9 @@ impl OctreeBuilder {
                     Ok(child_keys)
                 })
                 .collect::<Result<Vec<_>>>()?
-                .into_iter().flatten().collect();
+                .into_iter()
+                .flatten()
+                .collect();
 
             to_split = new_children.into_iter().filter(|k| oversized(k)).collect();
         }
@@ -575,16 +681,14 @@ impl OctreeBuilder {
         );
 
         // Estimate memory required to hold all leaf data.
-        let total_bytes: u64 = leaf_keys.iter()
+        let total_bytes: u64 = leaf_keys
+            .iter()
             .map(|k| self.node_path(k).metadata().map_or(0, |m| m.len()))
             .sum();
 
         // Phase 2
         let result = if total_bytes <= config.memory_budget {
-            info!(
-                "Building octree in-memory ({} MB)",
-                total_bytes / 1_048_576
-            );
+            info!("Building octree in-memory ({} MB)", total_bytes / 1_048_576);
             self.bottom_up_in_memory(&leaf_keys, actual_max_depth)?
         } else {
             info!(
@@ -598,13 +702,16 @@ impl OctreeBuilder {
         let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
         info!(
             "Total octree nodes: {}, total points: {} (original: {})",
-            result.len(), total_pts, self.total_points
+            result.len(),
+            total_pts,
+            self.total_points
         );
         if total_pts as u64 != self.total_points {
             info!(
                 "Note: COPC contains {} points vs {} from input headers (diff {}). \
                  Input LAZ headers sometimes report inaccurate point counts.",
-                total_pts, self.total_points,
+                total_pts,
+                self.total_points,
                 self.total_points as i64 - total_pts as i64
             );
         }
@@ -617,11 +724,15 @@ impl OctreeBuilder {
         for (key, _) in &result {
             let mut k = *key;
             while let Some(parent) = k.parent() {
-                if present.insert(parent) { extra.push(parent); }
+                if present.insert(parent) {
+                    extra.push(parent);
+                }
                 k = parent;
             }
         }
-        for k in extra { result.push((k, 0)); }
+        for k in extra {
+            result.push((k, 0));
+        }
         result.sort_by_key(|(k, _)| k.level);
         Ok(result)
     }
@@ -656,50 +767,66 @@ impl OctreeBuilder {
                     }
                 }
             }
-            if parent_children.is_empty() { continue; }
+            if parent_children.is_empty() {
+                continue;
+            }
 
             // Snapshot children data for parallel processing (immutable borrow of `nodes`).
-            let tasks: Vec<(VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>)> =
-                parent_children.into_iter().map(|(parent, children)| {
-                    let all_pts = children.iter().enumerate()
+            let tasks: Vec<(VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>)> = parent_children
+                .into_iter()
+                .map(|(parent, children)| {
+                    let all_pts = children
+                        .iter()
+                        .enumerate()
                         .flat_map(|(ci, ck)| {
-                            nodes.get(ck).into_iter()
+                            nodes
+                                .get(ck)
+                                .into_iter()
                                 .flat_map(move |pts| pts.iter().map(move |p| (ci, p.clone())))
                         })
                         .collect();
                     (parent, children, all_pts)
-                }).collect();
+                })
+                .collect();
 
             // Grid-sample in parallel.
-            let results: Vec<(VoxelKey, Vec<VoxelKey>, Vec<RawPoint>, Vec<Vec<RawPoint>>)> =
-                tasks.into_par_iter()
-                    .map(|(parent, children, all_pts)| -> Result<_> {
-                        if all_pts.is_empty() {
-                            let n = children.len();
-                            return Ok((parent, children, vec![], vec![vec![]; n]));
-                        }
+            let results: Vec<(VoxelKey, Vec<VoxelKey>, Vec<RawPoint>, Vec<Vec<RawPoint>>)> = tasks
+                .into_par_iter()
+                .map(|(parent, children, all_pts)| -> Result<_> {
+                    if all_pts.is_empty() {
                         let n = children.len();
-                        let (parent_pts, remaining) =
-                            self.grid_sample(&parent, &all_pts, n, MAX_NODE_POINTS);
-                        Ok((parent, children, parent_pts, remaining))
-                    })
-                    .collect::<Result<_>>()?;
+                        return Ok((parent, children, vec![], vec![vec![]; n]));
+                    }
+                    let n = children.len();
+                    let (parent_pts, remaining) =
+                        self.grid_sample(&parent, &all_pts, n, MAX_NODE_POINTS);
+                    Ok((parent, children, parent_pts, remaining))
+                })
+                .collect::<Result<_>>()?;
 
             // Apply updates to `nodes` (sequential, needs &mut).
             for (parent, children, parent_pts, remaining) in results {
                 for (ck, rem) in children.into_iter().zip(remaining.into_iter()) {
-                    if rem.is_empty() { nodes.remove(&ck); } else { nodes.insert(ck, rem); }
+                    if rem.is_empty() {
+                        nodes.remove(&ck);
+                    } else {
+                        nodes.insert(ck, rem);
+                    }
                 }
-                if !parent_pts.is_empty() { nodes.insert(parent, parent_pts); }
+                if !parent_pts.is_empty() {
+                    nodes.insert(parent, parent_pts);
+                }
             }
         }
 
         // Write final nodes to disk for the writer.
-        nodes.par_iter().map(|(k, pts)| -> Result<()> {
-            self.write_node_to_temp(k, pts)
-        }).collect::<Result<Vec<_>>>()?;
+        nodes
+            .par_iter()
+            .map(|(k, pts)| -> Result<()> { self.write_node_to_temp(k, pts) })
+            .collect::<Result<Vec<_>>>()?;
 
-        Ok(nodes.iter()
+        Ok(nodes
+            .iter()
             .filter(|(_, pts)| !pts.is_empty())
             .map(|(k, pts)| (*k, pts.len()))
             .collect())
@@ -733,29 +860,41 @@ impl OctreeBuilder {
                     parent_children.entry(parent).or_default().push(*ck);
                 }
             }
-            if parent_children.is_empty() { continue; }
+            if parent_children.is_empty() {
+                continue;
+            }
 
             let parents: Vec<(VoxelKey, Vec<VoxelKey>)> = parent_children.into_iter().collect();
             let new_parent_keys: Vec<VoxelKey> = parents.iter().map(|(p, _)| *p).collect();
 
-            parents.par_iter().map(|(parent, children)| -> Result<()> {
-                let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
-                for (ci, ck) in children.iter().enumerate() {
-                    for p in self.read_node(ck)? { all_pts.push((ci, p)); }
-                }
-                if all_pts.is_empty() { return Ok(()); }
-                let (parent_pts, per_child) =
-                    self.grid_sample(parent, &all_pts, children.len(), MAX_NODE_POINTS);
-                for (ci, ck) in children.iter().enumerate() {
-                    self.write_node_to_temp(ck, &per_child[ci])?;
-                }
-                if !parent_pts.is_empty() {
-                    self.write_node_to_temp(parent, &parent_pts)?;
-                }
-                Ok(())
-            }).collect::<Result<Vec<_>>>()?;
+            parents
+                .par_iter()
+                .map(|(parent, children)| -> Result<()> {
+                    let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
+                    for (ci, ck) in children.iter().enumerate() {
+                        for p in self.read_node(ck)? {
+                            all_pts.push((ci, p));
+                        }
+                    }
+                    if all_pts.is_empty() {
+                        return Ok(());
+                    }
+                    let (parent_pts, per_child) =
+                        self.grid_sample(parent, &all_pts, children.len(), MAX_NODE_POINTS);
+                    for (ci, ck) in children.iter().enumerate() {
+                        self.write_node_to_temp(ck, &per_child[ci])?;
+                    }
+                    if !parent_pts.is_empty() {
+                        self.write_node_to_temp(parent, &parent_pts)?;
+                    }
+                    Ok(())
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-            keys_by_level.entry(d as i32).or_default().extend(new_parent_keys);
+            keys_by_level
+                .entry(d as i32)
+                .or_default()
+                .extend(new_parent_keys);
         }
 
         // Enumerate result from the in-memory key map (no directory scan needed).
@@ -764,7 +903,9 @@ impl OctreeBuilder {
             for key in level_keys {
                 let file_len = self.node_path(key).metadata().map_or(0, |m| m.len());
                 let count = file_len as usize / RawPoint::BYTE_SIZE;
-                if count > 0 { result.push((*key, count)); }
+                if count > 0 {
+                    result.push((*key, count));
+                }
             }
         }
         Ok(result)
@@ -781,7 +922,7 @@ impl OctreeBuilder {
     fn grid_sample(
         &self,
         parent: &VoxelKey,
-        pts: &[(usize, RawPoint)],  // (child_index, point)
+        pts: &[(usize, RawPoint)], // (child_index, point)
         n_children: usize,
         max_count: usize,
     ) -> (Vec<RawPoint>, Vec<Vec<RawPoint>>) {
@@ -792,13 +933,19 @@ impl OctreeBuilder {
         // Parent voxel geometry in integer coordinate space.
         let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
         let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
-            - self.offset_x) / self.scale_x).round() as i64;
-        let origin_y = ((self.cy - self.halfsize + parent.y as f64 * voxel_size_world
-            - self.offset_y) / self.scale_y).round() as i64;
-        let origin_z = ((self.cz - self.halfsize + parent.z as f64 * voxel_size_world
-            - self.offset_z) / self.scale_z).round() as i64;
-        let int_size = (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z))
+            - self.offset_x)
+            / self.scale_x)
             .round() as i64;
+        let origin_y = ((self.cy - self.halfsize + parent.y as f64 * voxel_size_world
+            - self.offset_y)
+            / self.scale_y)
+            .round() as i64;
+        let origin_z = ((self.cz - self.halfsize + parent.z as f64 * voxel_size_world
+            - self.offset_z)
+            / self.scale_z)
+            .round() as i64;
+        let int_size =
+            (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z)).round() as i64;
 
         // Grid resolution: R³ ≈ max_count cells; use floor so we never exceed max_count.
         let r = (max_count as f64).cbrt() as i64;
@@ -814,14 +961,18 @@ impl OctreeBuilder {
         });
 
         let grid_key = |p: &RawPoint| -> (i32, i32, i32) {
-            (((p.x as i64 - origin_x) / cell) as i32,
-             ((p.y as i64 - origin_y) / cell) as i32,
-             ((p.z as i64 - origin_z) / cell) as i32)
+            (
+                ((p.x as i64 - origin_x) / cell) as i32,
+                ((p.y as i64 - origin_y) / cell) as i32,
+                ((p.z as i64 - origin_z) / cell) as i32,
+            )
         };
 
         // Track which children actually have points so we can protect them.
         let mut child_has_pts = vec![false; n_children];
-        for (ci, _) in pts { child_has_pts[*ci] = true; }
+        for (ci, _) in pts {
+            child_has_pts[*ci] = true;
+        }
 
         // Collect parent samples together with their source child index so we
         // can move one back if a child gets completely drained.

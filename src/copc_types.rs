@@ -22,7 +22,12 @@ pub struct VoxelKey {
 
 impl VoxelKey {
     pub fn root() -> Self {
-        VoxelKey { level: 0, x: 0, y: 0, z: 0 }
+        VoxelKey {
+            level: 0,
+            x: 0,
+            y: 0,
+            z: 0,
+        }
     }
 
     /// Eight children of this node.
@@ -32,14 +37,54 @@ impl VoxelKey {
         let y2 = self.y * 2;
         let z2 = self.z * 2;
         [
-            VoxelKey { level: l, x: x2,     y: y2,     z: z2     },
-            VoxelKey { level: l, x: x2 + 1, y: y2,     z: z2     },
-            VoxelKey { level: l, x: x2,     y: y2 + 1, z: z2     },
-            VoxelKey { level: l, x: x2 + 1, y: y2 + 1, z: z2     },
-            VoxelKey { level: l, x: x2,     y: y2,     z: z2 + 1 },
-            VoxelKey { level: l, x: x2 + 1, y: y2,     z: z2 + 1 },
-            VoxelKey { level: l, x: x2,     y: y2 + 1, z: z2 + 1 },
-            VoxelKey { level: l, x: x2 + 1, y: y2 + 1, z: z2 + 1 },
+            VoxelKey {
+                level: l,
+                x: x2,
+                y: y2,
+                z: z2,
+            },
+            VoxelKey {
+                level: l,
+                x: x2 + 1,
+                y: y2,
+                z: z2,
+            },
+            VoxelKey {
+                level: l,
+                x: x2,
+                y: y2 + 1,
+                z: z2,
+            },
+            VoxelKey {
+                level: l,
+                x: x2 + 1,
+                y: y2 + 1,
+                z: z2,
+            },
+            VoxelKey {
+                level: l,
+                x: x2,
+                y: y2,
+                z: z2 + 1,
+            },
+            VoxelKey {
+                level: l,
+                x: x2 + 1,
+                y: y2,
+                z: z2 + 1,
+            },
+            VoxelKey {
+                level: l,
+                x: x2,
+                y: y2 + 1,
+                z: z2 + 1,
+            },
+            VoxelKey {
+                level: l,
+                x: x2 + 1,
+                y: y2 + 1,
+                z: z2 + 1,
+            },
         ]
     }
 

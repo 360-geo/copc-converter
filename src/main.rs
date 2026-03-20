@@ -98,7 +98,10 @@ fn main() -> Result<()> {
         temp_dir: args.temp_dir,
     };
 
-    info!("=== Pass 1: scanning {} input file(s) ===", input_files.len());
+    info!(
+        "=== Pass 1: scanning {} input file(s) ===",
+        input_files.len()
+    );
     let builder = octree::OctreeBuilder::scan(&input_files, &config)?;
 
     info!("=== Pass 2: distributing points to leaf voxels ===");

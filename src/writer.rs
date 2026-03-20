@@ -17,7 +17,6 @@
 /// Nodes are read from temp files and encoded in parallel batches, then
 /// compressed in parallel via compress_chunks(). The chunk table is read
 /// back from the file to recover per-chunk byte sizes for the hierarchy.
-
 use crate::copc_types::{
     CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, VoxelKey, write_evlr, write_vlr,
 };
@@ -109,9 +108,8 @@ pub fn write_copc(
     let snap_floor = |v: f64, scale: f64, offset: f64| -> f64 {
         ((v - offset) / scale).floor() * scale + offset
     };
-    let snap_ceil = |v: f64, scale: f64, offset: f64| -> f64 {
-        ((v - offset) / scale).ceil() * scale + offset
-    };
+    let snap_ceil =
+        |v: f64, scale: f64, offset: f64| -> f64 { ((v - offset) / scale).ceil() * scale + offset };
     let b = &builder.bounds;
     let (min_x, min_y, min_z) = (
         snap_floor(b.min_x, scale_x, offset_x),
@@ -135,7 +133,8 @@ pub fn write_copc(
 
     let mut ordered_keys: Vec<VoxelKey> = node_keys.iter().map(|(k, _)| *k).collect();
     ordered_keys.sort_by(|a, b| {
-        a.level.cmp(&b.level)
+        a.level
+            .cmp(&b.level)
             .then(a.x.cmp(&b.x))
             .then(a.y.cmp(&b.y))
             .then(a.z.cmp(&b.z))
@@ -143,14 +142,18 @@ pub fn write_copc(
 
     info!(
         "Writing {} nodes, {} points",
-        ordered_keys.len(), actual_total_points,
+        ordered_keys.len(),
+        actual_total_points,
     );
 
     // -----------------------------------------------------------------------
     // Write LAS 1.4 header manually (375 bytes)
     // -----------------------------------------------------------------------
     let file = std::fs::OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(output_path)
         .with_context(|| format!("Cannot create {:?}", output_path))?;
     let mut w = BufWriter::new(file);
@@ -158,24 +161,32 @@ pub fn write_copc(
     w.write_all(b"LASF")?;
     w.write_u16::<LittleEndian>(0)?;
     w.write_u16::<LittleEndian>(0x0001 | 0x0010)?; // GPS standard + WKT
-    w.write_all(&[0u8; 16])?;                       // project ID (GUID)
-    w.write_u8(1)?;                                  // version major
-    w.write_u8(4)?;                                  // version minor
+    w.write_all(&[0u8; 16])?; // project ID (GUID)
+    w.write_u8(1)?; // version major
+    w.write_u8(4)?; // version minor
     let mut sysid = [0u8; 32];
-    b"copc_converter".iter().enumerate().for_each(|(i, &c)| sysid[i] = c);
+    b"copc_converter"
+        .iter()
+        .enumerate()
+        .for_each(|(i, &c)| sysid[i] = c);
     w.write_all(&sysid)?;
     let mut gensoft = [0u8; 32];
-    b"copc_converter 0.1".iter().enumerate().for_each(|(i, &c)| gensoft[i] = c);
+    b"copc_converter 0.1"
+        .iter()
+        .enumerate()
+        .for_each(|(i, &c)| gensoft[i] = c);
     w.write_all(&gensoft)?;
-    w.write_u16::<LittleEndian>(1)?;                 // file creation day
-    w.write_u16::<LittleEndian>(2024)?;              // file creation year
-    w.write_u16::<LittleEndian>(375)?;               // header size
+    w.write_u16::<LittleEndian>(1)?; // file creation day
+    w.write_u16::<LittleEndian>(2024)?; // file creation year
+    w.write_u16::<LittleEndian>(375)?; // header size
     w.write_u32::<LittleEndian>(offset_to_point_data)?;
-    w.write_u32::<LittleEndian>(2)?;                 // number of VLRs
-    w.write_u8(128 | 7)?;                            // point format 135 = LAZ format 7
+    w.write_u32::<LittleEndian>(2)?; // number of VLRs
+    w.write_u8(128 | 7)?; // point format 135 = LAZ format 7
     w.write_u16::<LittleEndian>(POINT_RECORD_LENGTH)?;
-    w.write_u32::<LittleEndian>(0)?;                 // legacy point count
-    for _ in 0..5 { w.write_u32::<LittleEndian>(0)?; }
+    w.write_u32::<LittleEndian>(0)?; // legacy point count
+    for _ in 0..5 {
+        w.write_u32::<LittleEndian>(0)?;
+    }
     w.write_f64::<LittleEndian>(scale_x)?;
     w.write_f64::<LittleEndian>(scale_y)?;
     w.write_f64::<LittleEndian>(scale_z)?;
@@ -188,11 +199,13 @@ pub fn write_copc(
     w.write_f64::<LittleEndian>(min_y)?;
     w.write_f64::<LittleEndian>(max_z)?;
     w.write_f64::<LittleEndian>(min_z)?;
-    w.write_u64::<LittleEndian>(0)?;                 // start of waveform data
-    w.write_u64::<LittleEndian>(0)?;                 // start_of_first_EVLR – patched below
-    w.write_u32::<LittleEndian>(1)?;                 // number of EVLRs
+    w.write_u64::<LittleEndian>(0)?; // start of waveform data
+    w.write_u64::<LittleEndian>(0)?; // start_of_first_EVLR – patched below
+    w.write_u32::<LittleEndian>(1)?; // number of EVLRs
     w.write_u64::<LittleEndian>(actual_total_points)?;
-    for _ in 0..15 { w.write_u64::<LittleEndian>(0)?; }
+    for _ in 0..15 {
+        w.write_u64::<LittleEndian>(0)?;
+    }
 
     // -----------------------------------------------------------------------
     // VLR 1: copc info (placeholder – patched at the end)
@@ -215,7 +228,13 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     // VLR 2: laszip VLR
     // -----------------------------------------------------------------------
-    write_vlr(&mut w, "laszip encoded", 22204, "laz variable chunks", &laz_vlr_payload)?;
+    write_vlr(
+        &mut w,
+        "laszip encoded",
+        22204,
+        "laz variable chunks",
+        &laz_vlr_payload,
+    )?;
 
     w.flush()?;
 
@@ -259,8 +278,7 @@ pub fn write_copc(
         while batch_end < data_keys.len() {
             let key = &data_keys[batch_end];
             let node_bytes =
-                (point_counts.get(key).copied().unwrap_or(0) as u64)
-                * POINT_RECORD_LENGTH as u64;
+                (point_counts.get(key).copied().unwrap_or(0) as u64) * POINT_RECORD_LENGTH as u64;
             // Always include at least one node per batch to avoid stalling.
             if batch_end > batch_start && batch_bytes + node_bytes > memory_budget {
                 break;
@@ -279,8 +297,7 @@ pub fn write_copc(
                         .partial_cmp(&b.gps_time)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                let mut raw_bytes =
-                    Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
+                let mut raw_bytes = Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
                 for rp in &pts {
                     encode_point_fmt7(rp, &mut raw_bytes);
                 }
@@ -328,7 +345,8 @@ pub fn write_copc(
     if chunk_table.len() != data_keys.len() {
         info!(
             "ERROR: chunk table has {} entries but we compressed {} chunks!",
-            chunk_table.len(), data_keys.len()
+            chunk_table.len(),
+            data_keys.len()
         );
     }
 
