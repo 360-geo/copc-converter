@@ -8,7 +8,7 @@
 ///    accumulate into per-key temporary files on disk.
 ///    Point classification (key + coordinate conversion) is parallelized via rayon.
 ///    Memory-aware: fast path (full file) or batched path depending on budget.
-/// 4. Normalize leaves: any leaf with > MAX_NODE_POINTS is split into children on disk.
+/// 4. Normalize leaves: any leaf with > MAX_LEAF_POINTS is split into children on disk.
 /// 5. Build the tree bottom-up in parallel: each parent node gets a thinned sample
 ///    of its children's points written back to disk.
 /// 6. Produce the list of (VoxelKey, point_count) for the writer, which reads from disk.
@@ -58,8 +58,9 @@ fn morton3(x: u32, y: u32, z: u32) -> u64 {
 /// Maximum points per leaf voxel before we subdivide further.
 const MAX_LEAF_POINTS: u64 = 100_000;
 
-/// Maximum points to keep per non-leaf node (thinned sample for overview).
-const MAX_NODE_POINTS: usize = 100_000;
+/// Grid cells per axis for LOD thinning. Matches untwine's CellCount = 128.
+/// Higher values keep more points at coarse LOD levels (better progressive rendering).
+const GRID_CELLS_PER_AXIS: i64 = 128;
 
 // ---------------------------------------------------------------------------
 // Raw point storage
@@ -674,7 +675,7 @@ impl OctreeBuilder {
         Ok(keys)
     }
 
-    /// Phase 0 of build_node_map: split any leaf file that exceeds MAX_NODE_POINTS.
+    /// Phase 0 of build_node_map: split any leaf file that exceeds MAX_LEAF_POINTS.
     ///
     /// All nodes being split in one round occupy disjoint voxels, so their child
     /// files never conflict — the entire round is processed in parallel via rayon.
@@ -690,7 +691,7 @@ impl OctreeBuilder {
                 && self
                     .node_path(k)
                     .metadata()
-                    .is_ok_and(|m| m.len() as usize / RawPoint::BYTE_SIZE > MAX_NODE_POINTS)
+                    .is_ok_and(|m| m.len() / RawPoint::BYTE_SIZE as u64 > MAX_LEAF_POINTS)
         };
 
         let mut to_split: Vec<VoxelKey> = self
@@ -884,8 +885,7 @@ impl OctreeBuilder {
                         return Ok((parent, children, vec![], vec![vec![]; n]));
                     }
                     let n = children.len();
-                    let (parent_pts, remaining) =
-                        self.grid_sample(&parent, all_pts, n, MAX_NODE_POINTS);
+                    let (parent_pts, remaining) = self.grid_sample(&parent, all_pts, n);
                     Ok((parent, children, parent_pts, remaining))
                 })
                 .collect::<Result<_>>()?;
@@ -963,8 +963,7 @@ impl OctreeBuilder {
                     if all_pts.is_empty() {
                         return Ok(());
                     }
-                    let (parent_pts, per_child) =
-                        self.grid_sample(parent, all_pts, children.len(), MAX_NODE_POINTS);
+                    let (parent_pts, per_child) = self.grid_sample(parent, all_pts, children.len());
                     for (ci, ck) in children.iter().enumerate() {
                         self.write_node_to_temp(ck, &per_child[ci])?;
                     }
@@ -997,7 +996,7 @@ impl OctreeBuilder {
 
     /// Grid-based spatial sampling for one parent node.
     ///
-    /// Divides the parent voxel into a uniform grid of ≈ R³ cells (R = ∛max_count).
+    /// Divides the parent voxel into a uniform grid of GRID_CELLS_PER_AXIS³ cells.
     /// Points are sorted by Morton code and iterated in that order; the first point
     /// that falls into each unoccupied cell is accepted for the parent.  All others
     /// are returned to their originating child so every point lands in exactly one node.
@@ -1008,7 +1007,6 @@ impl OctreeBuilder {
         parent: &VoxelKey,
         mut pts: Vec<(usize, RawPoint)>, // takes ownership — no cloning
         n_children: usize,
-        max_count: usize,
     ) -> (Vec<RawPoint>, Vec<Vec<RawPoint>>) {
         if pts.is_empty() {
             return (vec![], vec![vec![]; n_children]);
@@ -1031,9 +1029,8 @@ impl OctreeBuilder {
         let int_size =
             (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z)).round() as i64;
 
-        // Grid resolution: R³ ≈ max_count cells; use floor so we never exceed max_count.
-        let r = (max_count as f64).cbrt() as i64;
-        let cell = (int_size / r).max(1);
+        // Grid resolution: fixed cells per axis, matching untwine's CellCount.
+        let cell = (int_size / GRID_CELLS_PER_AXIS).max(1);
 
         // Sort by Morton code within the parent voxel for spatially coherent traversal.
         pts.sort_unstable_by_key(|(_, p)| {
@@ -1059,11 +1056,13 @@ impl OctreeBuilder {
 
         // Partition: accepted for parent vs remaining for children. No cloning.
         let mut occupied: HashSet<(i32, i32, i32)> = HashSet::new();
-        let mut parent_pts: Vec<(usize, RawPoint)> = Vec::with_capacity(max_count);
+        let max_accepted =
+            (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS) as usize;
+        let mut parent_pts: Vec<(usize, RawPoint)> = Vec::with_capacity(max_accepted);
         let mut remaining: Vec<Vec<RawPoint>> = vec![Vec::new(); n_children];
 
         for (ci, p) in pts {
-            if parent_pts.len() < max_count && occupied.insert(grid_key(&p)) {
+            if parent_pts.len() < max_accepted && occupied.insert(grid_key(&p)) {
                 parent_pts.push((ci, p));
             } else {
                 remaining[ci].push(p);

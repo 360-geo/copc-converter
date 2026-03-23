@@ -9,6 +9,9 @@ target/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+# Integration test output
+tests/data/test_*.copc.laz
+
 # Claude Code local settings
 .claude/settings.local.json
 
