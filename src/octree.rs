@@ -310,6 +310,29 @@ pub fn point_to_key(
 // OctreeBuilder
 // ---------------------------------------------------------------------------
 
+/// Map an input LAS point format ID (0–10) to a COPC-compatible output format (6, 7, or 8).
+pub fn input_to_copc_format(id: u8) -> u8 {
+    match id {
+        2 | 3 | 5 | 7 => 7,
+        8 | 10 => 8,
+        _ => 6, // 0, 1, 4, 6, 9
+    }
+}
+
+/// Per-file results from the scan phase, used by validation.
+pub struct ScanResult {
+    pub bounds: Bounds,
+    pub point_count: u64,
+    pub scale_x: f64,
+    pub scale_y: f64,
+    pub scale_z: f64,
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub offset_z: f64,
+    pub wkt_crs: Option<Vec<u8>>,
+    pub point_format_id: u8,
+}
+
 pub struct OctreeBuilder {
     pub bounds: Bounds,
     pub total_points: u64,
@@ -329,15 +352,16 @@ pub struct OctreeBuilder {
     pub tmp_dir: PathBuf,
     /// WKT CRS payload from the first input file (if present).
     pub wkt_crs: Option<Vec<u8>>,
+    /// COPC output point format (6, 7, or 8), derived from input files.
+    pub point_format: u8,
 }
 
 impl OctreeBuilder {
     /// Pass 1: scan all files in parallel to get bounds and total point count.
-    pub fn scan(input_files: &[PathBuf], config: &PipelineConfig) -> Result<Self> {
-        type Transforms = (f64, f64, f64, f64, f64, f64);
-        let results: Vec<(Bounds, u64, Transforms, Option<Vec<u8>>)> = input_files
+    pub fn scan(input_files: &[PathBuf]) -> Result<Vec<ScanResult>> {
+        input_files
             .par_iter()
-            .map(|path| -> Result<_> {
+            .map(|path| -> Result<ScanResult> {
                 info!("Scanning {:?}", path);
                 let reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
@@ -346,42 +370,42 @@ impl OctreeBuilder {
                 let mut bounds = Bounds::empty();
                 bounds.expand_with(b.min.x, b.min.y, b.min.z);
                 bounds.expand_with(b.max.x, b.max.y, b.max.z);
-                let point_count = hdr.number_of_points();
                 let t = hdr.transforms();
-                let transforms = (
-                    t.x.scale, t.y.scale, t.z.scale, t.x.offset, t.y.offset, t.z.offset,
-                );
-                let wkt = hdr
-                    .all_vlrs()
-                    .find(|v| v.is_wkt_crs())
-                    .map(|v| v.data.clone());
-                Ok((bounds, point_count, transforms, wkt))
+                Ok(ScanResult {
+                    bounds,
+                    point_count: hdr.number_of_points(),
+                    scale_x: t.x.scale,
+                    scale_y: t.y.scale,
+                    scale_z: t.z.scale,
+                    offset_x: t.x.offset,
+                    offset_y: t.y.offset,
+                    offset_z: t.z.offset,
+                    wkt_crs: hdr
+                        .all_vlrs()
+                        .find(|v| v.is_wkt_crs())
+                        .map(|v| v.data.clone()),
+                    point_format_id: hdr.point_format().to_u8().unwrap_or(0),
+                })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect()
+    }
 
+    /// Build an OctreeBuilder from scan results and validated inputs.
+    pub fn from_scan(
+        scan_results: &[ScanResult],
+        validated: &crate::validate::ValidatedInputs,
+        config: &PipelineConfig,
+    ) -> Result<Self> {
         let mut bounds = Bounds::empty();
         let mut total_points = 0u64;
-        for (b, count, _, _) in &results {
-            bounds.merge(b);
-            total_points += count;
+        for r in scan_results {
+            bounds.merge(&r.bounds);
+            total_points += r.point_count;
         }
 
-        let (scale_x, scale_y, scale_z, offset_x, offset_y, offset_z) = results
-            .first()
-            .map(|(_, _, t, _)| *t)
-            .unwrap_or((0.001, 0.001, 0.001, 0.0, 0.0, 0.0));
-
-        // Extract WKT CRS from the first file and verify all files match.
-        let wkt_crs = results[0].3.clone();
-        for (i, (_, _, _, wkt)) in results.iter().enumerate().skip(1) {
-            if *wkt != wkt_crs {
-                anyhow::bail!(
-                    "CRS mismatch: file {:?} has a different WKT CRS than {:?}",
-                    input_files[i],
-                    input_files[0],
-                );
-            }
-        }
+        let first = &scan_results[0];
+        let (scale_x, scale_y, scale_z) = (first.scale_x, first.scale_y, first.scale_z);
+        let (offset_x, offset_y, offset_z) = (first.offset_x, first.offset_y, first.offset_z);
 
         let (cx, cy, cz, halfsize) = bounds.to_cube();
 
@@ -418,7 +442,8 @@ impl OctreeBuilder {
             offset_y,
             offset_z,
             tmp_dir,
-            wkt_crs,
+            wkt_crs: validated.wkt_crs.clone(),
+            point_format: validated.point_format,
         })
     }
 
@@ -448,7 +473,7 @@ impl OctreeBuilder {
             red: p.color.as_ref().map(|c| c.red).unwrap_or(0),
             green: p.color.as_ref().map(|c| c.green).unwrap_or(0),
             blue: p.color.as_ref().map(|c| c.blue).unwrap_or(0),
-            nir: 0,
+            nir: p.nir.unwrap_or(0),
         }
     }
 
@@ -1168,5 +1193,25 @@ mod tests {
             single_buf, bulk_buf,
             "bulk write must produce identical bytes to single write"
         );
+    }
+
+    #[test]
+    fn input_to_copc_format_mapping() {
+        // No color, no NIR → format 6
+        assert_eq!(input_to_copc_format(0), 6);
+        assert_eq!(input_to_copc_format(1), 6);
+        assert_eq!(input_to_copc_format(4), 6);
+        assert_eq!(input_to_copc_format(6), 6);
+        assert_eq!(input_to_copc_format(9), 6);
+
+        // Has color, no NIR → format 7
+        assert_eq!(input_to_copc_format(2), 7);
+        assert_eq!(input_to_copc_format(3), 7);
+        assert_eq!(input_to_copc_format(5), 7);
+        assert_eq!(input_to_copc_format(7), 7);
+
+        // Has color + NIR → format 8
+        assert_eq!(input_to_copc_format(8), 8);
+        assert_eq!(input_to_copc_format(10), 8);
     }
 }

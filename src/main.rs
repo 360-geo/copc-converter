@@ -1,5 +1,6 @@
 mod copc_types;
 mod octree;
+mod validate;
 mod writer;
 
 use anyhow::{Context, Result};
@@ -99,7 +100,12 @@ fn main() -> Result<()> {
         "=== Pass 1: scanning {} input file(s) ===",
         input_files.len()
     );
-    let builder = octree::OctreeBuilder::scan(&input_files, &config)?;
+    let scan_results = octree::OctreeBuilder::scan(&input_files)?;
+
+    info!("=== Validating inputs ===");
+    let validated = validate::validate(&input_files, &scan_results)?;
+
+    let builder = octree::OctreeBuilder::from_scan(&scan_results, &validated, &config)?;
 
     info!("=== Pass 2: distributing points to leaf voxels ===");
     builder.distribute(&input_files, &config)?;

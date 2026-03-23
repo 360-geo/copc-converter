@@ -4,8 +4,8 @@
 /// ------
 ///  [LAS 1.4 header]           375 bytes
 ///  [copc info VLR]            54 + 160 = 214 bytes
-///  [laszip VLR]               54 + 46  = 100 bytes   (user_id "laszip encoded", record_id 22204)
-///  --- offset_to_point_data = 689 ---
+///  [laszip VLR]               54 + variable (depends on point format)
+///  [WKT CRS VLR]              optional
 ///  [i64 chunk-table offset]   8 bytes  (points to chunk table after all data)
 ///  [compressed chunk 0]       variable
 ///  [compressed chunk 1]       variable
@@ -30,12 +30,19 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
-// LAS 1.4 format 7 raw byte size = 30 (base format 6) + 6 (RGB) = 36
+// Point record sizes: format 6 = 30, format 7 = 36, format 8 = 38
 // ---------------------------------------------------------------------------
-const POINT_RECORD_LENGTH: u16 = 36;
+fn point_record_length(fmt: u8) -> u16 {
+    match fmt {
+        6 => 30,
+        7 => 36,
+        8 => 38,
+        _ => 36,
+    }
+}
 
-/// Encode one point as LAS 1.4 format 7 raw bytes (36 bytes, little-endian).
-fn encode_point_fmt7(rp: &RawPoint, buf: &mut Vec<u8>) {
+/// Encode the format-6 base fields (30 bytes) shared by all COPC formats.
+fn encode_point_base(rp: &RawPoint, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&rp.x.to_le_bytes());
     buf.extend_from_slice(&rp.y.to_le_bytes());
     buf.extend_from_slice(&rp.z.to_le_bytes());
@@ -48,10 +55,20 @@ fn encode_point_fmt7(rp: &RawPoint, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&rp.scan_angle.to_le_bytes());
     buf.extend_from_slice(&rp.point_source_id.to_le_bytes());
     buf.extend_from_slice(&rp.gps_time.to_le_bytes());
-    buf.extend_from_slice(&rp.red.to_le_bytes());
-    buf.extend_from_slice(&rp.green.to_le_bytes());
-    buf.extend_from_slice(&rp.blue.to_le_bytes());
-    // Total = 4+4+4+2+1+1+1+1+2+2+8+2+2+2 = 36 bytes
+    // Total = 4+4+4+2+1+1+1+1+2+2+8 = 30 bytes
+}
+
+/// Encode one point according to the COPC output format (6, 7, or 8).
+fn encode_point(rp: &RawPoint, fmt: u8, buf: &mut Vec<u8>) {
+    encode_point_base(rp, buf);
+    if fmt >= 7 {
+        buf.extend_from_slice(&rp.red.to_le_bytes());
+        buf.extend_from_slice(&rp.green.to_le_bytes());
+        buf.extend_from_slice(&rp.blue.to_le_bytes());
+    }
+    if fmt >= 8 {
+        buf.extend_from_slice(&rp.nir.to_le_bytes());
+    }
 }
 
 /// Write a complete COPC file to `output_path`.
@@ -72,12 +89,15 @@ pub fn write_copc(
     let offset_y = builder.offset_y;
     let offset_z = builder.offset_z;
 
+    let point_format = builder.point_format;
+    let point_record_len = point_record_length(point_format);
+
     // -----------------------------------------------------------------------
-    // Build the LAZ VLR (variable-size chunks, format 7 items)
+    // Build the LAZ VLR (variable-size chunks)
     // -----------------------------------------------------------------------
     let laz_vlr = LazVlrBuilder::default()
-        .with_point_format(7, 0)
-        .context("LazVlrBuilder for format 7")?
+        .with_point_format(point_format, 0)
+        .context("LazVlrBuilder for format")?
         .with_variable_chunk_size()
         .build();
 
@@ -89,7 +109,7 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     let wkt_crs = &builder.wkt_crs;
     let copc_info_vlr_size: u32 = 54 + 160; // 214
-    let laz_vlr_size: u32 = 54 + laz_vlr_payload.len() as u32; // 100
+    let laz_vlr_size: u32 = 54 + laz_vlr_payload.len() as u32;
     let wkt_vlr_size: u32 = wkt_crs.as_ref().map(|d| 54 + d.len() as u32).unwrap_or(0);
     let num_vlrs: u32 = if wkt_crs.is_some() { 3 } else { 2 };
     let offset_to_point_data: u32 = 375 + copc_info_vlr_size + laz_vlr_size + wkt_vlr_size;
@@ -184,8 +204,8 @@ pub fn write_copc(
     w.write_u16::<LittleEndian>(375)?; // header size
     w.write_u32::<LittleEndian>(offset_to_point_data)?;
     w.write_u32::<LittleEndian>(num_vlrs)?; // number of VLRs
-    w.write_u8(128 | 7)?; // point format 135 = LAZ format 7
-    w.write_u16::<LittleEndian>(POINT_RECORD_LENGTH)?;
+    w.write_u8(128 | point_format)?; // LAZ compressed point format
+    w.write_u16::<LittleEndian>(point_record_len)?;
     w.write_u32::<LittleEndian>(0)?; // legacy point count
     for _ in 0..5 {
         w.write_u32::<LittleEndian>(0)?;
@@ -252,7 +272,7 @@ pub fn write_copc(
     // Parallel compression via ParLasZipCompressor
     // -----------------------------------------------------------------------
     let laz_vlr_for_compressor = LazVlrBuilder::default()
-        .with_point_format(7, 0)
+        .with_point_format(point_format, 0)
         .context("LazVlrBuilder (compressor)")?
         .with_variable_chunk_size()
         .build();
@@ -293,7 +313,7 @@ pub fn write_copc(
         while batch_end < data_keys.len() {
             let key = &data_keys[batch_end];
             let node_bytes =
-                (point_counts.get(key).copied().unwrap_or(0) as u64) * POINT_RECORD_LENGTH as u64;
+                (point_counts.get(key).copied().unwrap_or(0) as u64) * point_record_len as u64;
             // Always include at least one node per batch to avoid stalling.
             if batch_end > batch_start && batch_bytes + node_bytes > memory_budget {
                 break;
@@ -316,7 +336,7 @@ pub fn write_copc(
                 let mut local_returns = [0u64; 15];
                 let mut local_gps_min = f64::MAX;
                 let mut local_gps_max = f64::MIN;
-                let mut raw_bytes = Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
+                let mut raw_bytes = Vec::with_capacity(point_record_len as usize * pts.len());
                 for rp in &pts {
                     let rn = rp.return_number as usize;
                     if (1..=15).contains(&rn) {
@@ -328,7 +348,7 @@ pub fn write_copc(
                     if rp.gps_time > local_gps_max {
                         local_gps_max = rp.gps_time;
                     }
-                    encode_point_fmt7(rp, &mut raw_bytes);
+                    encode_point(rp, point_format, &mut raw_bytes);
                 }
                 Ok((raw_bytes, local_returns, local_gps_min, local_gps_max))
             })
@@ -380,7 +400,7 @@ pub fn write_copc(
     // Read the chunk table back from the file to get per-chunk byte sizes
     // -----------------------------------------------------------------------
     let read_vlr = LazVlrBuilder::default()
-        .with_point_format(7, 0)
+        .with_point_format(point_format, 0)
         .context("LazVlrBuilder (read)")?
         .with_variable_chunk_size()
         .build();
@@ -476,4 +496,98 @@ pub fn write_copc(
 
     info!("COPC file written: {:?}", output_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_point() -> RawPoint {
+        RawPoint {
+            x: -123456,
+            y: 789012,
+            z: -1,
+            intensity: 65535,
+            return_number: 3,
+            number_of_returns: 5,
+            classification: 6,
+            scan_angle: -15000,
+            user_data: 42,
+            point_source_id: 1001,
+            gps_time: 123456789.987654,
+            red: 255,
+            green: 0,
+            blue: 65535,
+            nir: 32768,
+        }
+    }
+
+    #[test]
+    fn point_record_lengths() {
+        assert_eq!(point_record_length(6), 30);
+        assert_eq!(point_record_length(7), 36);
+        assert_eq!(point_record_length(8), 38);
+    }
+
+    #[test]
+    fn encode_point_format6_size() {
+        let p = sample_point();
+        let mut buf = Vec::new();
+        encode_point(&p, 6, &mut buf);
+        assert_eq!(buf.len(), 30);
+    }
+
+    #[test]
+    fn encode_point_format7_size() {
+        let p = sample_point();
+        let mut buf = Vec::new();
+        encode_point(&p, 7, &mut buf);
+        assert_eq!(buf.len(), 36);
+    }
+
+    #[test]
+    fn encode_point_format8_size() {
+        let p = sample_point();
+        let mut buf = Vec::new();
+        encode_point(&p, 8, &mut buf);
+        assert_eq!(buf.len(), 38);
+    }
+
+    #[test]
+    fn encode_point_format7_includes_rgb() {
+        let p = sample_point();
+        let mut buf = Vec::new();
+        encode_point(&p, 7, &mut buf);
+        // RGB starts at offset 30 (after base fields)
+        let red = u16::from_le_bytes([buf[30], buf[31]]);
+        let green = u16::from_le_bytes([buf[32], buf[33]]);
+        let blue = u16::from_le_bytes([buf[34], buf[35]]);
+        assert_eq!(red, p.red);
+        assert_eq!(green, p.green);
+        assert_eq!(blue, p.blue);
+    }
+
+    #[test]
+    fn encode_point_format8_includes_nir() {
+        let p = sample_point();
+        let mut buf = Vec::new();
+        encode_point(&p, 8, &mut buf);
+        // NIR starts at offset 36 (after RGB)
+        let nir = u16::from_le_bytes([buf[36], buf[37]]);
+        assert_eq!(nir, p.nir);
+    }
+
+    #[test]
+    fn encode_point_format6_matches_base_of_format7() {
+        let p = sample_point();
+        let mut buf6 = Vec::new();
+        let mut buf7 = Vec::new();
+        encode_point(&p, 6, &mut buf6);
+        encode_point(&p, 7, &mut buf7);
+        assert_eq!(
+            buf6[..],
+            buf7[..30],
+            "format 6 must match the first 30 bytes of format 7"
+        );
+    }
 }

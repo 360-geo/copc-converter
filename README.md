@@ -6,7 +6,7 @@ A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [CO
 
 ## Features
 
-- Produces spec-compliant COPC 1.0 files (LAS 1.4, point format 7)
+- Produces spec-compliant COPC 1.0 files (LAS 1.4, point format 6, 7, or 8 — automatically chosen from input)
 - Merges multiple input files into a single COPC output
 - Out-of-core processing with a configurable memory budget — handles datasets larger than RAM
 - Parallel reading, octree construction, and LAZ compression via rayon
@@ -67,10 +67,11 @@ copc_converter ./my_survey/ -o survey.copc.laz --memory-limit 8G
 
 ## How it works
 
-1. **Scan** — reads headers from all input files in parallel to determine bounds, CRS, and point count.
-2. **Distribute** — reads every point, assigns it to an octree leaf voxel, and writes it to a temporary file on disk.
-3. **Build** — constructs the octree bottom-up, thinning points at each level to produce multi-resolution LODs.
-4. **Write** — encodes and compresses nodes in parallel into a single COPC file with a hierarchy EVLR for spatial indexing.
+1. **Scan** — reads headers from all input files in parallel to determine bounds, CRS, point format, and point count.
+2. **Validate** — checks that all input files share the same CRS and point format, and selects the appropriate COPC output format (6, 7, or 8).
+3. **Distribute** — reads every point, assigns it to an octree leaf voxel, and writes it to a temporary file on disk.
+4. **Build** — constructs the octree bottom-up, thinning points at each level to produce multi-resolution LODs.
+5. **Write** — encodes and compresses nodes in parallel into a single COPC file with a hierarchy EVLR for spatial indexing.
 
 ## License
 
