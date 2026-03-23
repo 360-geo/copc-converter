@@ -2,6 +2,12 @@
 name = "copc_converter"
 version = "0.1.0"
 edition = "2024"
+description = "Fast, memory-efficient converter from LAS/LAZ to COPC (Cloud-Optimized Point Cloud)"
+license = "MIT"
+readme = "README.md"
+keywords = ["copc", "las", "laz", "pointcloud", "lidar"]
+categories = ["command-line-utilities", "science::geo"]
+repository = "https://github.com/360-geo/copc-converter"
 
 [[bin]]
 name = "copc_converter"
