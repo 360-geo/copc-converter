@@ -42,27 +42,23 @@ For best performance, prefer installing from source via `cargo install` — this
 
 ```sh
 # Single file
-copc_converter input.laz -o output.copc.laz
-
-# Multiple files
-copc_converter tile1.laz tile2.laz tile3.laz -o merged.copc.laz
+copc_converter input.laz output.copc.laz
 
 # Directory of LAZ/LAS files
-copc_converter ./tiles/ -o merged.copc.laz
+copc_converter ./tiles/ merged.copc.laz
 ```
 
 ### Options
 
 | Flag | Description | Default |
 |---|---|---|
-| `-o, --output` | Output COPC file path | *(required)* |
 | `--memory-limit` | Max memory budget (`16G`, `4096M`, etc.) | `16G` |
 | `--temp-dir` | Directory for intermediate files | system temp |
 
 ### Example
 
 ```sh
-copc_converter ./my_survey/ -o survey.copc.laz --memory-limit 8G
+copc_converter ./my_survey/ survey.copc.laz --memory-limit 8G
 ```
 
 ## How it works
