@@ -2,6 +2,12 @@
 
 A Rust CLI that converts LAS/LAZ point cloud files into [COPC](https://copc.io/) (Cloud-Optimized Point Cloud) files.
 
+## Agent rules
+
+- **Never push, tag, or release without explicit user confirmation.** Always show what you intend to do and wait for approval before any action that affects the remote repository or creates a release.
+- Run `cargo fmt` to fix formatting — don't manually edit whitespace.
+- Do not add `Co-Authored-By` lines to commits.
+
 ## Spec & References
 
 - COPC 1.0 specification: https://github.com/copcio/copcio.github.io/blob/main/copc-specification-1.0.pdf
@@ -48,7 +54,10 @@ CI runs all three on every push to `master` and on PRs. All must pass.
 ## Releasing
 
 1. Commit and push to `master`
-2. Create a GitHub release tagged `vX.Y.Z` (e.g. `v0.3.1`)
-3. CI automatically:
+2. Create and push a git tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
+3. Create a GitHub Release: `gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes`
+4. CI triggers on the release event and automatically:
    - Builds binaries for linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64)
    - Publishes to crates.io
+
+**Important:** A git tag alone is not enough — the CI workflows trigger on `release: [published]`, so the GitHub Release (step 3) is required.
