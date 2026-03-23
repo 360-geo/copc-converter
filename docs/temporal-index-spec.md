@@ -11,6 +11,8 @@ The temporal index provides a per-node lookup table of sampled GPS timestamps, a
 - Determine which octree nodes contain points within a given time range without decompressing point data.
 - Estimate the approximate point index within a node for a given time boundary.
 
+A motivating use case is mobile mapping. A fleet of survey vehicles captures a city over days or weeks, producing a single merged COPC file. At busy intersections, the same spatial area may contain points from 10+ passes by different vehicles at different times. A client that needs the points for a specific location and a specific pass must currently decompress all spatially overlapping nodes and discard the majority of points belonging to other passes. The temporal index allows the client to combine spatial octree queries with time-range filtering, skipping nodes from unrelated passes before any decompression occurs.
+
 ## 2. Scope
 
 This specification defines a single optional EVLR that may be appended to any COPC 1.0 file. A file with this EVLR remains fully COPC 1.0 compliant. Readers that do not recognize the EVLR SHALL ignore it per standard LAS 1.4 behavior.
