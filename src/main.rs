@@ -7,6 +7,9 @@ use clap::Parser;
 use log::info;
 use std::path::PathBuf;
 
+/// Maximum fraction of the stated memory limit to actually use.
+const MEMORY_SAFETY_FACTOR: f64 = 0.75;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Convert LAZ files to a COPC file")]
 struct Args {
@@ -17,6 +20,41 @@ struct Args {
     /// Output COPC file path
     #[arg(short, long)]
     output: PathBuf,
+
+    /// Maximum memory budget (e.g. "16G", "8G", "4096M", "512M"). Default: "16G"
+    #[arg(long, default_value = "16G")]
+    memory_limit: String,
+
+    /// Temp directory for intermediate files. Default: system temp
+    #[arg(long)]
+    temp_dir: Option<PathBuf>,
+}
+
+/// Configuration threaded through the pipeline.
+pub struct PipelineConfig {
+    /// Effective memory budget in bytes (after safety factor).
+    pub memory_budget: u64,
+    /// Optional custom temp directory.
+    pub temp_dir: Option<PathBuf>,
+}
+
+/// Parse a human-readable size string into bytes.
+/// Supports suffixes: G/g (GiB), M/m (MiB), K/k (KiB), or plain bytes.
+fn parse_memory_limit(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num_part, multiplier) = if let Some(n) = s.strip_suffix(['G', 'g']) {
+        (n.trim(), 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix(['M', 'm']) {
+        (n.trim(), 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix(['K', 'k']) {
+        (n.trim(), 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    let value: f64 = num_part
+        .parse()
+        .with_context(|| format!("Invalid memory limit: {s:?}"))?;
+    Ok((value * multiplier as f64) as u64)
 }
 
 fn collect_input_files(raw: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -48,20 +86,32 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let input_files = collect_input_files(args.input)?;
 
+    let raw_limit = parse_memory_limit(&args.memory_limit)?;
+    let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
+    info!(
+        "Memory limit: {} bytes (effective budget: {} bytes)",
+        raw_limit, memory_budget
+    );
+
+    let config = PipelineConfig {
+        memory_budget,
+        temp_dir: args.temp_dir,
+    };
+
     info!(
         "=== Pass 1: scanning {} input file(s) ===",
         input_files.len()
     );
-    let builder = octree::OctreeBuilder::scan(&input_files)?;
+    let builder = octree::OctreeBuilder::scan(&input_files, &config)?;
 
     info!("=== Pass 2: distributing points to leaf voxels ===");
-    builder.distribute(&input_files)?;
+    builder.distribute(&input_files, &config)?;
 
     info!("=== Building octree node map ===");
-    let node_map = builder.build_node_map()?;
+    let node_keys = builder.build_node_map(&config)?;
 
     info!("=== Writing COPC file: {:?} ===", args.output);
-    writer::write_copc(&args.output, &builder, &node_map)?;
+    writer::write_copc(&args.output, &builder, &node_keys, config.memory_budget)?;
 
     builder.cleanup();
     info!("Done.");

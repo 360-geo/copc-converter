@@ -1,18 +1,24 @@
 [package]
-name = "copc_rs"
+name = "copc_converter"
 version = "0.1.0"
 edition = "2024"
+description = "Fast, memory-efficient converter from LAS/LAZ to COPC (Cloud-Optimized Point Cloud)"
+license = "MIT"
+readme = "README.md"
+keywords = ["copc", "las", "laz", "pointcloud", "lidar"]
+categories = ["command-line-utilities", "science::geo"]
+repository = "https://github.com/360-geo/copc-converter"
 
 [[bin]]
-name = "copc_rs"
+name = "copc_converter"
 path = "src/main.rs"
 
 [dependencies]
 las = { version = "0.9", features = ["laz-parallel"] }
-laz = "0.9"
+laz = { version = "0.12", features = ["parallel"] }
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
-tempfile = "3"
+rayon = "1.10"
