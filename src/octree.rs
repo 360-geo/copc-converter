@@ -89,6 +89,32 @@ pub struct RawPoint {
 impl RawPoint {
     pub const BYTE_SIZE: usize = 4 + 4 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 8 + 2 + 2 + 2 + 2; // 38
 
+    #[allow(unused)]
+    pub fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
+        let mut buf = [0u8; Self::BYTE_SIZE];
+        {
+            use std::io::Cursor;
+            let mut c = Cursor::new(&mut buf[..]);
+            c.write_i32::<LittleEndian>(self.x)?;
+            c.write_i32::<LittleEndian>(self.y)?;
+            c.write_i32::<LittleEndian>(self.z)?;
+            c.write_u16::<LittleEndian>(self.intensity)?;
+            c.write_u8(self.return_number)?;
+            c.write_u8(self.number_of_returns)?;
+            c.write_u8(self.classification)?;
+            c.write_i16::<LittleEndian>(self.scan_angle)?;
+            c.write_u8(self.user_data)?;
+            c.write_u16::<LittleEndian>(self.point_source_id)?;
+            c.write_f64::<LittleEndian>(self.gps_time)?;
+            c.write_u16::<LittleEndian>(self.red)?;
+            c.write_u16::<LittleEndian>(self.green)?;
+            c.write_u16::<LittleEndian>(self.blue)?;
+            c.write_u16::<LittleEndian>(self.nir)?;
+        }
+        w.write_all(&buf)?;
+        Ok(())
+    }
+
     pub fn read<R: std::io::Read>(r: &mut R) -> Result<Self> {
         let mut buf = [0u8; Self::BYTE_SIZE];
         r.read_exact(&mut buf)?;

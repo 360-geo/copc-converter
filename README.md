@@ -32,6 +32,12 @@ cargo install --path .
 
 This installs the `copc_converter` binary to `~/.cargo/bin/`, which should be on your `PATH`.
 
+### Pre-built binaries
+
+Download pre-built binaries from the [GitHub releases](https://github.com/360-geo/copc-converter/releases) page. These are built for broad compatibility and run on any machine.
+
+For best performance, prefer installing from source via `cargo install` — this automatically compiles with `target-cpu=native`, optimizing for your specific CPU's instruction set (AVX2, NEON, etc.).
+
 ## Usage
 
 ```sh

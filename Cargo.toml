@@ -1,6 +1,6 @@
 [package]
 name = "copc_converter"
-version = "0.1.0"
+version = "0.0.0-dev"
 edition = "2024"
 description = "Fast, memory-efficient converter from LAS/LAZ to COPC (Cloud-Optimized Point Cloud)"
 license = "MIT"
