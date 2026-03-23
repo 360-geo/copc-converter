@@ -170,3 +170,109 @@ pub fn write_evlr<W: Write>(
 
 /// EVLR header size in bytes (60).
 pub const EVLR_HEADER_SIZE: usize = 60;
+
+// ---------------------------------------------------------------------------
+// Temporal Index EVLR (optional extension)
+// ---------------------------------------------------------------------------
+
+/// Header for the temporal index EVLR (16 bytes).
+pub struct TemporalIndexHeader {
+    pub version: u32,
+    pub stride: u32,
+    pub node_count: u32,
+}
+
+impl TemporalIndexHeader {
+    pub fn write<W: Write>(&self, w: &mut W) -> anyhow::Result<()> {
+        w.write_u32::<LittleEndian>(self.version)?;
+        w.write_u32::<LittleEndian>(self.stride)?;
+        w.write_u32::<LittleEndian>(self.node_count)?;
+        w.write_u32::<LittleEndian>(0)?; // reserved
+        Ok(())
+    }
+}
+
+/// One node's temporal samples in the temporal index EVLR.
+pub struct TemporalIndexEntry {
+    pub key: VoxelKey,
+    pub samples: Vec<f64>,
+}
+
+impl TemporalIndexEntry {
+    pub fn write<W: Write>(&self, w: &mut W) -> anyhow::Result<()> {
+        w.write_i32::<LittleEndian>(self.key.level)?;
+        w.write_i32::<LittleEndian>(self.key.x)?;
+        w.write_i32::<LittleEndian>(self.key.y)?;
+        w.write_i32::<LittleEndian>(self.key.z)?;
+        w.write_u32::<LittleEndian>(self.samples.len() as u32)?;
+        for &t in &self.samples {
+            w.write_f64::<LittleEndian>(t)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::{LittleEndian, ReadBytesExt};
+    use std::io::Cursor;
+
+    #[test]
+    fn temporal_header_size() {
+        let mut buf = Vec::new();
+        TemporalIndexHeader {
+            version: 1,
+            stride: 1000,
+            node_count: 5,
+        }
+        .write(&mut buf)
+        .unwrap();
+        assert_eq!(buf.len(), 16);
+    }
+
+    #[test]
+    fn temporal_entry_roundtrip() {
+        let entry = TemporalIndexEntry {
+            key: VoxelKey {
+                level: 3,
+                x: 1,
+                y: 2,
+                z: 4,
+            },
+            samples: vec![100.0, 200.5, 300.75],
+        };
+        let mut buf = Vec::new();
+        entry.write(&mut buf).unwrap();
+
+        // VoxelKey (16) + sample_count (4) + 3 * f64 (24) = 44
+        assert_eq!(buf.len(), 44);
+
+        let mut r = Cursor::new(&buf);
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 3);
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 1);
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 2);
+        assert_eq!(r.read_i32::<LittleEndian>().unwrap(), 4);
+        assert_eq!(r.read_u32::<LittleEndian>().unwrap(), 3);
+        assert_eq!(r.read_f64::<LittleEndian>().unwrap(), 100.0);
+        assert_eq!(r.read_f64::<LittleEndian>().unwrap(), 200.5);
+        assert_eq!(r.read_f64::<LittleEndian>().unwrap(), 300.75);
+    }
+
+    #[test]
+    fn temporal_entry_empty_samples() {
+        let entry = TemporalIndexEntry {
+            key: VoxelKey {
+                level: 0,
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            samples: vec![],
+        };
+        let mut buf = Vec::new();
+        entry.write(&mut buf).unwrap();
+        // VoxelKey (16) + sample_count (4) = 20
+        assert_eq!(buf.len(), 20);
+    }
+}

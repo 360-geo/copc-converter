@@ -1,3 +1,4 @@
+use crate::PipelineConfig;
 /// Write a COPC 1.0 file.
 ///
 /// Layout
@@ -18,7 +19,8 @@
 /// compressed in parallel via compress_chunks(). The chunk table is read
 /// back from the file to recover per-chunk byte sizes for the hierarchy.
 use crate::copc_types::{
-    CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, VoxelKey, write_evlr, write_vlr,
+    CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, TemporalIndexEntry, TemporalIndexHeader, VoxelKey,
+    write_evlr, write_vlr,
 };
 use crate::octree::{OctreeBuilder, RawPoint};
 use anyhow::{Context, Result};
@@ -80,8 +82,9 @@ pub fn write_copc(
     output_path: &Path,
     builder: &OctreeBuilder,
     node_keys: &[(VoxelKey, usize)],
-    memory_budget: u64,
+    config: &PipelineConfig,
 ) -> Result<()> {
+    let memory_budget = config.memory_budget;
     let scale_x = builder.scale_x;
     let scale_y = builder.scale_y;
     let scale_z = builder.scale_z;
@@ -224,7 +227,8 @@ pub fn write_copc(
     w.write_f64::<LittleEndian>(min_z)?;
     w.write_u64::<LittleEndian>(0)?; // start of waveform data
     w.write_u64::<LittleEndian>(0)?; // start_of_first_EVLR – patched below
-    w.write_u32::<LittleEndian>(1)?; // number of EVLRs
+    let num_evlrs: u32 = if config.temporal_index { 2 } else { 1 };
+    w.write_u32::<LittleEndian>(num_evlrs)?; // number of EVLRs
     w.write_u64::<LittleEndian>(actual_total_points)?;
     for _ in 0..15 {
         w.write_u64::<LittleEndian>(0)?;
@@ -305,6 +309,9 @@ pub fn write_copc(
     let mut return_counts = [0u64; 15];
     let mut gpstime_min = f64::MAX;
     let mut gpstime_max = f64::MIN;
+    let mut temporal_entries: Vec<TemporalIndexEntry> = Vec::new();
+    let temporal_index = config.temporal_index;
+    let temporal_stride = config.temporal_stride as usize;
 
     let mut batch_start = 0;
     while batch_start < data_keys.len() {
@@ -323,10 +330,10 @@ pub fn write_copc(
         }
 
         let batch = &data_keys[batch_start..batch_end];
-        // Each parallel task returns (encoded_bytes, local_return_counts, local_gps_min, local_gps_max).
-        let results: Vec<(Vec<u8>, [u64; 15], f64, f64)> = batch
+        type NodeResult = (Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
+        let results: Vec<NodeResult> = batch
             .par_iter()
-            .map(|key| -> Result<(Vec<u8>, [u64; 15], f64, f64)> {
+            .map(|key| -> Result<NodeResult> {
                 let mut pts = builder.read_node(key)?;
                 pts.sort_unstable_by(|a, b| {
                     a.gps_time
@@ -336,8 +343,9 @@ pub fn write_copc(
                 let mut local_returns = [0u64; 15];
                 let mut local_gps_min = f64::MAX;
                 let mut local_gps_max = f64::MIN;
+                let mut samples = Vec::new();
                 let mut raw_bytes = Vec::with_capacity(point_record_len as usize * pts.len());
-                for rp in &pts {
+                for (i, rp) in pts.iter().enumerate() {
                     let rn = rp.return_number as usize;
                     if (1..=15).contains(&rn) {
                         local_returns[rn - 1] += 1;
@@ -348,26 +356,44 @@ pub fn write_copc(
                     if rp.gps_time > local_gps_max {
                         local_gps_max = rp.gps_time;
                     }
+                    if temporal_index && (i % temporal_stride == 0 || i == pts.len() - 1) {
+                        samples.push(rp.gps_time);
+                    }
                     encode_point(rp, point_format, &mut raw_bytes);
                 }
-                Ok((raw_bytes, local_returns, local_gps_min, local_gps_max))
+                Ok((
+                    raw_bytes,
+                    local_returns,
+                    local_gps_min,
+                    local_gps_max,
+                    samples,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
 
         let encoded: Vec<Vec<u8>> = results
             .into_iter()
-            .map(|(bytes, local_returns, local_min, local_max)| {
-                for i in 0..15 {
-                    return_counts[i] += local_returns[i];
-                }
-                if local_min < gpstime_min {
-                    gpstime_min = local_min;
-                }
-                if local_max > gpstime_max {
-                    gpstime_max = local_max;
-                }
-                bytes
-            })
+            .enumerate()
+            .map(
+                |(i, (bytes, local_returns, local_min, local_max, samples))| {
+                    for j in 0..15 {
+                        return_counts[j] += local_returns[j];
+                    }
+                    if local_min < gpstime_min {
+                        gpstime_min = local_min;
+                    }
+                    if local_max > gpstime_max {
+                        gpstime_max = local_max;
+                    }
+                    if temporal_index {
+                        temporal_entries.push(TemporalIndexEntry {
+                            key: batch[i],
+                            samples,
+                        });
+                    }
+                    bytes
+                },
+            )
             .collect();
 
         compressor
@@ -460,6 +486,30 @@ pub fn write_copc(
     file.seek(SeekFrom::Start(evlr_start))?;
     let mut w = BufWriter::new(file);
     write_evlr(&mut w, "copc", 1000, "copc hierarchy", &hier_payload)?;
+
+    // -----------------------------------------------------------------------
+    // EVLR: temporal index (optional)
+    // -----------------------------------------------------------------------
+    if config.temporal_index {
+        let mut temporal_payload = Vec::new();
+        TemporalIndexHeader {
+            version: 1,
+            stride: config.temporal_stride,
+            node_count: temporal_entries.len() as u32,
+        }
+        .write(&mut temporal_payload)?;
+        for entry in &temporal_entries {
+            entry.write(&mut temporal_payload)?;
+        }
+        write_evlr(
+            &mut w,
+            "copc_temporal",
+            1000,
+            "temporal index",
+            &temporal_payload,
+        )?;
+    }
+
     w.flush()?;
     let mut file = w
         .into_inner()
@@ -575,6 +625,53 @@ mod tests {
         // NIR starts at offset 36 (after RGB)
         let nir = u16::from_le_bytes([buf[36], buf[37]]);
         assert_eq!(nir, p.nir);
+    }
+
+    /// Helper: simulate the temporal sampling logic from the encoding loop.
+    fn sample_gps_times(gps_times: &[f64], stride: usize) -> Vec<f64> {
+        let mut samples = Vec::new();
+        for (i, &t) in gps_times.iter().enumerate() {
+            if i % stride == 0 || i == gps_times.len() - 1 {
+                samples.push(t);
+            }
+        }
+        samples
+    }
+
+    #[test]
+    fn temporal_sampling_basic() {
+        // 5000 points, stride 1000 → indices 0, 1000, 2000, 3000, 4000, 4999
+        let times: Vec<f64> = (0..5000).map(|i| i as f64 * 0.1).collect();
+        let samples = sample_gps_times(&times, 1000);
+        assert_eq!(samples.len(), 6);
+        assert_eq!(samples[0], 0.0);
+        assert_eq!(samples[5], 4999.0 * 0.1);
+    }
+
+    #[test]
+    fn temporal_sampling_fewer_than_stride() {
+        // 50 points, stride 1000 → just first and last
+        let times: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let samples = sample_gps_times(&times, 1000);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0], 0.0);
+        assert_eq!(samples[1], 49.0);
+    }
+
+    #[test]
+    fn temporal_sampling_single_point() {
+        let samples = sample_gps_times(&[42.0], 1000);
+        assert_eq!(samples, vec![42.0]);
+    }
+
+    #[test]
+    fn temporal_sampling_exact_stride() {
+        // 1000 points, stride 1000 → indices 0 and 999
+        let times: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let samples = sample_gps_times(&times, 1000);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0], 0.0);
+        assert_eq!(samples[1], 999.0);
     }
 
     #[test]

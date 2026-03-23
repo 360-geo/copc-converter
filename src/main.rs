@@ -27,6 +27,14 @@ struct Args {
     /// Temp directory for intermediate files. Default: system temp
     #[arg(long)]
     temp_dir: Option<PathBuf>,
+
+    /// Enable temporal index EVLR for GPS-time-based queries
+    #[arg(long)]
+    temporal_index: bool,
+
+    /// Sampling stride for temporal index (every n-th point). Default: 1000
+    #[arg(long, default_value_t = 1000)]
+    temporal_stride: u32,
 }
 
 /// Configuration threaded through the pipeline.
@@ -35,6 +43,10 @@ pub struct PipelineConfig {
     pub memory_budget: u64,
     /// Optional custom temp directory.
     pub temp_dir: Option<PathBuf>,
+    /// Whether to write a temporal index EVLR.
+    pub temporal_index: bool,
+    /// Sampling stride for temporal index.
+    pub temporal_stride: u32,
 }
 
 /// Parse a human-readable size string into bytes.
@@ -94,6 +106,8 @@ fn main() -> Result<()> {
     let config = PipelineConfig {
         memory_budget,
         temp_dir: args.temp_dir,
+        temporal_index: args.temporal_index,
+        temporal_stride: args.temporal_stride,
     };
 
     info!(
@@ -114,7 +128,7 @@ fn main() -> Result<()> {
     let node_keys = builder.build_node_map(&config)?;
 
     info!("=== Writing COPC file: {:?} ===", args.output);
-    writer::write_copc(&args.output, &builder, &node_keys, config.memory_budget)?;
+    writer::write_copc(&args.output, &builder, &node_keys, &config)?;
 
     drop(builder);
     info!("Done.");
