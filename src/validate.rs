@@ -13,7 +13,17 @@ pub struct ValidatedInputs {
 
 /// Check that all scanned files agree on CRS and point format,
 /// and derive the COPC output point format.
-pub fn validate(input_files: &[PathBuf], results: &[ScanResult]) -> Result<ValidatedInputs> {
+/// Returns true if the LAS point format includes GPS time.
+fn format_has_gps_time(fmt: u8) -> bool {
+    // LAS formats 0 and 2 lack GPS time; all others (1, 3–10) include it.
+    !matches!(fmt, 0 | 2)
+}
+
+pub fn validate(
+    input_files: &[PathBuf],
+    results: &[ScanResult],
+    temporal_index: bool,
+) -> Result<ValidatedInputs> {
     let wkt_crs = results[0].wkt_crs.clone();
     let first_format = results[0].point_format_id;
 
@@ -34,6 +44,13 @@ pub fn validate(input_files: &[PathBuf], results: &[ScanResult]) -> Result<Valid
                 first_format,
             );
         }
+    }
+
+    if temporal_index && !format_has_gps_time(first_format) {
+        anyhow::bail!(
+            "Temporal index requested but input point format {} does not include GPS time",
+            first_format,
+        );
     }
 
     let point_format = input_to_copc_format(first_format);
@@ -69,7 +86,7 @@ mod tests {
     fn validate_single_file() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 3)];
-        let v = validate(&files, &results).unwrap();
+        let v = validate(&files, &results, false).unwrap();
         assert_eq!(v.point_format, 7);
         assert!(v.wkt_crs.is_none());
     }
@@ -79,7 +96,7 @@ mod tests {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
         let wkt = Some(b"WKT".to_vec());
         let results = vec![make_result(wkt.clone(), 8), make_result(wkt, 8)];
-        let v = validate(&files, &results).unwrap();
+        let v = validate(&files, &results, false).unwrap();
         assert_eq!(v.point_format, 8);
     }
 
@@ -90,7 +107,7 @@ mod tests {
             make_result(Some(b"WKT_A".to_vec()), 7),
             make_result(Some(b"WKT_B".to_vec()), 7),
         ];
-        let err = validate(&files, &results).unwrap_err();
+        let err = validate(&files, &results, false).unwrap_err();
         assert!(err.to_string().contains("CRS mismatch"));
     }
 
@@ -98,7 +115,25 @@ mod tests {
     fn validate_format_mismatch() {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
         let results = vec![make_result(None, 3), make_result(None, 7)];
-        let err = validate(&files, &results).unwrap_err();
+        let err = validate(&files, &results, false).unwrap_err();
         assert!(err.to_string().contains("Point format mismatch"));
+    }
+
+    #[test]
+    fn validate_temporal_index_requires_gps_time() {
+        // Format 0 has no GPS time
+        let files = vec![PathBuf::from("a.laz")];
+        let results = vec![make_result(None, 0)];
+        let err = validate(&files, &results, true).unwrap_err();
+        assert!(err.to_string().contains("does not include GPS time"));
+    }
+
+    #[test]
+    fn validate_temporal_index_with_gps_time() {
+        // Format 1 has GPS time
+        let files = vec![PathBuf::from("a.laz")];
+        let results = vec![make_result(None, 1)];
+        let v = validate(&files, &results, true).unwrap();
+        assert_eq!(v.point_format, 6);
     }
 }

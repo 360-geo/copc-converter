@@ -117,7 +117,7 @@ fn main() -> Result<()> {
     let scan_results = octree::OctreeBuilder::scan(&input_files)?;
 
     info!("=== Validating inputs ===");
-    let validated = validate::validate(&input_files, &scan_results)?;
+    let validated = validate::validate(&input_files, &scan_results, config.temporal_index)?;
 
     let builder = octree::OctreeBuilder::from_scan(&scan_results, &validated, &config)?;
 
