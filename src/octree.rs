@@ -1061,8 +1061,10 @@ impl OctreeBuilder {
         let parent_pts = parent_pts.into_iter().map(|(_, p)| p).collect();
         (parent_pts, remaining)
     }
+}
 
-    pub fn cleanup(&self) {
+impl Drop for OctreeBuilder {
+    fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }

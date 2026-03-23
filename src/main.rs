@@ -13,12 +13,10 @@ const MEMORY_SAFETY_FACTOR: f64 = 0.75;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Convert LAZ files to a COPC file")]
 struct Args {
-    /// One or more input LAZ/LAS files, or a single directory containing them
-    #[arg(required = true, num_args = 1..)]
-    input: Vec<PathBuf>,
+    /// Input LAZ/LAS file, or a directory containing them
+    input: PathBuf,
 
     /// Output COPC file path
-    #[arg(short, long)]
     output: PathBuf,
 
     /// Maximum memory budget (e.g. "16G", "8G", "4096M", "512M"). Default: "16G"
@@ -57,11 +55,10 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
     Ok((value * multiplier as f64) as u64)
 }
 
-fn collect_input_files(raw: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if raw.len() == 1 && raw[0].is_dir() {
-        let dir = &raw[0];
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .with_context(|| format!("Cannot read directory {:?}", dir))?
+fn collect_input_files(raw: PathBuf) -> Result<Vec<PathBuf>> {
+    if raw.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&raw)
+            .with_context(|| format!("Cannot read directory {:?}", raw))?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| {
@@ -73,10 +70,10 @@ fn collect_input_files(raw: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
             })
             .collect();
         files.sort();
-        anyhow::ensure!(!files.is_empty(), "No LAZ/LAS files found in {:?}", dir);
+        anyhow::ensure!(!files.is_empty(), "No LAZ/LAS files found in {:?}", raw);
         Ok(files)
     } else {
-        Ok(raw)
+        Ok(vec![raw])
     }
 }
 
@@ -113,7 +110,7 @@ fn main() -> Result<()> {
     info!("=== Writing COPC file: {:?} ===", args.output);
     writer::write_copc(&args.output, &builder, &node_keys, config.memory_budget)?;
 
-    builder.cleanup();
+    drop(builder);
     info!("Done.");
     Ok(())
 }
