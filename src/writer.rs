@@ -87,9 +87,12 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     // File layout constants
     // -----------------------------------------------------------------------
+    let wkt_crs = &builder.wkt_crs;
     let copc_info_vlr_size: u32 = 54 + 160; // 214
     let laz_vlr_size: u32 = 54 + laz_vlr_payload.len() as u32; // 100
-    let offset_to_point_data: u32 = 375 + copc_info_vlr_size + laz_vlr_size; // 689
+    let wkt_vlr_size: u32 = wkt_crs.as_ref().map(|d| 54 + d.len() as u32).unwrap_or(0);
+    let num_vlrs: u32 = if wkt_crs.is_some() { 3 } else { 2 };
+    let offset_to_point_data: u32 = 375 + copc_info_vlr_size + laz_vlr_size + wkt_vlr_size;
 
     let copc_info_payload_pos: u64 = 375 + 54;
 
@@ -180,7 +183,7 @@ pub fn write_copc(
     w.write_u16::<LittleEndian>(2024)?; // file creation year
     w.write_u16::<LittleEndian>(375)?; // header size
     w.write_u32::<LittleEndian>(offset_to_point_data)?;
-    w.write_u32::<LittleEndian>(2)?; // number of VLRs
+    w.write_u32::<LittleEndian>(num_vlrs)?; // number of VLRs
     w.write_u8(128 | 7)?; // point format 135 = LAZ format 7
     w.write_u16::<LittleEndian>(POINT_RECORD_LENGTH)?;
     w.write_u32::<LittleEndian>(0)?; // legacy point count
@@ -236,6 +239,13 @@ pub fn write_copc(
         &laz_vlr_payload,
     )?;
 
+    // -----------------------------------------------------------------------
+    // VLR 3 (optional): WKT CRS
+    // -----------------------------------------------------------------------
+    if let Some(wkt_data) = wkt_crs {
+        write_vlr(&mut w, "LASF_Projection", 2112, "WKT", wkt_data)?;
+    }
+
     w.flush()?;
 
     // -----------------------------------------------------------------------
@@ -271,6 +281,11 @@ pub fn write_copc(
 
     // Split data_keys into batches whose total uncompressed bytes fit within
     // memory_budget, then encode+compress each batch before moving to the next.
+    // Also accumulate per-return point counts and GPS time extents.
+    let mut return_counts = [0u64; 15];
+    let mut gpstime_min = f64::MAX;
+    let mut gpstime_max = f64::MIN;
+
     let mut batch_start = 0;
     while batch_start < data_keys.len() {
         let mut batch_bytes: u64 = 0;
@@ -288,28 +303,64 @@ pub fn write_copc(
         }
 
         let batch = &data_keys[batch_start..batch_end];
-        let encoded: Vec<Vec<u8>> = batch
+        // Each parallel task returns (encoded_bytes, local_return_counts, local_gps_min, local_gps_max).
+        let results: Vec<(Vec<u8>, [u64; 15], f64, f64)> = batch
             .par_iter()
-            .map(|key| -> Result<Vec<u8>> {
+            .map(|key| -> Result<(Vec<u8>, [u64; 15], f64, f64)> {
                 let mut pts = builder.read_node(key)?;
                 pts.sort_unstable_by(|a, b| {
                     a.gps_time
                         .partial_cmp(&b.gps_time)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
+                let mut local_returns = [0u64; 15];
+                let mut local_gps_min = f64::MAX;
+                let mut local_gps_max = f64::MIN;
                 let mut raw_bytes = Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
                 for rp in &pts {
+                    let rn = rp.return_number as usize;
+                    if rn >= 1 && rn <= 15 {
+                        local_returns[rn - 1] += 1;
+                    }
+                    if rp.gps_time < local_gps_min {
+                        local_gps_min = rp.gps_time;
+                    }
+                    if rp.gps_time > local_gps_max {
+                        local_gps_max = rp.gps_time;
+                    }
                     encode_point_fmt7(rp, &mut raw_bytes);
                 }
-                Ok(raw_bytes)
+                Ok((raw_bytes, local_returns, local_gps_min, local_gps_max))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        let encoded: Vec<Vec<u8>> = results
+            .into_iter()
+            .map(|(bytes, local_returns, local_min, local_max)| {
+                for i in 0..15 {
+                    return_counts[i] += local_returns[i];
+                }
+                if local_min < gpstime_min {
+                    gpstime_min = local_min;
+                }
+                if local_max > gpstime_max {
+                    gpstime_max = local_max;
+                }
+                bytes
+            })
+            .collect();
 
         compressor
             .compress_chunks(encoded)
             .context("compress_chunks")?;
 
         batch_start = batch_end;
+    }
+
+    // If no points were processed, reset GPS time to 0.
+    if gpstime_min > gpstime_max {
+        gpstime_min = 0.0;
+        gpstime_max = 0.0;
     }
 
     compressor.done().context("compressor done")?;
@@ -405,16 +456,23 @@ pub fn write_copc(
         spacing: builder.halfsize / (1u64 << builder.depth) as f64,
         root_hier_offset: evlr_start + EVLR_HEADER_SIZE as u64,
         root_hier_size: hier_payload.len() as u64,
-        gpstime_minimum: 0.0,
-        gpstime_maximum: 0.0,
+        gpstime_minimum: gpstime_min,
+        gpstime_maximum: gpstime_max,
     };
     let mut pinfo_buf = Vec::with_capacity(160);
     patched_info.write(&mut pinfo_buf)?;
     file.seek(SeekFrom::Start(copc_info_payload_pos))?;
     file.write_all(&pinfo_buf)?;
 
+    // Patch EVLR start offset
     file.seek(SeekFrom::Start(235))?;
     file.write_all(&evlr_start.to_le_bytes())?;
+
+    // Patch number of points by return (15 × u64 starting at header offset 255)
+    file.seek(SeekFrom::Start(255))?;
+    for &count in &return_counts {
+        file.write_all(&count.to_le_bytes())?;
+    }
 
     info!("COPC file written: {:?}", output_path);
     Ok(())

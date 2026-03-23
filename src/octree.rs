@@ -326,13 +326,15 @@ pub struct OctreeBuilder {
     pub offset_z: f64,
     /// Temp directory where node files are written.
     pub tmp_dir: PathBuf,
+    /// WKT CRS payload from the first input file (if present).
+    pub wkt_crs: Option<Vec<u8>>,
 }
 
 impl OctreeBuilder {
     /// Pass 1: scan all files in parallel to get bounds and total point count.
     pub fn scan(input_files: &[PathBuf], config: &PipelineConfig) -> Result<Self> {
         type Transforms = (f64, f64, f64, f64, f64, f64);
-        let results: Vec<(Bounds, u64, Transforms)> = input_files
+        let results: Vec<(Bounds, u64, Transforms, Option<Vec<u8>>)> = input_files
             .par_iter()
             .map(|path| -> Result<_> {
                 info!("Scanning {:?}", path);
@@ -348,21 +350,34 @@ impl OctreeBuilder {
                 let transforms = (
                     t.x.scale, t.y.scale, t.z.scale, t.x.offset, t.y.offset, t.z.offset,
                 );
-                Ok((bounds, point_count, transforms))
+                let wkt = hdr.all_vlrs().find(|v| v.is_wkt_crs()).map(|v| v.data.clone());
+                Ok((bounds, point_count, transforms, wkt))
             })
             .collect::<Result<Vec<_>>>()?;
 
         let mut bounds = Bounds::empty();
         let mut total_points = 0u64;
-        for (b, count, _) in &results {
+        for (b, count, _, _) in &results {
             bounds.merge(b);
             total_points += count;
         }
 
         let (scale_x, scale_y, scale_z, offset_x, offset_y, offset_z) = results
             .first()
-            .map(|(_, _, t)| *t)
+            .map(|(_, _, t, _)| *t)
             .unwrap_or((0.001, 0.001, 0.001, 0.0, 0.0, 0.0));
+
+        // Extract WKT CRS from the first file and verify all files match.
+        let wkt_crs = results[0].3.clone();
+        for (i, (_, _, _, wkt)) in results.iter().enumerate().skip(1) {
+            if *wkt != wkt_crs {
+                anyhow::bail!(
+                    "CRS mismatch: file {:?} has a different WKT CRS than {:?}",
+                    input_files[i],
+                    input_files[0],
+                );
+            }
+        }
 
         let (cx, cy, cz, halfsize) = bounds.to_cube();
 
@@ -399,6 +414,7 @@ impl OctreeBuilder {
             offset_y,
             offset_z,
             tmp_dir,
+            wkt_crs,
         })
     }
 
