@@ -89,31 +89,6 @@ pub struct RawPoint {
 impl RawPoint {
     pub const BYTE_SIZE: usize = 4 + 4 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 8 + 2 + 2 + 2 + 2; // 38
 
-    pub fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
-        let mut buf = [0u8; Self::BYTE_SIZE];
-        {
-            use std::io::Cursor;
-            let mut c = Cursor::new(&mut buf[..]);
-            c.write_i32::<LittleEndian>(self.x)?;
-            c.write_i32::<LittleEndian>(self.y)?;
-            c.write_i32::<LittleEndian>(self.z)?;
-            c.write_u16::<LittleEndian>(self.intensity)?;
-            c.write_u8(self.return_number)?;
-            c.write_u8(self.number_of_returns)?;
-            c.write_u8(self.classification)?;
-            c.write_i16::<LittleEndian>(self.scan_angle)?;
-            c.write_u8(self.user_data)?;
-            c.write_u16::<LittleEndian>(self.point_source_id)?;
-            c.write_f64::<LittleEndian>(self.gps_time)?;
-            c.write_u16::<LittleEndian>(self.red)?;
-            c.write_u16::<LittleEndian>(self.green)?;
-            c.write_u16::<LittleEndian>(self.blue)?;
-            c.write_u16::<LittleEndian>(self.nir)?;
-        }
-        w.write_all(&buf)?;
-        Ok(())
-    }
-
     pub fn read<R: std::io::Read>(r: &mut R) -> Result<Self> {
         let mut buf = [0u8; Self::BYTE_SIZE];
         r.read_exact(&mut buf)?;
@@ -350,7 +325,10 @@ impl OctreeBuilder {
                 let transforms = (
                     t.x.scale, t.y.scale, t.z.scale, t.x.offset, t.y.offset, t.z.offset,
                 );
-                let wkt = hdr.all_vlrs().find(|v| v.is_wkt_crs()).map(|v| v.data.clone());
+                let wkt = hdr
+                    .all_vlrs()
+                    .find(|v| v.is_wkt_crs())
+                    .map(|v| v.data.clone());
                 Ok((bounds, point_count, transforms, wkt))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1113,13 +1091,27 @@ mod tests {
 
     #[test]
     fn rawpoint_roundtrip_bulk() {
-        let points = vec![sample_point(), RawPoint {
-            x: 0, y: 0, z: 0,
-            intensity: 0, return_number: 0, number_of_returns: 0,
-            classification: 0, scan_angle: 0, user_data: 0,
-            point_source_id: 0, gps_time: 0.0,
-            red: 0, green: 0, blue: 0, nir: 0,
-        }, sample_point()];
+        let points = vec![
+            sample_point(),
+            RawPoint {
+                x: 0,
+                y: 0,
+                z: 0,
+                intensity: 0,
+                return_number: 0,
+                number_of_returns: 0,
+                classification: 0,
+                scan_angle: 0,
+                user_data: 0,
+                point_source_id: 0,
+                gps_time: 0.0,
+                red: 0,
+                green: 0,
+                blue: 0,
+                nir: 0,
+            },
+            sample_point(),
+        ];
 
         let mut buf = Vec::new();
         RawPoint::write_bulk(&points, &mut buf).unwrap();
@@ -1144,6 +1136,9 @@ mod tests {
         let mut bulk_buf = Vec::new();
         RawPoint::write_bulk(&[p.clone()], &mut bulk_buf).unwrap();
 
-        assert_eq!(single_buf, bulk_buf, "bulk write must produce identical bytes to single write");
+        assert_eq!(
+            single_buf, bulk_buf,
+            "bulk write must produce identical bytes to single write"
+        );
     }
 }

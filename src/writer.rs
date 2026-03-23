@@ -319,7 +319,7 @@ pub fn write_copc(
                 let mut raw_bytes = Vec::with_capacity(POINT_RECORD_LENGTH as usize * pts.len());
                 for rp in &pts {
                     let rn = rp.return_number as usize;
-                    if rn >= 1 && rn <= 15 {
+                    if (1..=15).contains(&rn) {
                         local_returns[rn - 1] += 1;
                     }
                     if rp.gps_time < local_gps_min {
