@@ -635,12 +635,14 @@ impl OctreeBuilder {
     /// Compute the number of parallel distribute workers based on available
     /// cores and the input file count.
     ///
-    /// We deliberately use ~half the cores so the `las` crate's parallel LAZ
-    /// decoder (enabled via the `laz-parallel` feature) can use the other half
-    /// for in-file decompression without oversubscribing the CPU.
+    /// We use ~2/3 of the cores so the `las` crate's parallel LAZ decoder
+    /// (enabled via the `laz-parallel` feature) still has headroom for
+    /// in-file decompression without oversubscribing the CPU. Empirically,
+    /// `cores / 2` left ~30% of cores idle on an 8-core pod, while `cores`
+    /// risks oversubscription. `cores * 2 / 3` is the sweet spot.
     fn distribute_worker_count(input_file_count: usize) -> usize {
         let cores = rayon::current_num_threads();
-        let target = (cores / 2).max(2);
+        let target = ((cores * 2) / 3).max(2);
         target.min(input_file_count).max(1)
     }
 
