@@ -19,11 +19,89 @@ use crate::copc_types::VoxelKey;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
+
+/// Maximum number of leaf temp files kept open simultaneously during distribute.
+///
+/// Each entry holds a `BufWriter<File>` (~8 KiB internal buffer) plus an OS file
+/// descriptor. Capping this lets us process datasets with millions of leaves
+/// without exhausting either memory or the FD ulimit (default 256 on macOS,
+/// 1024 on most Linux containers).
+const DISTRIBUTE_OPEN_FILES_CAP: usize = 512;
+
+/// LRU cache of append-mode `BufWriter`s for leaf temp files.
+///
+/// On eviction the writer is flushed and dropped, releasing both its buffer
+/// and its file descriptor. Subsequent writes to the same key reopen the file
+/// in append mode.
+struct LeafWriterCache {
+    writers: HashMap<VoxelKey, BufWriter<File>>,
+    /// Insertion / access order. Front = least recently used.
+    order: VecDeque<VoxelKey>,
+    capacity: usize,
+}
+
+impl LeafWriterCache {
+    fn new(capacity: usize) -> Self {
+        LeafWriterCache {
+            writers: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    /// Append the given points to the temp file for `key`, opening (and
+    /// possibly evicting another entry) as needed.
+    fn append(&mut self, key: VoxelKey, tmp_dir: &Path, points: &[RawPoint]) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        if self.writers.contains_key(&key) {
+            // Move to back (most-recently-used).
+            if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+        } else {
+            // Evict if at capacity.
+            while self.writers.len() >= self.capacity {
+                if let Some(victim) = self.order.pop_front() {
+                    if let Some(mut w) = self.writers.remove(&victim) {
+                        w.flush().context("flush evicted distribute writer")?;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let path = tmp_dir.join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z));
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("Cannot open leaf file {:?}", path))?;
+            self.writers.insert(key, BufWriter::new(f));
+            self.order.push_back(key);
+        }
+
+        let w = self.writers.get_mut(&key).expect("just inserted");
+        RawPoint::write_bulk(points, w)?;
+        Ok(())
+    }
+
+    /// Flush and drop every cached writer.
+    fn flush_all(&mut self) -> Result<()> {
+        for (_, mut w) in self.writers.drain() {
+            w.flush().context("flush distribute writer")?;
+        }
+        self.order.clear();
+        Ok(())
+    }
+}
 
 /// Task fed into the parallel grid-sampling step: parent key, child keys, and
 /// indexed points (child-index, point).
@@ -531,139 +609,84 @@ impl OctreeBuilder {
             .collect()
     }
 
-    /// Merge classified points into per-key buffers and flush periodically.
-    fn merge_into_buffers(
+    /// Group a classified batch by voxel key and write each group to its
+    /// cached writer in one bulk call. The per-batch HashMap is dropped on
+    /// return so no `Vec` capacity accumulates across batches.
+    fn write_classified_batch(
         classified: Vec<(VoxelKey, RawPoint)>,
-        buffers: &mut HashMap<VoxelKey, Vec<RawPoint>>,
-        writers: &mut HashMap<VoxelKey, BufWriter<File>>,
+        cache: &mut LeafWriterCache,
         tmp_dir: &Path,
-        point_idx: &mut u64,
-        flush_every: usize,
     ) -> Result<()> {
+        let mut groups: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
         for (key, raw) in classified {
-            buffers.entry(key).or_default().push(raw);
-            *point_idx += 1;
-            if (*point_idx).is_multiple_of(flush_every as u64) {
-                Self::flush_buffers(buffers, writers, tmp_dir)?;
-            }
+            groups.entry(key).or_default().push(raw);
+        }
+        // Drain so the inner Vecs are moved out and freed at end of iteration,
+        // and the HashMap itself is dropped at end of function.
+        for (key, pts) in groups.drain() {
+            cache.append(key, tmp_dir, &pts)?;
         }
         Ok(())
     }
 
     /// Pass 2: assign all points to leaf temp files.
     ///
-    /// Uses `read_all_points_into` (fast parallel decompression) when the file
-    /// fits within half the memory budget; otherwise falls back to batched reads.
-    /// Key assignment and coordinate conversion are always parallelized via rayon.
+    /// Reads each input in chunks sized to fit within the memory budget, so
+    /// peak memory is bounded regardless of input file size. Key assignment
+    /// and coordinate conversion are parallelized via rayon. Open leaf temp
+    /// files are managed by an LRU cache (`DISTRIBUTE_OPEN_FILES_CAP`) so the
+    /// number of distinct leaves can grow without bound.
     pub fn distribute(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
-        let flush_every =
-            ((config.memory_budget / 4) as usize / RawPoint::BYTE_SIZE).clamp(10_000, 500_000);
+        // Size each chunk so the transient memory of one chunk
+        //   `Vec<las::Point>` (~120 B/pt) +
+        //   `Vec<(VoxelKey, RawPoint)>` (~50 B/pt) +
+        //   per-voxel grouping HashMap (~50 B/pt)
+        // stays within ~1/8 of the budget. The /8 leaves headroom for the
+        // writer cache, rayon thread-local allocations, and decompression
+        // buffers held inside `las::Reader`.
+        const BYTES_PER_POINT_TRANSIENT: u64 = 120 + 50 + 50;
+        let chunk_size = ((config.memory_budget / 8) / BYTES_PER_POINT_TRANSIENT)
+            .clamp(50_000, 2_000_000) as usize;
+
         debug!(
-            "Distribute: budget={} MB, flush_every={} points",
+            "Distribute: budget={} MB, chunk_size={} points, open-file cap={}",
             config.memory_budget / 1_048_576,
-            flush_every
+            chunk_size,
+            DISTRIBUTE_OPEN_FILES_CAP
         );
 
-        let mut buffers: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
-        let mut writers: HashMap<VoxelKey, BufWriter<File>> = HashMap::new();
+        let mut cache = LeafWriterCache::new(DISTRIBUTE_OPEN_FILES_CAP);
         let mut point_idx = 0u64;
-
-        let half_budget = config.memory_budget / 2;
 
         for path in input_files {
             let mut reader =
                 las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
 
             let file_point_count = reader.header().number_of_points();
-            // Estimated memory per las::Point (~120 bytes)
-            let estimated_mem = file_point_count * 120;
-
             debug!(
-                "Distribute file {:?}: {} points, est {} MB, half_budget={} MB → {}",
+                "Distribute file {:?}: {} points",
                 path.file_name().unwrap_or_default(),
-                file_point_count,
-                estimated_mem / 1_048_576,
-                half_budget / 1_048_576,
-                if estimated_mem <= half_budget {
-                    "fast path"
-                } else {
-                    "batched path"
-                }
+                file_point_count
             );
 
-            if estimated_mem <= half_budget {
-                // Fast path: load entire file with parallel decompression
-                let mut points: Vec<las::Point> = Vec::new();
-                reader.read_all_points_into(&mut points)?;
-                let classified = self.classify_points_parallel(&points);
-                drop(points);
-                Self::merge_into_buffers(
-                    classified,
-                    &mut buffers,
-                    &mut writers,
-                    &self.tmp_dir,
-                    &mut point_idx,
-                    flush_every,
-                )?;
-                config.report(crate::ProgressEvent::StageProgress { done: point_idx });
-            } else {
-                // Batched path: read in chunks to stay within budget
-                let batch_size = (half_budget / 120).max(10_000) as usize;
-                debug!(
-                    "File too large (~{} MB), using batched reads of {} points",
-                    estimated_mem / (1024 * 1024),
-                    batch_size
-                );
-                let mut points: Vec<las::Point> = Vec::new();
-                loop {
-                    points.clear();
-                    let n = reader.read_points_into(batch_size as u64, &mut points)?;
-                    if n == 0 {
-                        break;
-                    }
-                    let classified = self.classify_points_parallel(&points);
-                    Self::merge_into_buffers(
-                        classified,
-                        &mut buffers,
-                        &mut writers,
-                        &self.tmp_dir,
-                        &mut point_idx,
-                        flush_every,
-                    )?;
-                    config.report(crate::ProgressEvent::StageProgress { done: point_idx });
+            let mut points: Vec<las::Point> = Vec::with_capacity(chunk_size);
+            loop {
+                points.clear();
+                let n = reader.read_points_into(chunk_size as u64, &mut points)?;
+                if n == 0 {
+                    break;
                 }
+                let classified = self.classify_points_parallel(&points);
+                // Free the las::Point chunk before building the per-voxel
+                // grouping map so the two large allocations don't coexist.
+                points.clear();
+                Self::write_classified_batch(classified, &mut cache, &self.tmp_dir)?;
+                point_idx += n;
+                config.report(crate::ProgressEvent::StageProgress { done: point_idx });
             }
         }
 
-        Self::flush_buffers(&mut buffers, &mut writers, &self.tmp_dir)?;
-        // Explicitly flush all BufWriters so no data is lost on drop.
-        for (_, w) in writers.iter_mut() {
-            std::io::Write::flush(w).context("flush distribute writer")?;
-        }
-        Ok(())
-    }
-
-    fn flush_buffers(
-        buffers: &mut HashMap<VoxelKey, Vec<RawPoint>>,
-        writers: &mut HashMap<VoxelKey, BufWriter<File>>,
-        tmp_dir: &Path,
-    ) -> Result<()> {
-        for (key, pts) in buffers.iter_mut() {
-            if pts.is_empty() {
-                continue;
-            }
-            let w = writers.entry(*key).or_insert_with(|| {
-                let path = tmp_dir.join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z));
-                let f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .expect("Cannot open leaf file");
-                BufWriter::new(f)
-            });
-            RawPoint::write_bulk(pts, w)?;
-            pts.clear();
-        }
+        cache.flush_all()?;
         Ok(())
     }
 
@@ -683,6 +706,34 @@ impl OctreeBuilder {
             pts.push(RawPoint::read(&mut r)?);
         }
         Ok(pts)
+    }
+
+    /// Stream points for a node key directly into an existing
+    /// `Vec<(usize, RawPoint)>`, tagging each with `ci`.
+    ///
+    /// Unlike `read_node` this avoids allocating an intermediate
+    /// `Vec<RawPoint>`, so the caller's accumulator and the file's points
+    /// never coexist as two separate allocations.
+    pub fn read_node_into_indexed(
+        &self,
+        key: &VoxelKey,
+        ci: usize,
+        sink: &mut Vec<(usize, RawPoint)>,
+    ) -> Result<()> {
+        let path = self.node_path(key);
+        let f = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let file_len = f.metadata()?.len();
+        let count = file_len as usize / RawPoint::BYTE_SIZE;
+        sink.reserve(count);
+        let mut r = BufReader::new(f);
+        for _ in 0..count {
+            sink.push((ci, RawPoint::read(&mut r)?));
+        }
+        Ok(())
     }
 
     /// Write points to a temp file for the given node key (overwrites if exists).
@@ -1090,11 +1141,15 @@ impl OctreeBuilder {
             keys_by_level.entry(k.level).or_default().insert(k);
         }
 
-        // In-memory cost per point during grid_sample: the (usize, RawPoint) input
-        // vec plus the output vecs (parent + per-child remaining) — roughly 2x the
-        // input since points move from input to output.
-        const MEM_PER_POINT: u64 =
-            (std::mem::size_of::<(usize, RawPoint)>() + std::mem::size_of::<RawPoint>()) as u64;
+        // In-memory cost per point during a small-parent task. We hold:
+        //   - the `all_pts: Vec<(usize, RawPoint)>` input  (~56 B/pt)
+        //   - the `parent_pts` + per-child `remaining` outputs (~38 B/pt total,
+        //     since each input point ends up in exactly one output vec)
+        //   - rayon/HashSet/sort-scratch overhead (~20 B/pt safety margin)
+        // Total ≈ 114 B/pt; round up to 128 for headroom. The previous value
+        // (56) under-counted the outputs and could push batches ~40% over the
+        // configured budget at peak.
+        const MEM_PER_POINT: u64 = 128;
 
         for d in (0..actual_max_depth).rev() {
             config.report(crate::ProgressEvent::StageProgress {
@@ -1189,11 +1244,12 @@ impl OctreeBuilder {
                 batch
                     .par_iter()
                     .map(|(parent, children, _)| -> Result<()> {
+                        // Stream every child directly into a single tagged vec
+                        // — no transient per-child Vec<RawPoint>, so the peak
+                        // matches the budget estimate (MEM_PER_POINT).
                         let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
                         for (ci, ck) in children.iter().enumerate() {
-                            for p in self.read_node(ck)? {
-                                all_pts.push((ci, p));
-                            }
+                            self.read_node_into_indexed(ck, ci, &mut all_pts)?;
                         }
                         if all_pts.is_empty() {
                             return Ok(());
@@ -1542,7 +1598,7 @@ mod tests {
         p.write(&mut single_buf).unwrap();
 
         let mut bulk_buf = Vec::new();
-        RawPoint::write_bulk(&[p.clone()], &mut bulk_buf).unwrap();
+        RawPoint::write_bulk(std::slice::from_ref(&p), &mut bulk_buf).unwrap();
 
         assert_eq!(
             single_buf, bulk_buf,
