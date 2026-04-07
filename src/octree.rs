@@ -23,15 +23,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
-/// Maximum number of leaf temp files kept open simultaneously during distribute.
+/// Maximum number of leaf temp files kept open simultaneously **across all
+/// distribute workers**. Divided evenly between workers, with a small floor.
 ///
-/// Each entry holds a `BufWriter<File>` (~8 KiB internal buffer) plus an OS file
-/// descriptor. Capping this lets us process datasets with millions of leaves
-/// without exhausting either memory or the FD ulimit (default 256 on macOS,
-/// 1024 on most Linux containers).
+/// Each entry holds a `BufWriter<File>` (~8 KiB internal buffer) plus an OS
+/// file descriptor. Capping this lets us process datasets with millions of
+/// leaves without exhausting either memory or the FD ulimit (default 256 on
+/// macOS, 1024 on most Linux containers).
 const DISTRIBUTE_OPEN_FILES_CAP: usize = 512;
+
+/// Minimum per-worker LRU capacity. Below this the cache thrashes.
+const MIN_PER_WORKER_OPEN_FILES: usize = 32;
 
 /// LRU cache of append-mode `BufWriter`s for leaf temp files.
 ///
@@ -580,15 +585,13 @@ impl OctreeBuilder {
         }
     }
 
-    /// Parallel key assignment + coordinate conversion for a batch of points.
-    ///
-    /// Key assignment uses the *reconstructed* world coordinates (integer → world)
-    /// rather than the original floating-point coordinates.  This guarantees that
-    /// what the validator computes from the stored integers always falls inside the
-    /// assigned voxel, even when input files use different scales/offsets.
-    fn classify_points_parallel(&self, points: &[las::Point]) -> Vec<(VoxelKey, RawPoint)> {
+    /// Sequential key assignment + coordinate conversion for a batch of
+    /// points. Used by the parallel distribute workers; outer parallelism
+    /// across files provides the cores, so this loop stays single-threaded
+    /// to avoid nested rayon scheduling overhead.
+    fn classify_points(&self, points: &[las::Point]) -> Vec<(VoxelKey, RawPoint)> {
         points
-            .par_iter()
+            .iter()
             .map(|p| {
                 let raw = self.convert_point(p);
                 let rx = raw.x as f64 * self.scale_x + self.offset_x;
@@ -615,7 +618,7 @@ impl OctreeBuilder {
     fn write_classified_batch(
         classified: Vec<(VoxelKey, RawPoint)>,
         cache: &mut LeafWriterCache,
-        tmp_dir: &Path,
+        shard_dir: &Path,
     ) -> Result<()> {
         let mut groups: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
         for (key, raw) in classified {
@@ -624,69 +627,200 @@ impl OctreeBuilder {
         // Drain so the inner Vecs are moved out and freed at end of iteration,
         // and the HashMap itself is dropped at end of function.
         for (key, pts) in groups.drain() {
-            cache.append(key, tmp_dir, &pts)?;
+            cache.append(key, shard_dir, &pts)?;
         }
         Ok(())
     }
 
+    /// Compute the number of parallel distribute workers based on available
+    /// cores and the input file count.
+    ///
+    /// We deliberately use ~half the cores so the `las` crate's parallel LAZ
+    /// decoder (enabled via the `laz-parallel` feature) can use the other half
+    /// for in-file decompression without oversubscribing the CPU.
+    fn distribute_worker_count(input_file_count: usize) -> usize {
+        let cores = rayon::current_num_threads();
+        let target = (cores / 2).max(2);
+        target.min(input_file_count).max(1)
+    }
+
     /// Pass 2: assign all points to leaf temp files.
     ///
-    /// Reads each input in chunks sized to fit within the memory budget, so
-    /// peak memory is bounded regardless of input file size. Key assignment
-    /// and coordinate conversion are parallelized via rayon. Open leaf temp
-    /// files are managed by an LRU cache (`DISTRIBUTE_OPEN_FILES_CAP`) so the
-    /// number of distinct leaves can grow without bound.
+    /// Input files are processed in parallel by N workers, each with its own
+    /// `LeafWriterCache` writing into a private shard subdirectory. After all
+    /// workers finish, `merge_distribute_shards()` concatenates the per-worker
+    /// shard files into the canonical `tmp_dir/{level}_{x}_{y}_{z}` files
+    /// expected by `normalize_leaves` and `build_node_map`.
+    ///
+    /// Each worker reads its files in fixed-size chunks sized from the memory
+    /// budget, so peak memory is bounded regardless of input file size. The
+    /// number of open leaf temp files is bounded by `DISTRIBUTE_OPEN_FILES_CAP`
+    /// across all workers combined.
     pub fn distribute(&self, input_files: &[PathBuf], config: &PipelineConfig) -> Result<()> {
-        // Size each chunk so the transient memory of one chunk
+        let num_workers = Self::distribute_worker_count(input_files.len());
+
+        // Size each chunk so one worker's transient memory
         //   `Vec<las::Point>` (~120 B/pt) +
         //   `Vec<(VoxelKey, RawPoint)>` (~50 B/pt) +
         //   per-voxel grouping HashMap (~50 B/pt)
-        // stays within ~1/8 of the budget. The /8 leaves headroom for the
-        // writer cache, rayon thread-local allocations, and decompression
-        // buffers held inside `las::Reader`.
+        // stays within (budget / 8 / num_workers). The /8 leaves headroom
+        // for the writer caches, rayon thread-local allocations, and the
+        // decompression buffers held inside `las::Reader`.
         const BYTES_PER_POINT_TRANSIENT: u64 = 120 + 50 + 50;
-        let chunk_size = ((config.memory_budget / 8) / BYTES_PER_POINT_TRANSIENT)
-            .clamp(50_000, 2_000_000) as usize;
+        let per_worker_budget = config.memory_budget / num_workers as u64;
+        let chunk_size =
+            ((per_worker_budget / 8) / BYTES_PER_POINT_TRANSIENT).clamp(50_000, 2_000_000) as usize;
+
+        let per_worker_cap =
+            (DISTRIBUTE_OPEN_FILES_CAP / num_workers).max(MIN_PER_WORKER_OPEN_FILES);
 
         debug!(
-            "Distribute: budget={} MB, chunk_size={} points, open-file cap={}",
+            "Distribute: budget={} MB, workers={}, chunk_size={} points, open-file cap={} (per worker)",
             config.memory_budget / 1_048_576,
+            num_workers,
             chunk_size,
-            DISTRIBUTE_OPEN_FILES_CAP
+            per_worker_cap
         );
 
-        let mut cache = LeafWriterCache::new(DISTRIBUTE_OPEN_FILES_CAP);
-        let mut point_idx = 0u64;
+        // Create shard subdirectories under the temp dir.
+        let shards_root = self.tmp_dir.join("shards");
+        if shards_root.exists() {
+            std::fs::remove_dir_all(&shards_root)
+                .with_context(|| format!("removing stale shards dir {:?}", shards_root))?;
+        }
+        std::fs::create_dir_all(&shards_root)?;
+        let shard_dirs: Vec<PathBuf> = (0..num_workers)
+            .map(|w| {
+                let d = shards_root.join(w.to_string());
+                std::fs::create_dir_all(&d)?;
+                Ok(d)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        for path in input_files {
-            let mut reader =
-                las::Reader::from_path(path).with_context(|| format!("Cannot open {:?}", path))?;
+        // Split the input file list into one slice per worker. Round-robin
+        // would balance file-size variance better, but contiguous slices keep
+        // logging readable and the difference is small in practice because
+        // each worker processes many files.
+        let files_per_worker = input_files.len().div_ceil(num_workers);
+        let progress = AtomicU64::new(0);
 
-            let file_point_count = reader.header().number_of_points();
-            debug!(
-                "Distribute file {:?}: {} points",
-                path.file_name().unwrap_or_default(),
-                file_point_count
-            );
-
-            let mut points: Vec<las::Point> = Vec::with_capacity(chunk_size);
-            loop {
-                points.clear();
-                let n = reader.read_points_into(chunk_size as u64, &mut points)?;
-                if n == 0 {
-                    break;
+        shard_dirs
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(worker_id, shard_dir)| -> Result<()> {
+                let start = worker_id * files_per_worker;
+                let end = (start + files_per_worker).min(input_files.len());
+                if start >= end {
+                    return Ok(());
                 }
-                let classified = self.classify_points_parallel(&points);
-                // Free the las::Point chunk before building the per-voxel
-                // grouping map so the two large allocations don't coexist.
-                points.clear();
-                Self::write_classified_batch(classified, &mut cache, &self.tmp_dir)?;
-                point_idx += n;
-                config.report(crate::ProgressEvent::StageProgress { done: point_idx });
+                let mut cache = LeafWriterCache::new(per_worker_cap);
+                let mut points: Vec<las::Point> = Vec::with_capacity(chunk_size);
+
+                for path in &input_files[start..end] {
+                    let mut reader = las::Reader::from_path(path)
+                        .with_context(|| format!("Cannot open {:?}", path))?;
+
+                    let file_point_count = reader.header().number_of_points();
+                    debug!(
+                        "Distribute worker {} file {:?}: {} points",
+                        worker_id,
+                        path.file_name().unwrap_or_default(),
+                        file_point_count
+                    );
+
+                    loop {
+                        points.clear();
+                        let n = reader.read_points_into(chunk_size as u64, &mut points)?;
+                        if n == 0 {
+                            break;
+                        }
+                        let classified = self.classify_points(&points);
+                        // Free the las::Point chunk before building the per-voxel
+                        // grouping map so the two large allocations don't coexist.
+                        points.clear();
+                        Self::write_classified_batch(classified, &mut cache, shard_dir)?;
+                        let done = progress.fetch_add(n, Ordering::Relaxed) + n;
+                        config.report(crate::ProgressEvent::StageProgress { done });
+                    }
+                }
+
+                cache.flush_all()
+            })?;
+
+        self.merge_distribute_shards(&shards_root, num_workers)?;
+        Ok(())
+    }
+
+    /// Concatenate per-worker shard files into the canonical
+    /// `tmp_dir/{level}_{x}_{y}_{z}` location and remove the shards directory.
+    ///
+    /// Runs in parallel over the union of voxel keys present in any shard.
+    /// For each key, opens an append-mode writer on the canonical path and
+    /// streams every shard's contribution into it via `std::io::copy`.
+    fn merge_distribute_shards(&self, shards_root: &Path, num_workers: usize) -> Result<()> {
+        // Collect the union of voxel keys across all shards. Each filename is
+        // `{level}_{x}_{y}_{z}` (parsed by `all_node_keys`).
+        let mut keys: HashSet<VoxelKey> = HashSet::new();
+        for w in 0..num_workers {
+            let shard_dir = shards_root.join(w.to_string());
+            let dir_iter = match std::fs::read_dir(&shard_dir) {
+                Ok(it) => it,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for entry in dir_iter {
+                let entry = entry?;
+                let name = entry.file_name().into_string().unwrap_or_default();
+                let parts: Vec<&str> = name.split('_').collect();
+                if parts.len() == 4
+                    && let (Ok(l), Ok(x), Ok(y), Ok(z)) = (
+                        parts[0].parse::<i32>(),
+                        parts[1].parse::<i32>(),
+                        parts[2].parse::<i32>(),
+                        parts[3].parse::<i32>(),
+                    )
+                {
+                    keys.insert(VoxelKey { level: l, x, y, z });
+                }
             }
         }
 
-        cache.flush_all()?;
+        debug!(
+            "Distribute merge: {} unique voxel keys across {} shards",
+            keys.len(),
+            num_workers
+        );
+
+        let keys: Vec<VoxelKey> = keys.into_iter().collect();
+        keys.par_iter().try_for_each(|key| -> Result<()> {
+            let canonical = self.node_path(key);
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&canonical)
+                .with_context(|| format!("opening canonical leaf file {:?}", canonical))?;
+            let mut out = BufWriter::new(f);
+            for w in 0..num_workers {
+                let shard_path = shards_root
+                    .join(w.to_string())
+                    .join(format!("{}_{}_{}_{}", key.level, key.x, key.y, key.z));
+                match File::open(&shard_path) {
+                    Ok(f) => {
+                        let mut reader = BufReader::new(f);
+                        std::io::copy(&mut reader, &mut out).with_context(|| {
+                            format!("copying shard {:?} into {:?}", shard_path, canonical)
+                        })?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            out.flush().context("flush merged leaf file")?;
+            Ok(())
+        })?;
+
+        std::fs::remove_dir_all(shards_root)
+            .with_context(|| format!("removing shards root {:?}", shards_root))?;
         Ok(())
     }
 
