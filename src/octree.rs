@@ -890,29 +890,6 @@ impl OctreeBuilder {
     }
 
     /// Convert a `las::Point` to a `RawPoint` using the builder's scale/offset.
-    fn convert_point(&self, p: &las::Point) -> RawPoint {
-        let ix = ((p.x - self.offset_x) / self.scale_x).round() as i32;
-        let iy = ((p.y - self.offset_y) / self.scale_y).round() as i32;
-        let iz = ((p.z - self.offset_z) / self.scale_z).round() as i32;
-        RawPoint {
-            x: ix,
-            y: iy,
-            z: iz,
-            intensity: p.intensity,
-            return_number: p.return_number,
-            number_of_returns: p.number_of_returns,
-            classification: p.classification.into(),
-            scan_angle: (p.scan_angle / 0.006).round() as i16,
-            user_data: p.user_data,
-            point_source_id: p.point_source_id,
-            gps_time: p.gps_time.unwrap_or(0.0),
-            red: p.color.as_ref().map(|c| c.red).unwrap_or(0),
-            green: p.color.as_ref().map(|c| c.green).unwrap_or(0),
-            blue: p.color.as_ref().map(|c| c.blue).unwrap_or(0),
-            nir: p.nir.unwrap_or(0),
-        }
-    }
-
     /// Read all raw points for a given node key from disk.
     pub fn read_node(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
         let path = self.node_path(key);
@@ -1362,16 +1339,29 @@ impl OctreeBuilder {
                 }
 
                 let mut cache = ChunkWriterCache::new(per_worker_cap, self.temp_compression);
-                let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
+                // Reusable scratch buffer for decompressed raw points in
+                // *file frame*. Reprojected to the builder frame below.
+                let mut raw_points: Vec<RawPoint> = Vec::with_capacity(read_chunk_size);
                 // Group buffer reused across batches so capacity amortizes.
                 // Drained at the end of each batch so retained Vec capacity
                 // stays bounded by the working set, not by all-time peak.
                 let mut groups: HashMap<u32, Vec<RawPoint>> = HashMap::new();
 
                 for path in &input_files[start..end] {
-                    let mut reader = las::Reader::from_path(path)
-                        .with_context(|| format!("Cannot open {:?}", path))?;
-                    let file_pts = reader.header().number_of_points();
+                    let meta = crate::laz_read::LazFileMeta::read(path)?;
+                    let file_pts = meta.n_points;
+                    let (fsx, fsy, fsz) = meta.scale;
+                    let (fox, foy, foz) = meta.offset;
+                    // True when the file and the builder share the exact
+                    // same scale/offset, in which case the file-frame i32
+                    // coordinates are already the builder-frame values.
+                    let same_frame = fsx == self.scale_x
+                        && fsy == self.scale_y
+                        && fsz == self.scale_z
+                        && fox == self.offset_x
+                        && foy == self.offset_y
+                        && foz == self.offset_z;
+                    let mut reader = crate::laz_read::RawLazReader::open_full(path, meta)?;
                     debug!(
                         "Chunked distribute worker {} file {:?}: {} points",
                         worker_id,
@@ -1380,8 +1370,8 @@ impl OctreeBuilder {
                     );
 
                     loop {
-                        points.clear();
-                        let n = reader.read_points_into(read_chunk_size as u64, &mut points)?;
+                        raw_points.clear();
+                        let n = reader.read_full_into(&mut raw_points, read_chunk_size)?;
                         if n == 0 {
                             break;
                         }
@@ -1390,11 +1380,20 @@ impl OctreeBuilder {
                         // them in memory before writing. Grouping batches
                         // many points per writer call → fewer LRU touches
                         // and better amortization than per-point appends.
-                        for p in &points {
-                            // Convert via the same RawPoint conversion the
-                            // per-leaf path uses, so the chunked path stores
-                            // the exact same int-coordinate representation.
-                            let raw = self.convert_point(p);
+                        for raw in raw_points.drain(..) {
+                            // Reproject file-frame scaled ints into the
+                            // builder frame. When the file and builder
+                            // share scale/offset (the common single-file
+                            // case), this is a no-op.
+                            let mut raw = raw;
+                            if !same_frame {
+                                let wx = raw.x as f64 * fsx + fox;
+                                let wy = raw.y as f64 * fsy + foy;
+                                let wz = raw.z as f64 * fsz + foz;
+                                raw.x = ((wx - self.offset_x) / self.scale_x).round() as i32;
+                                raw.y = ((wy - self.offset_y) / self.scale_y).round() as i32;
+                                raw.z = ((wz - self.offset_z) / self.scale_z).round() as i32;
+                            }
 
                             // Classify to grid cell via point_to_key at the
                             // grid depth, using round-tripped world coords.
@@ -1428,16 +1427,13 @@ impl OctreeBuilder {
                             groups.entry(chunk_idx).or_default().push(raw);
                         }
 
-                        // Free the las::Point buffer before flushing groups.
-                        points.clear();
-
                         // Flush each group to the cache. Drain so vec capacity
                         // doesn't accumulate across batches.
                         for (chunk_idx, pts) in groups.drain() {
                             cache.append(chunk_idx, shard_dir, &pts)?;
                         }
 
-                        let done = progress.fetch_add(n, Ordering::Relaxed) + n;
+                        let done = progress.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
                         config.report(crate::ProgressEvent::StageProgress { done });
                     }
                 }

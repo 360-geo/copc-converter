@@ -26,6 +26,7 @@
 //! ```
 
 pub(crate) mod copc_types;
+pub(crate) mod laz_read;
 pub(crate) mod octree;
 pub(crate) mod validate;
 pub(crate) mod writer;

@@ -292,31 +292,38 @@ fn count_points(
                 return Ok(());
             }
 
-            // Reuse a single point buffer across files in this worker to
-            // amortize allocation cost.
-            let mut points: Vec<las::Point> = Vec::with_capacity(1_000_000);
+            // Reuse a single scratch buffer of raw scaled `i32` triples
+            // across files in this worker to amortize allocation cost.
+            // The raw LAZ reader decompresses directly into these; no
+            // `las::Point` struct materialization in between.
+            let mut xyz: Vec<[i32; 3]> = Vec::with_capacity(1_000_000);
 
             for path in &input_files[start..end] {
-                let mut reader = las::Reader::from_path(path)
-                    .with_context(|| format!("Cannot open {:?}", path))?;
+                let meta = crate::laz_read::LazFileMeta::read(path)?;
+                let (fsx, fsy, fsz) = meta.scale;
+                let (fox, foy, foz) = meta.offset;
+                let mut reader = crate::laz_read::RawLazReader::open_selective(
+                    path,
+                    meta,
+                    crate::laz_read::xyz_only_selection(),
+                )?;
                 loop {
-                    points.clear();
-                    let n = reader.read_points_into(1_000_000, &mut points)?;
+                    xyz.clear();
+                    let n = reader.read_xyz_into(&mut xyz, 1_000_000)?;
                     if n == 0 {
                         break;
                     }
-                    for p in &points {
-                        // Classify using the same round-tripped coordinates
-                        // the distribute phase will use, so the grid cell
-                        // counted here is exactly the cell the LUT will look
-                        // up for the same point at distribute time. Raw `p.x`
-                        // and `raw.x*scale+offset` can differ by up to half a
-                        // scale step due to LAS scale/offset rounding, which
-                        // would put boundary points in different cells and
-                        // cause point loss during build.
-                        let ix = ((p.x - builder.offset_x) / builder.scale_x).round() as i32;
-                        let iy = ((p.y - builder.offset_y) / builder.scale_y).round() as i32;
-                        let iz = ((p.z - builder.offset_z) / builder.scale_z).round() as i32;
+                    for triple in &xyz {
+                        // File-frame scaled ints → world coordinates (using
+                        // the file's own scale/offset) → builder-frame
+                        // round-tripped coordinates, matching the exact
+                        // quantization the partition pass will apply.
+                        let fwx = triple[0] as f64 * fsx + fox;
+                        let fwy = triple[1] as f64 * fsy + foy;
+                        let fwz = triple[2] as f64 * fsz + foz;
+                        let ix = ((fwx - builder.offset_x) / builder.scale_x).round() as i32;
+                        let iy = ((fwy - builder.offset_y) / builder.scale_y).round() as i32;
+                        let iz = ((fwz - builder.offset_z) / builder.scale_z).round() as i32;
                         let wx = ix as f64 * builder.scale_x + builder.offset_x;
                         let wy = iy as f64 * builder.scale_y + builder.offset_y;
                         let wz = iz as f64 * builder.scale_z + builder.offset_z;
@@ -340,7 +347,7 @@ fn count_points(
                         let idx = gx + gy * g + gz * g * g;
                         grid[idx].fetch_add(1, Ordering::Relaxed);
                     }
-                    let done = progress.fetch_add(n, Ordering::Relaxed) + n;
+                    let done = progress.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
                     // Reuse the existing pipeline progress channel so the
                     // analyze tool's CLI can show a familiar progress bar.
                     // The stage was started by the caller.
