@@ -1,3 +1,4 @@
+use crate::copc_types::VoxelKey;
 /// Out-of-core octree builder.
 ///
 /// Strategy
@@ -14,8 +15,7 @@
 /// 6. Produce the list of (VoxelKey, point_count) for the writer, which reads from disk.
 ///
 /// Memory usage is bounded by the configurable memory budget.
-use crate::PipelineConfig;
-use crate::copc_types::VoxelKey;
+use crate::{Error, PipelineConfig};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
@@ -728,6 +728,7 @@ pub fn input_to_copc_format(id: u8) -> u8 {
 }
 
 /// Per-file results from the scan phase, used by validation.
+#[derive(Debug, Clone)]
 pub struct ScanResult {
     pub bounds: Bounds,
     pub point_count: u64,
@@ -737,8 +738,145 @@ pub struct ScanResult {
     pub offset_x: f64,
     pub offset_y: f64,
     pub offset_z: f64,
-    pub wkt_crs: Option<Vec<u8>>,
+    pub crs: Option<Crs>,
     pub point_format_id: u8,
+}
+
+/// An enum describing the supported Crs options
+#[derive(Debug, Clone)]
+pub enum Crs {
+    Wkt(Vec<u8>),
+    GeoTiffEpsg(u16, Option<u16>),
+}
+
+impl Crs {
+    pub fn is_equal_to(&self, other: &Self) -> Result<bool> {
+        match (self, other) {
+            (Self::Wkt(l_bytes), Self::Wkt(r_bytes)) => {
+                // first check byte for byte eq
+                if l_bytes == r_bytes {
+                    return Ok(true);
+                }
+                // Try and grab epsg codes
+                let epsg_l = get_epsg_from_wkt_crs_bytes(l_bytes)?;
+                let epsg_r = get_epsg_from_wkt_crs_bytes(r_bytes)?;
+
+                Ok(epsg_l == epsg_r)
+            }
+            (Self::GeoTiffEpsg(l0, l1), Self::GeoTiffEpsg(r0, r1)) => Ok(l0 == r0 && l1 == r1),
+            (Self::GeoTiffEpsg(horizontal, vertical), Self::Wkt(bytes)) => {
+                let epsg_r = get_epsg_from_wkt_crs_bytes(bytes)?;
+                Ok(horizontal == &epsg_r.0 && vertical == &epsg_r.1)
+            }
+            (Self::Wkt(bytes), Self::GeoTiffEpsg(horizontal, vertical)) => {
+                let epsg_l = get_epsg_from_wkt_crs_bytes(bytes)?;
+                Ok(horizontal == &epsg_l.0 && vertical == &epsg_l.1)
+            }
+        }
+    }
+
+    pub fn is_equal_to_ignore_vertical_component(&self, other: &Self) -> Result<bool> {
+        match (self, other) {
+            (Self::Wkt(l_bytes), Self::Wkt(r_bytes)) => {
+                // first check byte for byte eq
+                if l_bytes == r_bytes {
+                    return Ok(true);
+                }
+                // Try and grab epsg codes
+                let epsg_l = get_epsg_from_wkt_crs_bytes(l_bytes)?;
+                let epsg_r = get_epsg_from_wkt_crs_bytes(r_bytes)?;
+                Ok(epsg_l.0 == epsg_r.0)
+            }
+            (Self::GeoTiffEpsg(l0, _l1), Self::GeoTiffEpsg(r0, _r1)) => Ok(l0 == r0),
+            (Self::GeoTiffEpsg(horizontal, _vertical), Self::Wkt(bytes)) => {
+                let epsg_r = get_epsg_from_wkt_crs_bytes(bytes)?;
+                Ok(horizontal == &epsg_r.0)
+            }
+            (Self::Wkt(bytes), Self::GeoTiffEpsg(horizontal, _vertical)) => {
+                let epsg_l = get_epsg_from_wkt_crs_bytes(bytes)?;
+                Ok(horizontal == &epsg_l.0)
+            }
+        }
+    }
+}
+
+/// Tries to parse EPSG code(s) from WKT-CRS bytes.
+///
+/// By parsing the EPSG codes at the end of the vertical and horizontal CRS sub-strings
+/// This is not true WKT parser and might provide a bad code if
+/// the WKT-CRS bytes does not look as expected
+pub fn get_epsg_from_wkt_crs_bytes(bytes: &[u8]) -> Result<(u16, Option<u16>)> {
+    pub const EPSG_RANGE: std::ops::Range<u16> = 1024..(i16::MAX as u16);
+    let wkt = String::from_utf8_lossy(bytes);
+
+    enum WktPieces<'a> {
+        One(&'a [u8]),
+        Two(&'a [u8], &'a [u8]),
+    }
+
+    impl WktPieces<'_> {
+        fn parse_codes(&self) -> (u16, Option<u16>) {
+            match self {
+                WktPieces::One(hor) => (Self::get_code(hor), None),
+                WktPieces::Two(hor, ver) => (Self::get_code(hor), Some(Self::get_code(ver))),
+            }
+        }
+
+        fn get_code(bytes: &[u8]) -> u16 {
+            // the EPSG code is located at the end of the substrings
+            // and so we iterate through the substrings backwards collecting
+            // digits and adding them to our EPSG code
+            let mut epsg_code = 0;
+            let mut code_has_started = false;
+            let mut power = 1;
+            // the 10 last bytes should be enough (with a small margin)
+            // as the code is 4 or 5 digits starting at the 2nd or 3rd byte from the back
+            for byte in bytes.trim_ascii_end().iter().rev().take(10) {
+                // if the byte is an ASCII encoded digit
+                if byte.is_ascii_digit() {
+                    // mark that the EPSG code has started
+                    // so that we can break when we no
+                    // longer find digits
+                    code_has_started = true;
+
+                    // translate from ASCII to digits
+                    // and multiply by powers of 10
+                    // sum it to build the EPSG
+                    // code digit by digit
+                    epsg_code += power * (byte - 48) as u16;
+                    power *= 10;
+                } else if code_has_started {
+                    // we no longer see digits
+                    // so the code must be over
+                    break;
+                }
+            }
+            epsg_code
+        }
+    }
+
+    // VERT_CS for WKT v1 and VERTCRS or VERTICALCRS for v2
+    let pieces = if let Some((horizontal, vertical)) = wkt.split_once("VERTCRS") {
+        WktPieces::Two(horizontal.as_bytes(), vertical.as_bytes())
+    } else if let Some((horizontal, vertical)) = wkt.split_once("VERTICALCRS") {
+        WktPieces::Two(horizontal.as_bytes(), vertical.as_bytes())
+    } else if let Some((horizontal, vertical)) = wkt.split_once("VERT_CS") {
+        WktPieces::Two(horizontal.as_bytes(), vertical.as_bytes())
+    } else {
+        WktPieces::One(wkt.as_bytes())
+    };
+
+    let mut codes = pieces.parse_codes();
+
+    if !EPSG_RANGE.contains(&codes.0) {
+        return Err(Error::InvalidEpsgCrs(codes.0).into());
+    }
+    if let Some(v_code) = codes.1
+        && !EPSG_RANGE.contains(&v_code)
+    {
+        codes.1 = None;
+    }
+    Ok(codes)
 }
 
 /// Builds a COPC octree from scanned input files.
@@ -790,28 +928,40 @@ impl OctreeBuilder {
                 debug!("Scanning {:?}", path);
                 let reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
-                let hdr = reader.header();
-                let b = hdr.bounds();
+                let header = reader.header();
+                let b = header.bounds();
                 let mut bounds = Bounds::empty();
                 bounds.expand_with(b.min.x, b.min.y, b.min.z);
                 bounds.expand_with(b.max.x, b.max.y, b.max.z);
-                let t = hdr.transforms();
+                let t = header.transforms();
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 config.report(crate::ProgressEvent::StageProgress { done: n });
+
+                let crs = if let Some(wkt) = header.get_wkt_crs_bytes() {
+                    Some(Crs::Wkt(wkt.to_owned()))
+                } else if let Ok(Some(geotiff)) = header.get_geotiff_crs() {
+                    let horizontal = match geotiff.get_gt_model_type_geo_key_value() {
+                        Some(1) => geotiff.get_projected_crs_geo_key_value(),
+                        Some(2) | Some(3) => geotiff.get_geodetic_crs_geo_key_value(),
+                        _ => None,
+                    };
+                    let vertical = geotiff.get_vertical_crs_geo_key_value();
+                    horizontal.map(|horizontal| Crs::GeoTiffEpsg(horizontal, vertical))
+                } else {
+                    None
+                };
+
                 Ok(ScanResult {
                     bounds,
-                    point_count: hdr.number_of_points(),
+                    point_count: header.number_of_points(),
                     scale_x: t.x.scale,
                     scale_y: t.y.scale,
                     scale_z: t.z.scale,
                     offset_x: t.x.offset,
                     offset_y: t.y.offset,
                     offset_z: t.z.offset,
-                    wkt_crs: hdr
-                        .all_vlrs()
-                        .find(|v| v.is_wkt_crs())
-                        .map(|v| v.data.clone()),
-                    point_format_id: hdr.point_format().to_u8().unwrap_or(0),
+                    crs,
+                    point_format_id: header.point_format().to_u8().unwrap_or(0),
                 })
             })
             .collect();

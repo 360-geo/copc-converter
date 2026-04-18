@@ -66,6 +66,10 @@ pub enum Error {
         file_b: PathBuf,
     },
 
+    /// The parsed epsg code from the Crs data is out of range
+    #[error("The parsed Epsg Crs code is not in range")]
+    InvalidEpsgCrs(u16),
+
     /// Input files have mismatched point formats.
     #[error(
         "Point format mismatch: {file_a:?} has format {format_a} but {file_b:?} has format {format_b}"
