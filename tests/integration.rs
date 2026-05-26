@@ -695,7 +695,7 @@ fn temporal_index_present_when_enabled() {
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output,
-        &["--temporal-index"],
+        &["--temporal-index", "1000"],
     );
 
     let data = read_file(output);
@@ -745,7 +745,7 @@ fn temporal_index_samples_are_sorted() {
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output,
-        &["--temporal-index", "--temporal-stride", "500"],
+        &["--temporal-index", "500"],
     );
 
     let data = read_file(output);
@@ -797,7 +797,7 @@ fn temporal_index_custom_stride() {
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output,
-        &["--temporal-index", "--temporal-stride", "100"],
+        &["--temporal-index", "100"],
     );
 
     let data = read_file(output);
@@ -812,7 +812,7 @@ fn temporal_index_custom_stride() {
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output2,
-        &["--temporal-index", "--temporal-stride", "5000"],
+        &["--temporal-index", "5000"],
     );
 
     let data2 = read_file(output2);
@@ -954,7 +954,7 @@ fn temporal_index_readable_by_streaming_crate() {
     run_converter_with_args(
         Path::new("tests/data/input.laz"),
         output,
-        &["--temporal-index"],
+        &["--temporal-index", "1000"],
     );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
