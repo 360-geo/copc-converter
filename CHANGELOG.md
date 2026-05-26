@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-26
+
+### Changed
+
+- **Breaking:** Merged `--temporal-index` and `--temporal-stride` into a single
+  `--temporal-index <STRIDE>` option. Passing the flag now both enables the
+  temporal index EVLR and sets the sampling stride (every n-th point); omitting
+  it disables the index. The previous `--temporal-index` boolean flag and the
+  separate `--temporal-stride` option are gone. (#19)
+- **Breaking (API):** `PipelineConfig.temporal_index` changed from `bool` to
+  `Option<u32>` and the `temporal_stride` field was removed. Migrate
+  `temporal_index: true, temporal_stride: 1000` to `temporal_index: Some(1000)`,
+  and `temporal_index: false` to `temporal_index: None`.
+
+### Added
+
+- New `Error::InvalidTemporalStride` variant returned when the temporal index is
+  requested with a stride that can't produce a valid index.
+
 ## [0.9.15] - 2026-05-20
 
 ### Fixed
@@ -60,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validation enforces an identical VLR and uniform `num_extra_bytes` across
   inputs.
 
-[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.9.15...HEAD
+[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/360-geo/copc-converter/compare/v0.9.15...v0.10.0
 [0.9.15]: https://github.com/360-geo/copc-converter/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/360-geo/copc-converter/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/360-geo/copc-converter/compare/v0.9.12...v0.9.13
