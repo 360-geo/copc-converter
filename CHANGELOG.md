@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Multi-file inputs with disjoint extents no longer collapse outlying points
+  onto a single wrong coordinate. The output's scale and offset were taken
+  blindly from the first input file, so points whose true coordinate sat more
+  than `i32::MAX × scale` from that offset would saturate during the
+  `f64 → i32` cast and pile up on the i32 boundary (e.g. ~22 000 m of Y
+  collapsed onto a single Y value). `OctreeBuilder::from_scan` now re-centers
+  the offset on the combined-bounds midpoint when the first file's offset
+  doesn't span the merged extent, and doubles the scale if even the
+  half-extent still won't fit in i32.
+
 ## [0.9.15] - 2026-05-20
 
 ### Fixed

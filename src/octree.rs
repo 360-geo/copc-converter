@@ -721,6 +721,32 @@ impl Bounds {
     }
 }
 
+/// Headroom kept below `i32::MAX` when checking whether
+/// `(world − offset) / scale` is representable. Leaves room for rounding,
+/// the half-scale-unit pad added by [`Bounds::to_cube`], and any tiny
+/// expansion (e.g. an extra point one ULP past the header bounds).
+const I32_HEADROOM: f64 = 2_147_400_000.0;
+
+/// Ensure `min..=max` is representable as `i32 = (world − offset) / scale`.
+///
+/// First re-centers `offset` on the midpoint of `min..max` when the existing
+/// offset would put either endpoint outside the headroom. Then doubles
+/// `scale` until the half-extent fits. Returns `true` iff either value was
+/// changed, so the caller can log the adjustment.
+fn fit_offset_scale(offset: &mut f64, scale: &mut f64, min: f64, max: f64) -> bool {
+    let fits = |o: f64, s: f64| -> bool {
+        ((min - o) / s).abs() <= I32_HEADROOM && ((max - o) / s).abs() <= I32_HEADROOM
+    };
+    let original = (*offset, *scale);
+    if !fits(*offset, *scale) {
+        *offset = 0.5 * (min + max);
+    }
+    while !fits(*offset, *scale) {
+        *scale *= 2.0;
+    }
+    (*offset, *scale) != original
+}
+
 // ---------------------------------------------------------------------------
 // VoxelKey assignment
 // ---------------------------------------------------------------------------
@@ -927,17 +953,20 @@ pub struct OctreeBuilder {
     pub cz: f64,
     /// Half-size of the root voxel.
     pub halfsize: f64,
-    /// X scale factor from the first input file.
+    /// X scale factor. Inherited from the first input file when the combined
+    /// bounds fit in i32 around `offset_x`; otherwise doubled until they do.
     pub scale_x: f64,
-    /// Y scale factor.
+    /// Y scale factor; see [`Self::scale_x`].
     pub scale_y: f64,
-    /// Z scale factor.
+    /// Z scale factor; see [`Self::scale_x`].
     pub scale_z: f64,
-    /// X offset.
+    /// X offset. Inherited from the first input file when its value puts the
+    /// combined min/max within i32 range at `scale_x`; otherwise re-centered
+    /// on the combined-bounds midpoint.
     pub offset_x: f64,
-    /// Y offset.
+    /// Y offset; see [`Self::offset_x`].
     pub offset_y: f64,
-    /// Z offset.
+    /// Z offset; see [`Self::offset_x`].
     pub offset_z: f64,
     /// Temp directory where node files are written.
     pub tmp_dir: PathBuf,
@@ -1085,8 +1114,29 @@ impl OctreeBuilder {
         }
 
         let first = &scan_results[0];
-        let (scale_x, scale_y, scale_z) = (first.scale_x, first.scale_y, first.scale_z);
-        let (offset_x, offset_y, offset_z) = (first.offset_x, first.offset_y, first.offset_z);
+        let (mut scale_x, mut scale_y, mut scale_z) = (first.scale_x, first.scale_y, first.scale_z);
+        let (mut offset_x, mut offset_y, mut offset_z) =
+            (first.offset_x, first.offset_y, first.offset_z);
+
+        // Points are encoded as `i32 = round((world - offset) / scale)`. The
+        // first input's offset/scale are sized for that file's bounds; when
+        // multiple files have disjoint extents, points from outlying files
+        // can fall outside the i32 representable range. Rust's saturating
+        // `f64 as i32` cast then clamps every overflowing point to
+        // `i32::MIN`/`MAX`, collapsing them onto the same wrong coordinate.
+        // Re-center the offset and, if necessary, coarsen the scale so the
+        // combined bounds fit. Scale only ever grows (precision is never
+        // tightened beyond what the first file claimed).
+        let adjusted_x = fit_offset_scale(&mut offset_x, &mut scale_x, bounds.min_x, bounds.max_x);
+        let adjusted_y = fit_offset_scale(&mut offset_y, &mut scale_y, bounds.min_y, bounds.max_y);
+        let adjusted_z = fit_offset_scale(&mut offset_z, &mut scale_z, bounds.min_z, bounds.max_z);
+        if adjusted_x || adjusted_y || adjusted_z {
+            info!(
+                "Adjusted output offset/scale to fit combined extents in i32: \
+                 offset=({offset_x:.6}, {offset_y:.6}, {offset_z:.6}) \
+                 scale=({scale_x:e}, {scale_y:e}, {scale_z:e})",
+            );
+        }
 
         let (cx, cy, cz, halfsize) = bounds.to_cube(scale_x, scale_y, scale_z);
 
@@ -2196,6 +2246,56 @@ impl Drop for OctreeBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_offset_scale_keeps_first_file_offset_when_bounds_fit() {
+        // Single-file or homogeneous-extent inputs should be bit-identical
+        // to prior versions: untouched offset and scale.
+        let mut offset = 122_243.6;
+        let mut scale = 0.001;
+        let changed = fit_offset_scale(&mut offset, &mut scale, 122_200.0, 122_287.146);
+        assert!(!changed);
+        assert_eq!(offset, 122_243.6);
+        assert_eq!(scale, 0.001);
+    }
+
+    #[test]
+    fn fit_offset_scale_recenters_when_first_file_offset_is_far() {
+        // Reproduces the disjoint-multi-file Y-clumping bug: the first
+        // file's offset sits at the top of the combined Y range, so the
+        // bottom of the range encodes to ~-4.5e9, well past i32::MIN.
+        // The fix re-centers offset on the combined midpoint; the half
+        // extent then fits comfortably in i32 at the original scale.
+        let mut offset = 455_444.84;
+        let mut scale = 1e-5;
+        let changed = fit_offset_scale(&mut offset, &mut scale, 410_823.89, 455_651.89);
+        assert!(changed);
+        // Re-centered.
+        assert!((offset - 433_237.89).abs() < 0.01, "offset = {offset}");
+        // Scale doubled once: half-extent 22414m / 1e-5 = 2.24e9 > headroom,
+        // so we need 2e-5 (half-extent / 2e-5 = 1.12e9, fits).
+        assert_eq!(scale, 2e-5);
+        // Sanity: both endpoints now fit in i32 with the chosen offset/scale.
+        let lo = ((410_823.89 - offset) / scale).round();
+        let hi = ((455_651.89 - offset) / scale).round();
+        assert!(lo >= i32::MIN as f64 && hi <= i32::MAX as f64);
+    }
+
+    #[test]
+    fn fit_offset_scale_grows_scale_for_extreme_spans() {
+        // Span so wide even a midpoint offset can't fit in i32 at the
+        // input scale; helper should double until it does.
+        let mut offset = 0.0;
+        let mut scale = 1e-5;
+        let half_extent = 100_000.0; // 100km half-span → 200km total
+        let changed = fit_offset_scale(&mut offset, &mut scale, -half_extent, half_extent);
+        assert!(changed);
+        assert_eq!(offset, 0.0); // midpoint
+        assert!(half_extent / scale <= I32_HEADROOM);
+        // Should be a power-of-two multiple of the original scale.
+        let ratio = (scale / 1e-5).round() as u32;
+        assert!(ratio.is_power_of_two(), "scale ratio = {ratio}");
+    }
 
     #[test]
     fn to_cube_pads_halfsize_by_one_scale_unit() {
