@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-05-28
+
 ### Fixed
 
 - Multi-file inputs with disjoint extents no longer collapse outlying points
@@ -17,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapsed onto a single Y value). `OctreeBuilder::from_scan` now re-centers
   the offset on the combined-bounds midpoint when the first file's offset
   doesn't span the merged extent, and doubles the scale if even the
-  half-extent still won't fit in i32.
+  half-extent still won't fit in i32. (#20)
 
 ## [0.10.0] - 2026-05-26
 
@@ -91,7 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validation enforces an identical VLR and uniform `num_extra_bytes` across
   inputs.
 
-[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/360-geo/copc-converter/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/360-geo/copc-converter/compare/v0.9.15...v0.10.0
 [0.9.15]: https://github.com/360-geo/copc-converter/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/360-geo/copc-converter/compare/v0.9.13...v0.9.14
