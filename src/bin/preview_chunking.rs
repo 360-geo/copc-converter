@@ -408,8 +408,7 @@ fn main() -> Result<()> {
     let config = PipelineConfig {
         memory_budget,
         temp_dir: None,
-        temporal_index: false,
-        temporal_stride: 1000,
+        temporal_index: None,
         progress: Some(progress),
         // The analyze tool has its own --chunk-target flag; it plumbs it
         // through separately to `validated.analyze_chunking(...)` rather

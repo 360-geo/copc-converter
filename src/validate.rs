@@ -77,7 +77,7 @@ pub fn validate(
     results: &[ScanResult],
     canonical_wkt: Option<Vec<u8>>,
     canonical_extra_bytes_vlr: Option<Vec<u8>>,
-    temporal_index: bool,
+    temporal_index: Option<u32>,
 ) -> crate::Result<ValidatedInputs> {
     // If no input file carried a WKT CRS but at least one carried a
     // GeoTIFF EPSG, synthesize a canonical WKT from the registry. The
@@ -180,10 +180,18 @@ pub fn validate(
         ));
     }
 
-    if temporal_index && !format_has_gps_time(first_format) {
-        return Err(Error::NoGpsTime {
-            format: first_format,
-        });
+    if let Some(temporal_stride) = temporal_index {
+        if temporal_stride == 0 {
+            return Err(Error::InvalidTemporalStride {
+                stride: temporal_stride,
+            });
+        }
+
+        if !format_has_gps_time(first_format) {
+            return Err(Error::NoGpsTime {
+                format: first_format,
+            });
+        }
     }
 
     // Stat-merge: take the canonical VLR bytes (first file's payload)
@@ -346,7 +354,7 @@ mod tests {
     fn validate_single_file() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 3)];
-        let v = validate(&files, &results, None, None, false).unwrap();
+        let v = validate(&files, &results, None, None, None).unwrap();
         assert_eq!(v.point_format, 7);
         assert!(v.wkt_crs.is_none());
         assert!(v.extra_bytes_vlr.is_none());
@@ -361,7 +369,7 @@ mod tests {
             make_result(Some(CrsKind::WktHash(h)), 8),
             make_result(Some(CrsKind::WktHash(h)), 8),
         ];
-        let v = validate(&files, &results, Some(WGS84_WKT.to_vec()), None, false).unwrap();
+        let v = validate(&files, &results, Some(WGS84_WKT.to_vec()), None, None).unwrap();
         assert_eq!(v.point_format, 8);
         assert_eq!(v.wkt_crs.as_deref(), Some(WGS84_WKT));
     }
@@ -373,7 +381,7 @@ mod tests {
             make_result(Some(CrsKind::WktHash(bytes_hash(EPSG3006_WKT))), 7),
             make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7),
         ];
-        let v = validate(&files, &results, Some(EPSG3006_WKT.to_vec()), None, false).unwrap();
+        let v = validate(&files, &results, Some(EPSG3006_WKT.to_vec()), None, None).unwrap();
         assert_eq!(v.wkt_crs.as_deref(), Some(EPSG3006_WKT));
     }
 
@@ -386,7 +394,7 @@ mod tests {
         ];
         // canonical_wkt comes from the WKT file (file 1), even though the
         // GeoTIFF file is listed first.
-        let v = validate(&files, &results, Some(EPSG3006_WKT.to_vec()), None, false).unwrap();
+        let v = validate(&files, &results, Some(EPSG3006_WKT.to_vec()), None, None).unwrap();
         assert_eq!(v.wkt_crs.as_deref(), Some(EPSG3006_WKT));
     }
 
@@ -397,7 +405,7 @@ mod tests {
             make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7),
             make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7),
         ];
-        let v = validate(&files, &results, None, None, false).unwrap();
+        let v = validate(&files, &results, None, None, None).unwrap();
         // The registry returns *some* WKT for EPSG:3006; we don't pin
         // the exact bytes (depends on crs-definitions version).
         assert!(v.wkt_crs.is_some());
@@ -412,7 +420,7 @@ mod tests {
             make_result(Some(CrsKind::WktHash(bytes_hash(WGS84_WKT))), 7),
             make_result(Some(CrsKind::WktHash(bytes_hash(EPSG3006_WKT))), 7),
         ];
-        let err = validate(&files, &results, Some(WGS84_WKT.to_vec()), None, false).unwrap_err();
+        let err = validate(&files, &results, Some(WGS84_WKT.to_vec()), None, None).unwrap_err();
         assert!(matches!(err, Error::CrsMismatch { .. }));
     }
 
@@ -420,7 +428,7 @@ mod tests {
     fn validate_format_mismatch() {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
         let results = vec![make_result(None, 3), make_result(None, 7)];
-        let err = validate(&files, &results, None, None, false).unwrap_err();
+        let err = validate(&files, &results, None, None, None).unwrap_err();
         assert!(matches!(err, Error::PointFormatMismatch { .. }));
     }
 
@@ -428,7 +436,7 @@ mod tests {
     fn validate_temporal_index_requires_gps_time() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 0)];
-        let err = validate(&files, &results, None, None, true).unwrap_err();
+        let err = validate(&files, &results, None, None, Some(1000)).unwrap_err();
         assert!(matches!(err, Error::NoGpsTime { .. }));
     }
 
@@ -436,7 +444,7 @@ mod tests {
     fn validate_temporal_index_with_gps_time() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 1)];
-        let v = validate(&files, &results, None, None, true).unwrap();
+        let v = validate(&files, &results, None, None, Some(1000)).unwrap();
         assert_eq!(v.point_format, 6);
     }
 
@@ -449,7 +457,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 8, 3),
             make_result_with_extras(None, parsed_b, 8, 3),
         ];
-        let v = validate(&files, &results, None, Some(canonical), false).unwrap();
+        let v = validate(&files, &results, None, Some(canonical), None).unwrap();
         assert_eq!(v.num_extra_bytes, 8);
         let merged = ParsedExtraBytes::parse(v.extra_bytes_vlr.as_ref().unwrap()).unwrap();
         assert_eq!(merged.stats[0].min[0], -1.0);
@@ -469,7 +477,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 8, 3),
             make_result_with_extras(None, parsed_b, 8, 3),
         ];
-        let v = validate(&files, &results, None, Some(canonical), false).unwrap();
+        let v = validate(&files, &results, None, Some(canonical), None).unwrap();
         let merged = ParsedExtraBytes::parse(v.extra_bytes_vlr.as_ref().unwrap()).unwrap();
         // Output stats must be the union: min from a, max from b.
         assert_eq!(merged.stats[0].min[0], -4.5);
@@ -485,7 +493,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 2, 3),
             make_result_with_extras(None, parsed_b, 4, 3),
         ];
-        let err = validate(&files, &results, None, Some(canonical), false).unwrap_err();
+        let err = validate(&files, &results, None, Some(canonical), None).unwrap_err();
         let Error::ExtraBytesMismatch {
             file_a,
             file_b,
@@ -518,7 +526,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 8, 3),
             make_result(None, 3), // no extras
         ];
-        let err = validate(&files, &results, None, Some(canonical), false).unwrap_err();
+        let err = validate(&files, &results, None, Some(canonical), None).unwrap_err();
         let Error::ExtraBytesMismatch { detail, .. } = err else {
             panic!("expected ExtraBytesMismatch");
         };
@@ -544,7 +552,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 2, 3),
             make_result_with_extras(None, parsed_b, 4, 3),
         ];
-        let err = validate(&files, &results, None, Some(canonical), false).unwrap_err();
+        let err = validate(&files, &results, None, Some(canonical), None).unwrap_err();
         let Error::ExtraBytesMismatch { detail, .. } = err else {
             panic!("expected ExtraBytesMismatch");
         };

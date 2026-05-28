@@ -10,8 +10,7 @@
 //! let config = PipelineConfig {
 //!     memory_budget: 12_884_901_888,
 //!     temp_dir: None,
-//!     temporal_index: false,
-//!     temporal_stride: 1000,
+//!     temporal_index: None,
 //!     progress: None,
 //!     chunk_target_override: None,
 //!     temp_compression: copc_converter::TempCompression::None,
@@ -107,6 +106,13 @@ pub enum Error {
     NoGpsTime {
         /// The incompatible point format.
         format: u8,
+    },
+
+    /// Temporal index requested but with an invalid temporal stride.
+    #[error("Temporal index requested but with an invalid temporal stride of {stride}.")]
+    InvalidTemporalStride {
+        /// The invalide temporal stride
+        stride: u32,
     },
 
     /// No LAZ/LAS files found in a directory.
@@ -217,10 +223,8 @@ pub struct PipelineConfig {
     pub memory_budget: u64,
     /// Optional custom temp directory.
     pub temp_dir: Option<PathBuf>,
-    /// Whether to write a temporal index EVLR.
-    pub temporal_index: bool,
-    /// Sampling stride for temporal index.
-    pub temporal_stride: u32,
+    /// Whether to write a temporal index EVLR and the sampling stride for the temporal index.
+    pub temporal_index: Option<u32>,
     /// Optional progress observer for reporting pipeline progress.
     pub progress: Option<std::sync::Arc<dyn ProgressObserver>>,
     /// Optional override for the chunk target size (in points). `None`

@@ -243,7 +243,11 @@ pub fn write_copc(
     w.write_f64::<LittleEndian>(min_z)?;
     w.write_u64::<LittleEndian>(0)?; // start of waveform data
     w.write_u64::<LittleEndian>(0)?; // start_of_first_EVLR – patched below
-    let num_evlrs: u32 = if config.temporal_index { 2 } else { 1 };
+    let num_evlrs: u32 = if config.temporal_index.is_some() {
+        2
+    } else {
+        1
+    };
     w.write_u32::<LittleEndian>(num_evlrs)?; // number of EVLRs
     w.write_u64::<LittleEndian>(actual_total_points)?;
     for _ in 0..15 {
@@ -383,8 +387,7 @@ pub fn write_copc(
     let mut gpstime_min = f64::MAX;
     let mut gpstime_max = f64::MIN;
     let mut temporal_entries: Vec<TemporalIndexEntry> = Vec::new();
-    let temporal_index = config.temporal_index;
-    let temporal_stride = config.temporal_stride as usize;
+    let temporal_index = config.temporal_index.map(|ts| ts as usize);
 
     let mut batch_start = 0;
     while batch_start < data_keys.len() {
@@ -446,7 +449,9 @@ pub fn write_copc(
                     if rp.gps_time > local_gps_max {
                         local_gps_max = rp.gps_time;
                     }
-                    if temporal_index && (i % temporal_stride == 0 || i == pts.len() - 1) {
+                    if let Some(stride) = temporal_index
+                        && (i % stride == 0 || i == pts.len() - 1)
+                    {
                         samples.push(rp.gps_time);
                     }
                     encode_point(rp, point_format, &mut raw_bytes);
@@ -478,7 +483,7 @@ pub fn write_copc(
             if local_max > gpstime_max {
                 gpstime_max = local_max;
             }
-            if temporal_index {
+            if temporal_index.is_some() {
                 temporal_entries.push(TemporalIndexEntry {
                     key: batch[i],
                     samples,
@@ -609,14 +614,14 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     // EVLR: temporal index (optional) — v2 paged layout
     // -----------------------------------------------------------------------
-    if config.temporal_index {
+    if let Some(temporal_stride) = temporal_index {
         // Current file position is where the EVLR record header starts.
         // The EVLR data payload begins 60 bytes later.
         let temporal_evlr_start = w.stream_position()?;
         let evlr_data_start = temporal_evlr_start + EVLR_HEADER_SIZE as u64;
 
         let temporal_payload =
-            build_temporal_payload(&temporal_entries, config.temporal_stride, evlr_data_start)?;
+            build_temporal_payload(&temporal_entries, temporal_stride as u32, evlr_data_start)?;
 
         write_evlr(
             &mut w,

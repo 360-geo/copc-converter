@@ -36,13 +36,11 @@ struct Args {
     #[arg(long)]
     temp_dir: Option<PathBuf>,
 
-    /// Enable temporal index EVLR for GPS-time-based queries
+    /// Enable temporal index EVLR for GPS-time-based queries by setting the sampling stride for temporal index (every n-th point).
+    /// Good value: 1000
+    /// Default: None
     #[arg(long)]
-    temporal_index: bool,
-
-    /// Sampling stride for temporal index (every n-th point). Default: 1000
-    #[arg(long, default_value_t = 1000)]
-    temporal_stride: u32,
+    temporal_index: Option<u32>,
 
     /// Progress output format: "bar" (default, interactive), "plain" (log lines),
     /// or "json" (NDJSON, one JSON object per line)
@@ -544,7 +542,6 @@ fn main() -> Result<()> {
         memory_budget,
         temp_dir: args.temp_dir,
         temporal_index: args.temporal_index,
-        temporal_stride: args.temporal_stride,
         progress: Some(progress),
         chunk_target_override: args.chunk_target,
         temp_compression: args.temp_compression.into(),

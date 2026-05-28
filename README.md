@@ -58,8 +58,7 @@ copc_converter ./tiles/ merged.copc.laz
 | `--memory-limit` | Max memory budget (`16G`, `4096M`, etc.) | auto-detected |
 | `--threads` | Max parallel threads | all cores |
 | `--temp-dir` | Directory for intermediate files | system temp |
-| `--temporal-index` | Write a temporal index EVLR for time-based queries | off |
-| `--temporal-stride` | Sampling stride for the temporal index (every n-th point) | `1000` |
+| `--temporal-index` | Set the sampling stride for writing a temporal index EVLR for time-based queries (every n-th point). Good value (depending on density): 1000 | off |
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
 | `--temp-compression` | Compress scratch temp files: `none` or `lz4` | `none` |
 | `--node-storage` | Per-node temp layout: `files` or `packed` | `files` |
@@ -124,8 +123,7 @@ let files = collect_input_files("./tiles/".into())?;
 let config = PipelineConfig {
     memory_budget: 12_884_901_888,
     temp_dir: None,
-    temporal_index: false,
-    temporal_stride: 1000,
+    temporal_index: None,
     progress: None, // or Some(Arc::new(your_observer))
     chunk_target_override: None,
     temp_compression: TempCompression::None,
