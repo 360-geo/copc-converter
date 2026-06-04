@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Inputs whose dense data is spread across a very large extent (e.g. a few
+  small dense regions scattered across a whole country) no longer OOM during
+  the build step. The counting grid has a fixed resolution, so over a huge
+  extent a single grid cell can cover kilometres of ground and collect far
+  more than the chunk target — the planner then emitted one enormous chunk per
+  such cell, and the build loaded it whole into memory. The chunk planner now
+  sub-splits an over-target finest-grid cell into deeper octree sub-chunks
+  (routed during distribute via a deeper descent), and the build step gained a
+  spill path that sub-divides any chunk whose actual point distribution still
+  exceeds the per-chunk memory budget — guaranteeing bounded build memory
+  regardless of how points concentrate inside a cell. This makes large,
+  geographically sparse datasets convert within a small `--memory-limit`.
+
 ## [0.10.1] - 2026-05-28
 
 ### Fixed

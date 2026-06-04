@@ -1185,6 +1185,63 @@ fn chunked_multi_chunk_preserves_all_points() {
     let _ = std::fs::remove_file(output);
 }
 
+/// Force the build-side spill path: a moderate `--chunk-target` keeps the
+/// planner from over-splitting, while a tiny `--memory-limit` makes the
+/// resulting chunks far exceed the per-chunk in-memory budget. That drives
+/// `build_chunk_spilled` (sub-octant counting → bounded subtree builds →
+/// local merge to the chunk root), which must conserve every point exactly.
+///
+/// This is the regression guard for the disjoint-extent OOM: dense data
+/// concentrated in few chunks must build within a small memory budget without
+/// losing or duplicating points.
+#[test]
+fn build_side_spill_preserves_all_points() {
+    let output = Path::new("tests/data/test_build_spill.copc.laz");
+    run_converter_with_args(
+        Path::new("tests/data/input.laz"),
+        output,
+        // chunk-target 200K → ~4-5 chunks on the ~830K-point input (multiple
+        // chunk roots → the cross-chunk merge runs). memory 16M → per-chunk
+        // in-memory build budget ~5 MB (~8K points), far below each ~200K
+        // chunk, so every chunk takes the spilled (sub-octant routed) path,
+        // while leaving the budget enough headroom for the merge step.
+        &["--chunk-target", "200000", "--memory-limit", "16M"],
+    );
+
+    let data = read_file(output);
+    let header = read_las_header(&data);
+    let hier = read_hierarchy(&data);
+
+    let hier_total: u64 = hier
+        .iter()
+        .filter(|e| e.point_count > 0)
+        .map(|e| e.point_count as u64)
+        .sum();
+    assert_eq!(
+        hier_total, header.total_points,
+        "spilled-build hierarchy point sum ({}) must equal header total ({})",
+        hier_total, header.total_points
+    );
+
+    let reference = read_file(Path::new("tests/data/untwine_reference.copc.laz"));
+    let ref_header = read_las_header(&reference);
+    assert_eq!(
+        header.total_points, ref_header.total_points,
+        "spilled-build total points ({}) must match reference input ({})",
+        header.total_points, ref_header.total_points
+    );
+
+    // The root must exist and the tree must be multi-level (the spill builds
+    // sub-octant subtrees and merges them up).
+    let max_level = hier.iter().map(|e| e.key.level).max().unwrap_or(0);
+    assert!(
+        max_level >= 3,
+        "spilled build must produce a multi-level tree (got max_level={max_level})"
+    );
+
+    let _ = std::fs::remove_file(output);
+}
+
 /// Run with `--temp-compression=lz4` and verify the pipeline still conserves
 /// every point. Exercises `write_temp_batch` + `read_temp_batches` under LZ4.
 #[test]

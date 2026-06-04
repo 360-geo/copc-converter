@@ -78,12 +78,49 @@ pub(crate) fn max_chunk_points(memory_budget: u64) -> u64 {
     raw.max(MIN_CHUNK_POINTS)
 }
 
+/// Hard cap on how many extra octree levels a single over-target finest cell
+/// may be sub-split into. `8^SPLIT_LEVEL_CAP` sub-chunks is the most one cell
+/// can expand to; at the default cap a cell can fan out to 8^6 ≈ 262k
+/// sub-chunks, enough to bring a multi-billion-point cell under any sane
+/// `chunk_target` while bounding the worst-case sub-chunk index count.
+const SPLIT_LEVEL_CAP: u32 = 6;
+
+/// Extra octree levels needed so a finest-grid cell holding `pop` points
+/// sub-divides into sub-chunks of ~`chunk_target` points each.
+///
+/// Returns `ceil(log8(pop / chunk_target))`, clamped to `SPLIT_LEVEL_CAP`.
+/// Returns 0 when the cell already fits `chunk_target` (no split). The
+/// distribution within the cell is rarely uniform, so the per-sub-chunk
+/// estimate (`pop / 8^k`) is only a target; the build phase's adaptive leaf
+/// subdivision absorbs any residual imbalance.
+fn split_extra_levels(pop: u64, chunk_target: u64) -> u32 {
+    if pop <= chunk_target {
+        return 0;
+    }
+    let mut k = 0u32;
+    while (pop as f64) / (8u64.pow(k) as f64) > chunk_target as f64 {
+        k += 1;
+        if k >= SPLIT_LEVEL_CAP {
+            break;
+        }
+    }
+    k
+}
+
 // ---------------------------------------------------------------------------
 // Chunk plan output
 // ---------------------------------------------------------------------------
 
 /// A single chunk in the plan: an octree voxel at some level, plus its
 /// estimated point count derived from the counting grid.
+///
+/// Most chunks sit at a grid level (`level <= grid_depth`) and own exactly
+/// one fine grid cell (or a merged cube of them). When a single finest-level
+/// cell holds more than `chunk_target` points, the planner sub-splits it into
+/// deeper octree voxels (`level > grid_depth`) so no chunk ever exceeds the
+/// memory budget — see [`merge_sparse_cells`]. Those deeper sub-chunks share
+/// one fine grid cell, so distribute routes points into them with a deeper
+/// `point_to_key` descent rather than the plain cell→chunk LUT.
 #[derive(Debug, Clone, Copy)]
 pub struct PlannedChunk {
     /// Octree level of this chunk's root cell.
@@ -525,12 +562,97 @@ fn count_points(
 // Merge sparse cells
 // ---------------------------------------------------------------------------
 
+/// Emit chunk root(s) for one finest- or coarser-level grid cell.
+///
+/// For a cell at or below `chunk_target`, pushes a single [`PlannedChunk`] at
+/// `level`. For an over-target finest-level cell (which is the only place a
+/// cell can exceed `chunk_target` — coarser cells only ever carry merged sums
+/// that already fit), sub-splits the cell into `8^k` deeper octree voxels at
+/// `grid_depth + k` so each sub-chunk targets ~`chunk_target` points.
+///
+/// The deeper sub-chunk at local octant `(sx, sy, sz)` (each in `0..2^k`) has
+/// voxel coordinates `(gx << k | sx, ...)` — a strict refinement of the cell,
+/// so its ancestor at `grid_depth` is exactly `(gx, gy, gz)`. Distribute
+/// reproduces this mapping with a `point_to_key` descent to `grid_depth + k`.
+///
+/// All `8^k` sub-octants are emitted with the uniform estimate `pop / 8^k`,
+/// even ones that may turn out empty: the coarse grid carries no sub-cell
+/// occupancy, and the build phase skips empty chunks cheaply. `k` is bounded
+/// by [`SPLIT_LEVEL_CAP`], so the fan-out per cell is at most `8^cap`.
+#[allow(clippy::too_many_arguments)]
+fn emit_chunk_root(
+    chunks: &mut Vec<PlannedChunk>,
+    level: u32,
+    grid_depth: u32,
+    gx: i32,
+    gy: i32,
+    gz: i32,
+    pop: u64,
+    chunk_target: u64,
+) {
+    debug_assert!(level <= grid_depth, "cell level above grid depth");
+    let k = if level == grid_depth {
+        split_extra_levels(pop, chunk_target)
+    } else {
+        // Coarser-level cells only ever hold a merged sum ≤ chunk_target by
+        // construction, so they never need splitting.
+        0
+    };
+
+    if k == 0 {
+        chunks.push(PlannedChunk {
+            level,
+            gx,
+            gy,
+            gz,
+            point_count: pop,
+        });
+        return;
+    }
+
+    let sub_per_axis = 1i32 << k;
+    let n_sub = 1u64 << (3 * k); // 8^k
+    let est_each = pop / n_sub;
+    // Spread the integer-division remainder one point per sub-chunk over the
+    // first `remainder` sub-chunks, so the plan's per-chunk estimates sum back
+    // to `pop` (preview/analyze checks total conservation) while no estimate
+    // exceeds `est_each + 1`. Since `k` was chosen so `est_each <= chunk_target`,
+    // every sub-chunk estimate stays at or just below target. The real
+    // per-sub-chunk counts come from the data at distribute/build time; this
+    // estimate only needs to conserve and stay roughly balanced.
+    let mut remainder = pop - est_each * n_sub;
+    let sub_level = grid_depth + k;
+    let base_x = gx << k;
+    let base_y = gy << k;
+    let base_z = gz << k;
+    for sz in 0..sub_per_axis {
+        for sy in 0..sub_per_axis {
+            for sx in 0..sub_per_axis {
+                let point_count = if remainder > 0 {
+                    remainder -= 1;
+                    est_each + 1
+                } else {
+                    est_each
+                };
+                chunks.push(PlannedChunk {
+                    level: sub_level,
+                    gx: base_x | sx,
+                    gy: base_y | sy,
+                    gz: base_z | sz,
+                    point_count,
+                });
+            }
+        }
+    }
+}
+
 /// Walk the implicit pyramid from the finest level to the root, collapsing
 /// 2×2×2 groups whose combined point count fits within `chunk_target`.
 ///
 /// Returns the list of chunk roots: cells that ended up either too dense to
 /// merge into their parent, or that sit at level 0 because the entire dataset
-/// fits in one chunk.
+/// fits in one chunk. Over-target finest-level cells are sub-split into deeper
+/// octree sub-chunks via [`emit_chunk_root`].
 fn merge_sparse_cells(
     grid: &[AtomicU32],
     grid_size: u32,
@@ -594,13 +716,16 @@ fn merge_sparse_cells(
                                     let pop = child_pops[child_idx];
                                     child_idx += 1;
                                     if pop > 0 {
-                                        chunks.push(PlannedChunk {
+                                        emit_chunk_root(
+                                            &mut chunks,
                                             level,
-                                            gx: (px * 2 + dx) as i32,
-                                            gy: (py * 2 + dy) as i32,
-                                            gz: (pz * 2 + dz) as i32,
-                                            point_count: pop as u64,
-                                        });
+                                            grid_depth,
+                                            (px * 2 + dx) as i32,
+                                            (py * 2 + dy) as i32,
+                                            (pz * 2 + dz) as i32,
+                                            pop as u64,
+                                            chunk_target,
+                                        );
                                     }
                                 }
                             }
@@ -625,13 +750,21 @@ fn merge_sparse_cells(
     debug_assert_eq!(current.len(), 1);
     let root_pop = current[0];
     if root_pop > 0 {
-        chunks.push(PlannedChunk {
-            level: 0,
-            gx: 0,
-            gy: 0,
-            gz: 0,
-            point_count: root_pop as u64,
-        });
+        // The whole dataset merged into one cell at level 0, which only
+        // happens when the total fits `chunk_target` — so no split. (If any
+        // finest cell had been over target it would have blocked the pyramid
+        // all the way up and `root_pop` would be SENTINEL here.) Route through
+        // `emit_chunk_root` anyway so the no-split path stays in one place.
+        emit_chunk_root(
+            &mut chunks,
+            0,
+            grid_depth,
+            0,
+            0,
+            0,
+            root_pop as u64,
+            chunk_target,
+        );
     }
 
     chunks
@@ -723,6 +856,70 @@ mod tests {
     }
 
     #[test]
+    fn split_extra_levels_thresholds() {
+        // At or below target → no split.
+        assert_eq!(split_extra_levels(0, 100), 0);
+        assert_eq!(split_extra_levels(100, 100), 0);
+        // Just over target → 1 level (8 sub-chunks, ~target/8 each... but the
+        // gate is pop/8^k <= target, so 101/8 = 12 <= 100 → k = 1).
+        assert_eq!(split_extra_levels(101, 100), 1);
+        assert_eq!(split_extra_levels(800, 100), 1);
+        // 8x over → still 1 (800/8 = 100 <= 100). 8x + 1 → 2.
+        assert_eq!(split_extra_levels(801, 100), 2);
+        // 648M into ~4.3M target (the motivating disjoint-NL case): need
+        // ceil(log8(648M/4.3M)) = ceil(log8(150.7)) = 3.
+        assert_eq!(split_extra_levels(648_000_000, 4_300_000), 3);
+        // Clamped at the cap for absurd ratios.
+        assert_eq!(split_extra_levels(u64::MAX, 1), SPLIT_LEVEL_CAP);
+    }
+
+    #[test]
+    fn emit_chunk_root_conserves_and_bounds() {
+        // An over-target finest cell sub-splits into 8^k sub-chunks whose
+        // estimates sum back to the original population and none of which
+        // exceeds the target by more than the one-point spread.
+        let mut chunks = Vec::new();
+        let pop = 10_000u64;
+        let target = 100u64;
+        let grid_depth = 4;
+        emit_chunk_root(&mut chunks, grid_depth, grid_depth, 5, 6, 7, pop, target);
+        let k = split_extra_levels(pop, target);
+        assert_eq!(chunks.len(), 1usize << (3 * k));
+        // Conservation.
+        let total: u64 = chunks.iter().map(|c| c.point_count).sum();
+        assert_eq!(total, pop);
+        // All sub-chunks at the deeper level, within the ancestor cell.
+        assert!(chunks.iter().all(|c| c.level == grid_depth + k));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| (c.gx >> k) == 5 && (c.gy >> k) == 6 && (c.gz >> k) == 7)
+        );
+        // Distinct positions (no duplicate sub-chunks).
+        let mut seen = std::collections::HashSet::new();
+        for c in &chunks {
+            assert!(
+                seen.insert((c.gx, c.gy, c.gz)),
+                "duplicate sub-chunk position"
+            );
+        }
+        // Balanced: max estimate is within 1 of the floor estimate.
+        let est_floor = pop / (1u64 << (3 * k));
+        assert!(chunks.iter().all(|c| c.point_count <= est_floor + 1));
+    }
+
+    #[test]
+    fn emit_chunk_root_no_split_below_target() {
+        // A cell at or below target emits exactly one chunk at its own level.
+        let mut chunks = Vec::new();
+        emit_chunk_root(&mut chunks, 3, 5, 1, 2, 3, 50, 100);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].level, 3);
+        assert_eq!(chunks[0].point_count, 50);
+        assert_eq!((chunks[0].gx, chunks[0].gy, chunks[0].gz), (1, 2, 3));
+    }
+
+    #[test]
     fn merge_single_chunk_when_fits() {
         // 8x8x8 grid (depth 3), all 512 cells have 1 point each → 512 total.
         // Chunk target 1000 → everything merges into one root at level 0.
@@ -736,12 +933,31 @@ mod tests {
 
     #[test]
     fn merge_splits_when_target_exceeded() {
-        // 8x8x8 grid, all cells have 100 points each → 51,200 total.
-        // Chunk target 50 → no merge possible at any level. Every non-empty
-        // fine cell becomes its own chunk root at level 3.
+        // 8x8x8 grid (depth 3), all cells have 100 points each → 51,200 total.
+        // Chunk target 50 → no merge possible at any level, and every finest
+        // cell is over target (100 > 50), so each sub-splits. split_extra_levels
+        // (100, 50) = 1, so each of the 512 cells fans out into 8 sub-chunks at
+        // level 4. Point counts are conserved across the split.
         let n = 8 * 8 * 8;
         let grid: Box<[AtomicU32]> = (0..n).map(|_| AtomicU32::new(100)).collect();
         let chunks = merge_sparse_cells(&grid, 8, 3, 50);
+        assert_eq!(chunks.len(), 512 * 8);
+        assert!(chunks.iter().all(|c| c.level == 4));
+        // Each sub-chunk is at or below target; conservation holds overall.
+        assert!(chunks.iter().all(|c| c.point_count <= 50));
+        let total: u64 = chunks.iter().map(|c| c.point_count).sum();
+        assert_eq!(total, 51_200);
+    }
+
+    #[test]
+    fn merge_no_split_when_finest_cell_fits() {
+        // 8x8x8 grid, all cells have 100 points each, target 100 → finest cells
+        // are exactly at target (not over), so no sub-split. Merging is still
+        // blocked one level up (8×100 = 800 > 100), so every finest cell is its
+        // own chunk root at level 3, as before sub-splitting existed.
+        let n = 8 * 8 * 8;
+        let grid: Box<[AtomicU32]> = (0..n).map(|_| AtomicU32::new(100)).collect();
+        let chunks = merge_sparse_cells(&grid, 8, 3, 100);
         assert_eq!(chunks.len(), 512);
         assert!(chunks.iter().all(|c| c.level == 3 && c.point_count == 100));
     }
@@ -749,19 +965,14 @@ mod tests {
     #[test]
     fn merge_partial_collapse() {
         // 4x4x4 grid (depth 2). One corner cell has 10000 points; all other
-        // cells have 1 point each. Chunk target 100 →
-        //  - the dense corner cell becomes a chunk root at level 2
-        //  - the 7 sibling fine cells are siblings of a blocked parent and
-        //    each become individual chunk roots at level 2
-        //  - the other 7 octants at level 1 are sparse enough to merge upward
-        //  - at level 0, the merged total of those 7 octants (= 56 points) is
-        //    below the target so they all collapse into one root at level 0
-        // Note: the level-1 parent that holds the dense cell is blocked, so
-        // its parent at level 0 is also blocked → can't merge to level 0.
-        // So we get: 8 chunk roots at level 2 (from the dense octant) +
-        // 7 separate roots at level 1 (the other octants, each holding 8 pts).
-        // Wait — level 0 is blocked because one of its children is blocked,
-        // so the 7 other children of root each become chunk roots at level 1.
+        // cells have 1 point each. Chunk target 100.
+        //
+        // The dense corner cell (10000 > 100) is over target, so it sub-splits:
+        // split_extra_levels(10000, 100) = 3, fanning out into 8³ = 512
+        // sub-chunks at level 2 + 3 = 5. Its 7 sibling fine cells (1 pt each)
+        // stay at level 2; the other octants merge as before. Point counts are
+        // conserved across the split (the integer-division remainder is handed
+        // to the first sub-chunk).
         let n = 4 * 4 * 4;
         let grid: Box<[AtomicU32]> = (0..n)
             .map(|i| {
@@ -773,8 +984,15 @@ mod tests {
             })
             .collect();
         let chunks = merge_sparse_cells(&grid, 4, 2, 100);
-        // Total points conservation
+        // Total points conservation across the sub-split.
         let total_pts: u64 = chunks.iter().map(|c| c.point_count).sum();
         assert_eq!(total_pts, 10000 + 63);
+        // The dense cell was sub-split: there are sub-chunks deeper than the
+        // grid depth (2), and no single chunk exceeds the target.
+        assert!(chunks.iter().any(|c| c.level > 2));
+        assert!(
+            chunks.iter().all(|c| c.point_count <= 100),
+            "no chunk should exceed target after sub-split"
+        );
     }
 }

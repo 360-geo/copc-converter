@@ -162,37 +162,93 @@ fn chunk_local_extra_levels(point_count: u64) -> u32 {
     d
 }
 
-/// Build the cell → chunk_index lookup table from a chunk plan.
+/// Sentinel `cells` entry meaning "this fine cell was sub-split into deeper
+/// octree sub-chunks; consult `sub` for the split descriptor and route points
+/// with a deeper `point_to_key` descent." Distinct from `u32::MAX`, which
+/// still means "no chunk covers this cell" (a bug for a well-formed plan).
+const SUBSPLIT_MARKER: u32 = u32::MAX - 1;
+
+/// Descriptor for a sub-split fine cell: how many extra octree levels deep
+/// its sub-chunks live (`k`) and the chunk index of its first sub-octant.
 ///
-/// The grid has `grid_size³` fine cells; for each chunk we fill in every
-/// fine cell it covers. A chunk at level L covers a `2^(grid_depth - L)`
-/// cube per axis, since the grid corresponds to octree cells at `grid_depth`.
+/// Sub-chunk indices are contiguous from `base` in z-major, then y, then x
+/// order — `base + sx + sy*2^k + sz*4^k` for local octant `(sx, sy, sz)` —
+/// matching the emission order in `chunking::emit_chunk_root`.
+#[derive(Debug, Clone, Copy)]
+struct SubSplit {
+    k: u32,
+    base: u32,
+}
+
+/// Cell → chunk routing table built from a chunk plan.
 ///
-/// Returns a flat `Vec<u32>` indexed by `gx + gy*G + gz*G²`. Each entry
-/// holds the chunk index this cell belongs to. Cells not covered by any
-/// chunk (which should not happen for a well-formed plan) get `u32::MAX`
-/// as a sentinel; we treat any point landing in such a cell as a bug.
-fn build_chunk_lut(plan: &crate::chunking::ChunkPlan) -> Vec<u32> {
+/// `cells[gx + gy*G + gz*G²]` holds the chunk index for that fine cell, or
+/// [`SUBSPLIT_MARKER`] when the cell was sub-split (look it up in `sub`), or
+/// `u32::MAX` when no chunk covers it (a malformed plan; treated as a bug).
+struct ChunkLut {
+    cells: Vec<u32>,
+    sub: HashMap<usize, SubSplit>,
+}
+
+/// Local octant index of a deeper sub-chunk voxel within its `grid_depth`
+/// ancestor cell, given the split depth `k`. Inverse of the placement in
+/// `chunking::emit_chunk_root`.
+fn sub_octant_index(gx: i32, gy: i32, gz: i32, k: u32) -> u32 {
+    let mask = (1i32 << k) - 1;
+    let sx = (gx & mask) as u32;
+    let sy = (gy & mask) as u32;
+    let sz = (gz & mask) as u32;
+    sx + (sy << k) + (sz << (2 * k))
+}
+
+/// Build the cell → chunk routing table from a chunk plan.
+///
+/// The grid has `grid_size³` fine cells. Chunks at or above `grid_depth`
+/// cover a `2^(grid_depth - level)` cube of fine cells and fill each covered
+/// cell with their index. Sub-split chunks (`level > grid_depth`) all share
+/// one fine cell; that cell is marked [`SUBSPLIT_MARKER`] and a [`SubSplit`]
+/// descriptor records the split depth and base index so distribute can route
+/// points into the right sub-chunk with a deeper descent.
+fn build_chunk_lut(plan: &crate::chunking::ChunkPlan) -> ChunkLut {
     let g = plan.grid_size as usize;
     let n_cells = g * g * g;
-    let mut lut = vec![u32::MAX; n_cells];
+    let mut cells = vec![u32::MAX; n_cells];
+    let mut sub: HashMap<usize, SubSplit> = HashMap::new();
 
     for (chunk_idx, chunk) in plan.chunks.iter().enumerate() {
-        // The chunk lives at chunk.level. The fine grid is at plan.grid_depth.
-        // Each chunk cell covers a stride of 2^(grid_depth - chunk.level)
-        // along each axis in the fine grid.
+        let chunk_idx = chunk_idx as u32;
         let level_diff = plan.grid_depth as i32 - chunk.level as i32;
-        debug_assert!(
-            level_diff >= 0,
-            "chunk level {} above grid depth {}",
-            chunk.level,
-            plan.grid_depth
-        );
-        let stride: usize = 1usize << level_diff as u32;
 
-        // Top-left corner of this chunk in fine-grid coordinates, clamped
-        // defensively against malformed chunks. (Should never trigger for
-        // a plan produced by `merge_sparse_cells`.)
+        if level_diff < 0 {
+            // Sub-split chunk: deeper than the grid. Map it back to its
+            // ancestor fine cell and record (or check) the split descriptor.
+            let k = chunk.level - plan.grid_depth;
+            // Ancestor cell coords at grid_depth: drop the k low octant bits.
+            let cell_gx = (chunk.gx >> k) as usize;
+            let cell_gy = (chunk.gy >> k) as usize;
+            let cell_gz = (chunk.gz >> k) as usize;
+            debug_assert!(
+                cell_gx < g && cell_gy < g && cell_gz < g,
+                "sub-chunk cell out of grid"
+            );
+            let cell_idx = cell_gx + cell_gy * g + cell_gz * g * g;
+            let octant = sub_octant_index(chunk.gx, chunk.gy, chunk.gz, k);
+            let base = chunk_idx - octant;
+            cells[cell_idx] = SUBSPLIT_MARKER;
+            match sub.get(&cell_idx) {
+                Some(existing) => debug_assert!(
+                    existing.k == k && existing.base == base,
+                    "inconsistent sub-split for cell {cell_idx}: {existing:?} vs {{k:{k}, base:{base}}}"
+                ),
+                None => {
+                    sub.insert(cell_idx, SubSplit { k, base });
+                }
+            }
+            continue;
+        }
+
+        // Chunk at or above grid depth: fill its covered cube of fine cells.
+        let stride: usize = 1usize << level_diff as u32;
         let base_x = (chunk.gx as usize * stride).min(g);
         let base_y = (chunk.gy as usize * stride).min(g);
         let base_z = (chunk.gz as usize * stride).min(g);
@@ -204,14 +260,14 @@ fn build_chunk_lut(plan: &crate::chunking::ChunkPlan) -> Vec<u32> {
             for y in base_y..end_y {
                 let row_start = base_x + y * g + z * g * g;
                 let row_end = end_x + y * g + z * g * g;
-                for cell in &mut lut[row_start..row_end] {
-                    *cell = chunk_idx as u32;
+                for cell in &mut cells[row_start..row_end] {
+                    *cell = chunk_idx;
                 }
             }
         }
     }
 
-    lut
+    ChunkLut { cells, sub }
 }
 
 /// Concatenate per-worker shard files into the canonical
@@ -275,6 +331,11 @@ type SampleTask = (VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>);
 /// promoted points, and per-child remaining points.
 type SampleResult = (VoxelKey, Vec<VoxelKey>, Vec<RawPoint>, Vec<Vec<RawPoint>>);
 
+/// Per-sub-octant output of the spilled build: the sub-octant root key, the
+/// `(VoxelKey, point_count)` nodes its subtree produced, and the root's
+/// retained points (gathered for the local merge up to the chunk root).
+type SubtreeBuild = (VoxelKey, Vec<(VoxelKey, usize)>, Vec<RawPoint>);
+
 // ---------------------------------------------------------------------------
 // Morton code helper (used for spatially coherent traversal order)
 // ---------------------------------------------------------------------------
@@ -299,6 +360,22 @@ fn morton3(x: u32, y: u32, z: u32) -> u64 {
 
 /// Maximum points per leaf voxel before we subdivide further.
 const MAX_LEAF_POINTS: u64 = 100_000;
+
+/// Estimated peak working-set bytes per point during a single chunk's
+/// in-memory build. The peak sums the leaf map (~48 B/pt), the `all_pts`
+/// sort buffer that lives alongside the leaves (~56 B/pt), grid_sample's
+/// outputs (~56 B/pt), plus HashMap growth and allocator fragmentation;
+/// 600 B/pt leaves genuine headroom over the raw ~160 B/pt sum. Used both
+/// to size build batches and to decide when a chunk must take the spilled
+/// (sub-divided) build path. Mirrors `chunking::PER_CHUNK_PEAK_BYTES_PER_POINT`.
+const PER_CHUNK_BYTES_PER_POINT_BUILD: u64 = 600;
+
+/// Fraction of the memory budget a single chunk's in-memory build may use
+/// before it must spill to the sub-divided path. Matches the planner's
+/// `SINGLE_CHUNK_BUDGET_FRACTION` so a chunk the planner sized to fit builds
+/// in memory, and only a chunk whose *actual* point distribution exceeded the
+/// planner's grid-resolution estimate spills.
+const SINGLE_CHUNK_BUILD_FRACTION: f64 = 0.4;
 
 /// Grid cells per axis for LOD thinning. Matches untwine's CellCount = 128.
 /// Higher values keep more points at coarse LOD levels (better progressive rendering).
@@ -1650,7 +1727,40 @@ impl OctreeBuilder {
                             let gz = (key.z as usize).min(g_usize - 1);
 
                             let cell_idx = gx + gy * g_usize + gz * g_usize * g_usize;
-                            let chunk_idx = lut[cell_idx];
+                            let chunk_idx = match lut.cells[cell_idx] {
+                                SUBSPLIT_MARKER => {
+                                    // Over-target cell: descend `k` levels
+                                    // deeper to pick the sub-chunk. Same
+                                    // `point_to_key` refinement the planner
+                                    // and per-chunk build use, so the point's
+                                    // sub-chunk root is its leaf's ancestor.
+                                    let s = lut.sub[&cell_idx];
+                                    let deep = point_to_key(
+                                        wx,
+                                        wy,
+                                        wz,
+                                        self.cx,
+                                        self.cy,
+                                        self.cz,
+                                        self.halfsize,
+                                        grid_depth + s.k,
+                                    );
+                                    // Clamp the deeper voxel into the (already
+                                    // clamped) ancestor cell's sub-range so a
+                                    // boundary point that rounds one past the
+                                    // cell can't wrap into a sibling's octant.
+                                    let span = 1i32 << s.k;
+                                    let local = |deep_c: i32, cell_c: usize| -> u32 {
+                                        let lo = cell_c as i32 * span;
+                                        (deep_c - lo).clamp(0, span - 1) as u32
+                                    };
+                                    let lx = local(deep.x, gx);
+                                    let ly = local(deep.y, gy);
+                                    let lz = local(deep.z, gz);
+                                    s.base + lx + (ly << s.k) + (lz << (2 * s.k))
+                                }
+                                idx => idx,
+                            };
                             groups.entry(chunk_idx).or_default().push(raw);
                         }
 
@@ -1695,99 +1805,169 @@ impl OctreeBuilder {
         stream_temp_batches(file, self.num_extra_bytes, self.temp_compression, f)
     }
 
-    /// Build a single chunk's sub-octree fully in memory and write its node
-    /// files to canonical temp paths.
+    /// Build a single chunk's sub-octree and write its node files to canonical
+    /// temp paths.
     ///
     /// Returns the list of `(VoxelKey, point_count)` for nodes at levels in
     /// `[chunk.level, chunk_leaf_depth]` that the chunk produced. The chunk
     /// root at `chunk.level` is included; coarser ancestors are left to the
     /// merge step.
+    ///
+    /// Dispatches on the chunk's estimated working set: chunks that fit
+    /// `chunk_mem_budget` build fully in memory; larger chunks take the
+    /// spilled path ([`Self::build_chunk_spilled`]), which sub-divides into
+    /// bounded subtrees so peak memory stays under budget regardless of how
+    /// the points are distributed inside the chunk.
+    ///
+    /// The dispatch reads the chunk file's **actual** point count rather than
+    /// trusting the planner's `point_count`, which is only an estimate (the
+    /// planner sees occupancy at grid resolution and, for a sub-split cell,
+    /// divides a cell's count evenly across sub-octants). A chunk whose real
+    /// distribution is far denser than the estimate — e.g. a road corridor
+    /// concentrated in one sub-octant — must still take the spilled path, so
+    /// the gate has to be the truth on disk. The count is one cheap streaming
+    /// pass (seek-based for uncompressed temp files).
     fn build_chunk_in_memory(
         &self,
         chunk: &crate::chunking::PlannedChunk,
         chunk_idx: u32,
+        chunk_mem_budget: u64,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
-        // Compute the chunk-local leaf depth from the plan's point-count
-        // estimate. Adaptive subdivision below corrects for any residual
-        // overflow in dense regions, so using the estimate here (rather
-        // than an exact count that would require a pre-read pass) is safe.
-        let extra_levels = chunk_local_extra_levels(chunk.point_count);
-        let leaf_depth = chunk.level + extra_levels;
-        debug!(
-            "Chunk {} (L{} {},{},{}): ~{} points → leaf depth {} (extra {})",
-            chunk_idx,
-            chunk.level,
-            chunk.gx,
-            chunk.gy,
-            chunk.gz,
-            chunk.point_count,
-            leaf_depth,
-            extra_levels
-        );
-
-        // Stream points into their leaf voxels at the global leaf depth.
-        // Classifying directly from the decoder avoids holding the chunk's
-        // full point list in memory alongside the leaves HashMap.
-        let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
-        let mut n_points: usize = 0;
-        self.stream_chunk_file(chunk_idx, |raw| {
-            n_points += 1;
-            let wx = raw.x as f64 * self.scale_x + self.offset_x;
-            let wy = raw.y as f64 * self.scale_y + self.offset_y;
-            let wz = raw.z as f64 * self.scale_z + self.offset_z;
-            let key = point_to_key(
-                wx,
-                wy,
-                wz,
-                self.cx,
-                self.cy,
-                self.cz,
-                self.halfsize,
-                leaf_depth,
+        let chunk_root = VoxelKey {
+            level: chunk.level as i32,
+            x: chunk.gx,
+            y: chunk.gy,
+            z: chunk.gz,
+        };
+        let actual_points = self.count_chunk_file(chunk_idx)?;
+        let est_bytes = actual_points.saturating_mul(PER_CHUNK_BYTES_PER_POINT_BUILD);
+        if est_bytes <= chunk_mem_budget {
+            self.build_subtree_in_memory(chunk_root, chunk_idx, actual_points, config)
+        } else {
+            debug!(
+                "Chunk {} (L{} {},{},{}): {} actual points exceed per-chunk budget ({} pts); spilling",
+                chunk_idx,
+                chunk.level,
+                chunk.gx,
+                chunk.gy,
+                chunk.gz,
+                actual_points,
+                chunk_mem_budget / PER_CHUNK_BYTES_PER_POINT_BUILD,
             );
+            self.build_chunk_spilled(chunk, chunk_idx, chunk_mem_budget, config)
+        }
+    }
 
-            // Debug-only defensive check: the leaf key's ancestor at
-            // chunk.level must equal the chunk root. If it doesn't, the
-            // chunked distribute classified this point into the wrong
-            // chunk. Distribute and build must use the same key derivation
-            // (`point_to_key`) to stay consistent — if this assertion ever
-            // fires, the classification has drifted again and points will
-            // be silently lost unless we reject here.
-            #[cfg(debug_assertions)]
-            {
-                let mut ancestor = key;
-                while ancestor.level > chunk.level as i32 {
-                    ancestor = ancestor.parent().expect("leaf above chunk level");
-                }
-                debug_assert!(
-                    ancestor.level == chunk.level as i32
-                        && ancestor.x == chunk.gx
-                        && ancestor.y == chunk.gy
-                        && ancestor.z == chunk.gz,
-                    "leaf {:?} does not belong to chunk root (L{} {},{},{}): ancestor at L{} = ({},{},{})",
-                    key,
-                    chunk.level,
-                    chunk.gx,
-                    chunk.gy,
-                    chunk.gz,
-                    ancestor.level,
-                    ancestor.x,
-                    ancestor.y,
-                    ancestor.z,
-                );
-            }
+    /// Actual point count in a chunk's canonical temp file (0 if absent).
+    /// One streaming pass over batch headers — see [`count_temp_file_points`].
+    fn count_chunk_file(&self, chunk_idx: u32) -> Result<u64> {
+        let path = chunk_canonical_path(&self.tmp_dir.join("chunks"), chunk_idx);
+        count_temp_file_points(&path, self.num_extra_bytes, self.temp_compression)
+    }
 
-            leaves.entry(key).or_default().push(raw);
+    /// Build the sub-octree rooted at `root` from every point in chunk file
+    /// `chunk_idx`, keeping the whole subtree resident in memory. Used by the
+    /// common (non-spilled) whole-chunk path, where every point in the file
+    /// belongs under `root` (the chunk root).
+    ///
+    /// `est_points` seeds the initial leaf depth; the adaptive subdivision in
+    /// [`Self::finish_subtree`] corrects any residual per-leaf overflow.
+    fn build_subtree_in_memory(
+        &self,
+        root: VoxelKey,
+        chunk_idx: u32,
+        est_points: u64,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        let leaf_depth = root.level as u32 + chunk_local_extra_levels(est_points);
+        let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        self.stream_chunk_file(chunk_idx, |raw| {
+            self.push_into_leaf(&mut leaves, raw, root, leaf_depth);
             Ok(())
         })?;
+        self.finish_subtree(root, leaves, leaf_depth, config)
+    }
 
-        if n_points == 0 {
-            // Empty chunk → no nodes produced. Should not happen for a plan
-            // generated by `merge_sparse_cells`, but handle defensively.
+    /// Build the sub-octree rooted at `root` from an in-memory point vector.
+    /// Used by the spilled path, where each sub-octant's points have already
+    /// been routed into their own (budget-sized) temp file and read back
+    /// whole. Consumes `points`.
+    fn build_subtree_from_points(
+        &self,
+        root: VoxelKey,
+        points: Vec<RawPoint>,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        let leaf_depth = root.level as u32 + chunk_local_extra_levels(points.len() as u64);
+        let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        for raw in points {
+            self.push_into_leaf(&mut leaves, raw, root, leaf_depth);
+        }
+        self.finish_subtree(root, leaves, leaf_depth, config)
+    }
+
+    /// Classify one point into its leaf voxel at `leaf_depth` and push it into
+    /// `leaves`. In debug builds, assert the leaf's ancestor at `root.level`
+    /// is `root` — the consistency contract between distribute's chunk
+    /// routing and the build's leaf derivation (both use `point_to_key`).
+    fn push_into_leaf(
+        &self,
+        leaves: &mut HashMap<VoxelKey, Vec<RawPoint>>,
+        raw: RawPoint,
+        root: VoxelKey,
+        leaf_depth: u32,
+    ) {
+        let wx = raw.x as f64 * self.scale_x + self.offset_x;
+        let wy = raw.y as f64 * self.scale_y + self.offset_y;
+        let wz = raw.z as f64 * self.scale_z + self.offset_z;
+        let key = point_to_key(
+            wx,
+            wy,
+            wz,
+            self.cx,
+            self.cy,
+            self.cz,
+            self.halfsize,
+            leaf_depth,
+        );
+        #[cfg(debug_assertions)]
+        {
+            let mut ancestor = key;
+            while ancestor.level > root.level {
+                ancestor = ancestor.parent().expect("leaf above root level");
+            }
+            debug_assert!(
+                ancestor == root,
+                "leaf {:?} does not belong to root {:?}: ancestor at L{} = ({},{},{})",
+                key,
+                root,
+                ancestor.level,
+                ancestor.x,
+                ancestor.y,
+                ancestor.z,
+            );
+        }
+        leaves.entry(key).or_default().push(raw);
+    }
+
+    /// Shared subtree finisher: adaptive leaf subdivision + bottom-up
+    /// grid-sample down to `root.level`. Writes every produced node to its
+    /// canonical temp path and returns `(VoxelKey, point_count)` for each.
+    fn finish_subtree(
+        &self,
+        root: VoxelKey,
+        mut leaves: HashMap<VoxelKey, Vec<RawPoint>>,
+        leaf_depth: u32,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        let root_level = root.level as u32;
+        if leaves.is_empty() {
+            // Empty subtree → no nodes produced. Expected for empty sub-octant
+            // slots in the spilled path; defensive otherwise.
             debug!(
-                "Chunk {} (L{} {},{},{}) is empty, skipping",
-                chunk_idx, chunk.level, chunk.gx, chunk.gy, chunk.gz
+                "Subtree (L{} {},{},{}) is empty, skipping",
+                root.level, root.x, root.y, root.z
             );
             return Ok(Vec::new());
         }
@@ -1819,9 +1999,12 @@ impl OctreeBuilder {
             let hit_cap = oversized.iter().any(|k| k.level as u32 >= CHUNK_DEPTH_CAP);
             if hit_cap {
                 debug!(
-                    "Chunk {}: stopping subdivision at depth cap {} \
+                    "Subtree (L{} {},{},{}): stopping subdivision at depth cap {} \
                      ({} leaves still oversized)",
-                    chunk_idx,
+                    root.level,
+                    root.x,
+                    root.y,
+                    root.z,
                     CHUNK_DEPTH_CAP,
                     oversized.len()
                 );
@@ -1853,18 +2036,301 @@ impl OctreeBuilder {
         }
 
         debug!(
-            "Chunk {}: {} leaves after subdivision, effective depth {}",
-            chunk_idx,
+            "Subtree (L{} {},{},{}): {} leaves after subdivision, effective depth {}",
+            root.level,
+            root.x,
+            root.y,
+            root.z,
             leaves.len(),
             effective_max_depth
         );
 
-        // Run the bottom-up grid-sample loop, stopping at chunk.level.
+        // Run the bottom-up grid-sample loop, stopping at root.level.
         // bottom_up_levels writes every produced node to its canonical temp
-        // file path, so the chunk's sub-octree is on disk after this returns.
-        // Suppress per-level progress events: the outer build stage tracks
+        // file path, so the subtree is on disk after this returns. Suppress
+        // per-level progress events: the outer build stage tracks
         // chunks-done, not levels.
-        self.bottom_up_levels(leaves, effective_max_depth, chunk.level, false, config)
+        self.bottom_up_levels(leaves, effective_max_depth, root_level, false, config)
+    }
+
+    /// Build an oversized chunk by sub-dividing it into bounded subtrees.
+    ///
+    /// The planner can only estimate a chunk's size from grid-resolution
+    /// occupancy, so a chunk that fits the budget on paper may concentrate
+    /// most of its points in one sub-region. This path guarantees bounded
+    /// peak memory regardless of the in-chunk distribution:
+    ///
+    /// 1. Choose a `split_level` whose densest sub-octant fits
+    ///    `chunk_mem_budget` ([`Self::choose_split_level`], one streaming
+    ///    count pass — no per-level re-reads).
+    /// 2. Stream the chunk file **once**, routing every point into a temp file
+    ///    for its `split_level` sub-octant via a bounded append-writer cache.
+    /// 3. Build each sub-octant subtree from its own (budget-sized) temp file
+    ///    and merge the sub-octant roots up to the chunk root.
+    ///
+    /// The chunk file is read exactly twice — once to choose the split level,
+    /// once to route — and each sub-octant build then reads only its own small
+    /// spill file. So the whole operation is `O(chunk_size)` regardless of how
+    /// deep the split goes or how many sub-octants result.
+    fn build_chunk_spilled(
+        &self,
+        chunk: &crate::chunking::PlannedChunk,
+        chunk_idx: u32,
+        chunk_mem_budget: u64,
+        config: &crate::PipelineConfig,
+    ) -> Result<Vec<(VoxelKey, usize)>> {
+        let chunk_root = VoxelKey {
+            level: chunk.level as i32,
+            x: chunk.gx,
+            y: chunk.gy,
+            z: chunk.gz,
+        };
+
+        // Step 1: in ONE streaming pass, find the shallowest split depth at
+        // which the densest sub-octant fits budget. `choose_split_level`
+        // counts occupancy at the deepest candidate level and rolls the counts
+        // up to every shallower level in memory, so the chunk file is read
+        // exactly once regardless of how deep the data forces the split.
+        let max_points_in_budget = (chunk_mem_budget / PER_CHUNK_BYTES_PER_POINT_BUILD).max(1);
+        let (split_level, densest) =
+            self.choose_split_level(chunk_idx, chunk_root, max_points_in_budget)?;
+        debug!(
+            "Spilled chunk {} (L{} {},{},{}): split_level {} (densest sub-octant {} pts, budget {} pts)",
+            chunk_idx,
+            chunk.level,
+            chunk.gx,
+            chunk.gy,
+            chunk.gz,
+            split_level,
+            densest,
+            max_points_in_budget,
+        );
+        if densest > max_points_in_budget {
+            // Hit the depth cap with a still-oversized sub-octant (extreme
+            // coincident-point density). finish_subtree's own leaf-depth cap
+            // will absorb it; log so it's visible.
+            debug!(
+                "Spilled chunk {}: densest sub-octant still {} pts > budget {} at the depth cap; \
+                 proceeding (may exceed budget for this chunk)",
+                chunk_idx, densest, max_points_in_budget
+            );
+        }
+
+        // Step 2: route every point into its sub-octant temp file in ONE pass.
+        // Sub-octant `VoxelKey`s are mapped to dense `u32` indices so the
+        // existing bounded append-writer cache (`ChunkWriterCache`) can shard
+        // them; `sub_roots[idx]` recovers the key. Files live under a
+        // per-chunk spill dir that is removed once the chunk is built.
+        let spill_dir = self.tmp_dir.join(format!("spill_{chunk_idx}"));
+        if spill_dir.exists() {
+            std::fs::remove_dir_all(&spill_dir)
+                .with_context(|| format!("removing stale spill dir {spill_dir:?}"))?;
+        }
+        std::fs::create_dir_all(&spill_dir)
+            .with_context(|| format!("creating spill dir {spill_dir:?}"))?;
+
+        let mut sub_index: HashMap<VoxelKey, u32> = HashMap::new();
+        let mut sub_roots: Vec<VoxelKey> = Vec::new();
+        let per_worker_cap = CHUNKED_OPEN_FILES_CAP.max(MIN_PER_WORKER_CHUNK_FILES);
+        let mut cache =
+            ChunkWriterCache::new(per_worker_cap, self.num_extra_bytes, self.temp_compression);
+        // Group points per sub-octant before appending so each cache touch
+        // writes a batch rather than a single point.
+        let mut pending: HashMap<u32, Vec<RawPoint>> = HashMap::new();
+        let mut pending_points: usize = 0;
+        // Flush threshold in points: a fraction of budget so the grouping
+        // buffer never dominates memory during routing.
+        let flush_threshold = ((chunk_mem_budget / 4)
+            / RawPoint::record_size(self.num_extra_bytes) as u64)
+            .max(1) as usize;
+
+        self.stream_chunk_file(chunk_idx, |raw| {
+            let wx = raw.x as f64 * self.scale_x + self.offset_x;
+            let wy = raw.y as f64 * self.scale_y + self.offset_y;
+            let wz = raw.z as f64 * self.scale_z + self.offset_z;
+            let sub = point_to_key(
+                wx,
+                wy,
+                wz,
+                self.cx,
+                self.cy,
+                self.cz,
+                self.halfsize,
+                split_level,
+            );
+            let idx = match sub_index.get(&sub) {
+                Some(i) => *i,
+                None => {
+                    let i = sub_roots.len() as u32;
+                    sub_index.insert(sub, i);
+                    sub_roots.push(sub);
+                    i
+                }
+            };
+            pending.entry(idx).or_default().push(raw);
+            pending_points += 1;
+            if pending_points >= flush_threshold {
+                for (idx, pts) in pending.drain() {
+                    cache.append(idx, &spill_dir, &pts)?;
+                }
+                pending_points = 0;
+            }
+            Ok(())
+        })?;
+        for (idx, pts) in pending.drain() {
+            cache.append(idx, &spill_dir, &pts)?;
+        }
+        cache.flush_all()?;
+
+        debug!(
+            "Spilled chunk {}: routed into {} sub-octant files at level {}",
+            chunk_idx,
+            sub_roots.len(),
+            split_level
+        );
+
+        // Step 3: build each sub-octant from its own temp file (in parallel —
+        // disjoint subtrees never write the same node), collecting the
+        // sub-octant root points for the local merge up to the chunk root.
+        let codec = self.temp_compression;
+        let nxb = self.num_extra_bytes;
+        let built: Vec<SubtreeBuild> = sub_roots
+            .par_iter()
+            .enumerate()
+            .map(|(idx, sub_root)| -> Result<_> {
+                let path = chunk_shard_path(&spill_dir, idx as u32);
+                let f = match File::open(&path) {
+                    Ok(f) => f,
+                    // A sub-octant index always has a file (we created it on
+                    // first point), but be defensive.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok((*sub_root, Vec::new(), Vec::new()));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let points = read_temp_batches(f, nxb, codec)?;
+                let nodes = self.build_subtree_from_points(*sub_root, points, config)?;
+                // Read back the sub-octant root's retained points for the
+                // merge to chunk.level (bounded by grid_sample's per-node cap).
+                let root_pts = self.read_node(sub_root)?;
+                Ok((*sub_root, nodes, root_pts))
+            })
+            .collect::<Result<_>>()?;
+
+        let mut all_nodes: Vec<(VoxelKey, usize)> = Vec::new();
+        let mut subroot_points: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        for (sub_root, nodes, root_pts) in built {
+            all_nodes.extend(nodes);
+            if !root_pts.is_empty() {
+                subroot_points.insert(sub_root, root_pts);
+            }
+        }
+
+        // The spill files are no longer needed.
+        let _ = std::fs::remove_dir_all(&spill_dir);
+
+        if subroot_points.is_empty() {
+            return Ok(all_nodes);
+        }
+
+        // Merge the sub-octant roots (at split_level) up to the chunk root
+        // (at chunk.level). bottom_up_levels rewrites each sub-octant root's
+        // file with its post-merge remainder and writes the new ancestors.
+        let merged =
+            self.bottom_up_levels(subroot_points, split_level, chunk.level, false, config)?;
+
+        // Combine: deeper nodes from the per-sub-octant builds + the merged
+        // ancestors (split_level down to chunk.level). The sub-octant root
+        // counts appear in both `all_nodes` (pre-merge) and `merged`
+        // (post-merge); the caller (build_node_map) re-reads every node count
+        // from disk after the merge, so here we just union the keys.
+        all_nodes.extend(merged);
+        Ok(all_nodes)
+    }
+
+    /// Choose the shallowest sub-octant split level whose densest sub-octant
+    /// holds at most `max_points` points, in a SINGLE streaming pass over the
+    /// chunk file.
+    ///
+    /// Returns `(split_level, densest_count_at_that_level)`. The chunk file is
+    /// read exactly once: every point is classified at the deepest candidate
+    /// level (`chunk_root.level + SPILL_DEPTH_CAP`) and accumulated into a
+    /// counting map. Because `point_to_key` is a strict refinement and
+    /// `VoxelKey::parent` is coordinate-halving, the per-sub-octant count at
+    /// any shallower level is recovered by right-shifting the deep coordinates
+    /// — so the densest count at every candidate depth is computed in memory
+    /// from that one map, with no extra file reads.
+    ///
+    /// Picks the shallowest level whose densest sub-octant fits `max_points`;
+    /// if even the deepest level doesn't (pathological coincident-point
+    /// density), returns the deepest level and lets the caller proceed (the
+    /// per-subtree leaf-depth cap absorbs the residual).
+    fn choose_split_level(
+        &self,
+        chunk_idx: u32,
+        chunk_root: VoxelKey,
+        max_points: u64,
+    ) -> Result<(u32, u64)> {
+        // Cap the extra depth below the chunk root. 8^cap is the maximum
+        // sub-octant fan-out; the deep counting map is bounded by the number
+        // of populated cells at this depth (≤ point count, and far smaller for
+        // any real surface data, which clusters).
+        const SPILL_DEPTH_CAP: u32 = 12;
+        let deepest = chunk_root.level as u32 + SPILL_DEPTH_CAP;
+
+        // Count occupancy at the deepest candidate level in one pass.
+        let mut deep_counts: HashMap<VoxelKey, u64> = HashMap::new();
+        self.stream_chunk_file(chunk_idx, |raw| {
+            let wx = raw.x as f64 * self.scale_x + self.offset_x;
+            let wy = raw.y as f64 * self.scale_y + self.offset_y;
+            let wz = raw.z as f64 * self.scale_z + self.offset_z;
+            let key = point_to_key(
+                wx,
+                wy,
+                wz,
+                self.cx,
+                self.cy,
+                self.cz,
+                self.halfsize,
+                deepest,
+            );
+            *deep_counts.entry(key).or_insert(0) += 1;
+            Ok(())
+        })?;
+
+        if deep_counts.is_empty() {
+            // Empty chunk — nothing to split; one level deep is harmless.
+            return Ok((chunk_root.level as u32 + 1, 0));
+        }
+
+        // Roll the deep counts up to each shallower level and find, for each,
+        // the densest sub-octant. A key at `deepest` maps to its ancestor at
+        // level `L = chunk_root.level + s` by right-shifting each coordinate by
+        // `deepest - L`. Walk shallow→deep and stop at the first level that
+        // fits `max_points`.
+        let root_level = chunk_root.level as u32;
+        let mut best: Option<(u32, u64)> = None;
+        for s in 1..=SPILL_DEPTH_CAP {
+            let level = root_level + s;
+            let shift = deepest - level;
+            let mut level_counts: HashMap<VoxelKey, u64> = HashMap::new();
+            for (k, c) in &deep_counts {
+                let anc = VoxelKey {
+                    level: level as i32,
+                    x: k.x >> shift,
+                    y: k.y >> shift,
+                    z: k.z >> shift,
+                };
+                *level_counts.entry(anc).or_insert(0) += c;
+            }
+            let densest = level_counts.values().copied().max().unwrap_or(0);
+            best = Some((level, densest));
+            if densest <= max_points {
+                return Ok((level, densest));
+            }
+        }
+        // None fit; return the deepest level probed.
+        Ok(best.expect("loop ran at least once"))
     }
 
     /// Merge chunk roots upward from `max_chunk_level` to the global root.
@@ -1961,7 +2427,7 @@ impl OctreeBuilder {
                     .iter()
                     .map(|ck| self.count_node(ck).unwrap_or(0))
                     .sum();
-                let est_mem = est_points * mem_per_point;
+                let est_mem = est_points.saturating_mul(mem_per_point);
                 if est_mem > config.memory_budget {
                     large_parents.push((parent, children, est_mem));
                 } else {
@@ -2086,11 +2552,15 @@ impl OctreeBuilder {
         //
         // Process chunks in batches sized by memory budget. Within each batch,
         // chunks run fully in parallel via rayon. Per-chunk peak working set
-        // sums the leaf map (~48 B/pt), the `all_pts` sort buffer that lives
-        // alongside the leaves (~56 B/pt), grid_sample's outputs (~56 B/pt),
-        // plus HashMap growth and allocator fragmentation. 600 B/pt leaves
-        // genuine headroom over the raw 160 B/pt sum.
-        const PER_CHUNK_BYTES_PER_POINT: u64 = 600;
+        // is estimated at `PER_CHUNK_BYTES_PER_POINT_BUILD` bytes per point.
+        //
+        // The planner's per-chunk `point_count` is an estimate from
+        // grid-resolution occupancy; a chunk can concentrate more points in
+        // one sub-region than the estimate implies. `chunk_mem_budget` is the
+        // ceiling above which a chunk builds via the spilled (sub-divided)
+        // path instead of fully in memory, so peak memory stays bounded even
+        // when the estimate was low.
+        let chunk_mem_budget = (config.memory_budget as f64 * SINGLE_CHUNK_BUILD_FRACTION) as u64;
 
         // Sort chunks by descending point count so the greedy batching stays
         // balanced (largest chunks first, smaller ones fill the gaps).
@@ -2116,7 +2586,10 @@ impl OctreeBuilder {
             let mut batch_mem: u64 = 0;
             let mut batch_end = batch_start;
             while batch_end < chunks_indexed.len() {
-                let est_mem = chunks_indexed[batch_end].1.point_count * PER_CHUNK_BYTES_PER_POINT;
+                let est_mem = chunks_indexed[batch_end]
+                    .1
+                    .point_count
+                    .saturating_mul(PER_CHUNK_BYTES_PER_POINT_BUILD);
                 // Always include at least one chunk per batch, even if it
                 // exceeds the budget on its own (better to OOM honestly than
                 // to hang forever in an empty batch).
@@ -2138,7 +2611,8 @@ impl OctreeBuilder {
             let batch_results: Vec<Vec<(VoxelKey, usize)>> = batch
                 .par_iter()
                 .map(|(chunk_idx, chunk)| -> Result<Vec<(VoxelKey, usize)>> {
-                    let nodes = self.build_chunk_in_memory(chunk, *chunk_idx, config)?;
+                    let nodes =
+                        self.build_chunk_in_memory(chunk, *chunk_idx, chunk_mem_budget, config)?;
                     let done = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
                     config.report(crate::ProgressEvent::StageProgress { done });
                     Ok(nodes)
@@ -2574,8 +3048,9 @@ mod tests {
             }],
         );
         let lut = build_chunk_lut(&plan);
-        assert_eq!(lut.len(), 64);
-        assert!(lut.iter().all(|&c| c == 0));
+        assert_eq!(lut.cells.len(), 64);
+        assert!(lut.cells.iter().all(|&c| c == 0));
+        assert!(lut.sub.is_empty());
     }
 
     #[test]
@@ -2592,10 +3067,11 @@ mod tests {
             .collect();
         let plan = make_plan(2, chunks);
         let lut = build_chunk_lut(&plan);
-        assert_eq!(lut.len(), 8);
+        assert_eq!(lut.cells.len(), 8);
+        assert!(lut.sub.is_empty());
         // Each cell should map to a distinct chunk index 0..8.
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for &c in &lut {
+        for &c in &lut.cells {
             assert!(c < 8, "got out-of-range chunk idx {c}");
             seen.insert(c);
         }
@@ -2628,23 +3104,27 @@ mod tests {
             ],
         );
         let lut = build_chunk_lut(&plan);
-        assert_eq!(lut.len(), 64);
+        assert_eq!(lut.cells.len(), 64);
+        assert!(lut.sub.is_empty());
 
         // Cells (gx, gy, gz) with all coords in 0..2 should map to chunk 0.
         for z in 0..2 {
             for y in 0..2 {
                 for x in 0..2 {
                     let idx = x + y * 4 + z * 16;
-                    assert_eq!(lut[idx], 0, "cell ({x},{y},{z}) should map to chunk 0");
+                    assert_eq!(
+                        lut.cells[idx], 0,
+                        "cell ({x},{y},{z}) should map to chunk 0"
+                    );
                 }
             }
         }
 
         // Cell (3, 3, 3) → chunk 1.
-        assert_eq!(lut[3 + 3 * 4 + 3 * 16], 1);
+        assert_eq!(lut.cells[3 + 3 * 4 + 3 * 16], 1);
 
         // Count uncovered cells: should be 64 - 8 - 1 = 55.
-        let uncovered = lut.iter().filter(|&&c| c == u32::MAX).count();
+        let uncovered = lut.cells.iter().filter(|&&c| c == u32::MAX).count();
         assert_eq!(uncovered, 55);
     }
 
@@ -2685,18 +3165,85 @@ mod tests {
             }],
         );
         let lut = build_chunk_lut(&plan);
-        assert_eq!(lut.len(), 512);
+        assert_eq!(lut.cells.len(), 512);
+        assert!(lut.sub.is_empty());
         let g = 8;
         for z in 6..8 {
             for y in 6..8 {
                 for x in 6..8 {
                     let idx = x + y * g + z * g * g;
-                    assert_eq!(lut[idx], 0, "cell ({x},{y},{z}) should be in the chunk");
+                    assert_eq!(
+                        lut.cells[idx], 0,
+                        "cell ({x},{y},{z}) should be in the chunk"
+                    );
                 }
             }
         }
         // No other cell should be in the chunk.
-        let in_chunk = lut.iter().filter(|&&c| c == 0).count();
+        let in_chunk = lut.cells.iter().filter(|&&c| c == 0).count();
         assert_eq!(in_chunk, 8);
+    }
+
+    #[test]
+    fn build_chunk_lut_subsplit_cell() {
+        // 4³ grid (depth 2). Cell (1,2,3) was sub-split into k=1 → 8 deeper
+        // sub-chunks at level 3, coords (2..4, 4..6, 6..8) in z,y,x order
+        // (matching chunking::emit_chunk_root). All other cells map to a
+        // single normal chunk so the grid is fully covered.
+        let k = 1u32;
+        let (cgx, cgy, cgz) = (1i32, 2, 3);
+        let mut chunks = vec![PlannedChunk {
+            level: 2,
+            gx: 0,
+            gy: 0,
+            gz: 0,
+            point_count: 10,
+        }];
+        // Sub-chunks emitted in z-major, then y, then x — same as the planner.
+        for sz in 0..2 {
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    chunks.push(PlannedChunk {
+                        level: 2 + k,
+                        gx: (cgx << k) | sx,
+                        gy: (cgy << k) | sy,
+                        gz: (cgz << k) | sz,
+                        point_count: 1_000_000,
+                    });
+                }
+            }
+        }
+        let plan = make_plan(4, chunks);
+        let lut = build_chunk_lut(&plan);
+
+        // The sub-split cell is marked and has a descriptor.
+        let cell_idx = cgx as usize + cgy as usize * 4 + cgz as usize * 16;
+        assert_eq!(lut.cells[cell_idx], SUBSPLIT_MARKER);
+        let s = lut
+            .sub
+            .get(&cell_idx)
+            .expect("sub-split descriptor present");
+        assert_eq!(s.k, k);
+        // The 8 sub-chunks occupy plan indices 1..9 (chunk 0 is the normal
+        // one), and the base is the index of local octant (0,0,0) = 1.
+        assert_eq!(s.base, 1);
+        assert_eq!(lut.sub.len(), 1);
+
+        // Routing: for each local octant, base + sub_octant_index reproduces
+        // the global chunk index assigned by enumerate() order.
+        for sz in 0..2i32 {
+            for sy in 0..2i32 {
+                for sx in 0..2i32 {
+                    let gx = (cgx << k) | sx;
+                    let gy = (cgy << k) | sy;
+                    let gz = (cgz << k) | sz;
+                    let octant = sub_octant_index(gx, gy, gz, k);
+                    let global = s.base + octant;
+                    // Expected: emission order index + 1 (chunk 0 is normal).
+                    let expected = 1 + (sx + sy * 2 + sz * 4) as u32;
+                    assert_eq!(global, expected, "octant ({sx},{sy},{sz}) routes wrong");
+                }
+            }
+        }
     }
 }
