@@ -18,9 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sub-splits an over-target finest-grid cell into deeper octree sub-chunks
   (routed during distribute via a deeper descent), and the build step gained a
   spill path that sub-divides any chunk whose actual point distribution still
-  exceeds the per-chunk memory budget — guaranteeing bounded build memory
-  regardless of how points concentrate inside a cell. This makes large,
-  geographically sparse datasets convert within a small `--memory-limit`.
+  exceeds the per-chunk memory budget. The build and merge steps now also bound
+  how many chunks they hold in memory at once — concurrency scales with the
+  memory budget (and cores) instead of running one chunk per core regardless of
+  budget, so peak build memory tracks `--memory-limit` from ~1 GB up to large
+  multi-core hosts. Together these guarantee bounded build memory regardless of
+  how points concentrate, letting large, geographically sparse datasets convert
+  within a small `--memory-limit`.
 
 ## [0.10.1] - 2026-05-28
 

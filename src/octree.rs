@@ -331,11 +331,6 @@ type SampleTask = (VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>);
 /// promoted points, and per-child remaining points.
 type SampleResult = (VoxelKey, Vec<VoxelKey>, Vec<RawPoint>, Vec<Vec<RawPoint>>);
 
-/// Per-sub-octant output of the spilled build: the sub-octant root key, the
-/// `(VoxelKey, point_count)` nodes its subtree produced, and the root's
-/// retained points (gathered for the local merge up to the chunk root).
-type SubtreeBuild = (VoxelKey, Vec<(VoxelKey, usize)>, Vec<RawPoint>);
-
 // ---------------------------------------------------------------------------
 // Morton code helper (used for spatially coherent traversal order)
 // ---------------------------------------------------------------------------
@@ -370,12 +365,67 @@ const MAX_LEAF_POINTS: u64 = 100_000;
 /// (sub-divided) build path. Mirrors `chunking::PER_CHUNK_PEAK_BYTES_PER_POINT`.
 const PER_CHUNK_BYTES_PER_POINT_BUILD: u64 = 600;
 
-/// Fraction of the memory budget a single chunk's in-memory build may use
-/// before it must spill to the sub-divided path. Matches the planner's
-/// `SINGLE_CHUNK_BUDGET_FRACTION` so a chunk the planner sized to fit builds
-/// in memory, and only a chunk whose *actual* point distribution exceeded the
-/// planner's grid-resolution estimate spills.
-const SINGLE_CHUNK_BUILD_FRACTION: f64 = 0.4;
+/// Fraction of the memory budget that phase 1's live build working set may
+/// occupy. The remaining headroom covers the process baseline still resident
+/// when the build starts (decoder buffers and allocations retained from scan /
+/// count / distribute), the writer phase's later peak, and allocator slack.
+/// Kept below half so that baseline + build stays well under the budget.
+const BUILD_WORKING_SET_FRACTION: f64 = 0.4;
+
+/// Smallest per-chunk in-memory budget we will split the working-set pool
+/// into. Concurrency grows by handing each new build slot at least this much,
+/// so slots stay large enough to build typical chunks fully in memory rather
+/// than forcing the (more memory-hungry) spill path. Larger budgets therefore
+/// buy *more concurrency* at a healthy per-slot size, not ever-tinier slots.
+const MIN_BUILD_SLOT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Hard cap on concurrent build slots, regardless of cores or budget. Past
+/// this, extra parallelism yields diminishing returns while multiplying peak
+/// memory and the number of spill temp files open at once. Big machines still
+/// get large per-slot budgets; they just don't fan out beyond this width.
+const MAX_BUILD_CONCURRENCY: usize = 16;
+
+/// A merge parent must be grid-sampled fully in memory (there is no spill for
+/// the merge step), so it is only rejected as "too large" when its children's
+/// combined points exceed `max(memory_budget, this floor)`. The floor lets the
+/// merge proceed for parents that are trivially holdable even when the
+/// configured budget is artificially tiny — merge parents hold LOD-thinned
+/// node data, which is inherently small, so anything under a couple of GB is
+/// always safe to grid-sample regardless of `--memory-limit`.
+const MERGE_PARENT_OOM_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Compute the phase-1 build concurrency and the per-chunk in-memory budget.
+///
+/// The working-set pool is `BUILD_WORKING_SET_FRACTION × memory_budget`.
+/// Concurrency is the largest count (≥ 1) that still gives each slot at least
+/// `MIN_BUILD_SLOT_BYTES`, capped by `cores` and `MAX_BUILD_CONCURRENCY`; the
+/// per-chunk budget is then the pool divided evenly among the slots. Peak live
+/// build memory is therefore ≈ the pool (`concurrency × per_chunk`), bounded
+/// by `BUILD_WORKING_SET_FRACTION × memory_budget`.
+///
+/// This scales across the whole budget range: a 1 GB budget yields one slot
+/// taking the whole pool (so a chunk builds in memory rather than spilling),
+/// while a 256 GB budget fans out to `min(cores, MAX_BUILD_CONCURRENCY)` slots
+/// each with a large budget. The per-chunk budget is deliberately kept *large*
+/// — a chunk only spills when it genuinely cannot fit one slot, because the
+/// spill path costs more peak memory than an in-memory build, so it is a
+/// correctness safety-net for oversized chunks, never a memory-saving tactic.
+///
+/// Returns `(concurrency, per_chunk_budget_bytes)`.
+fn build_concurrency_and_budget(memory_budget: u64, cores: usize) -> (usize, u64) {
+    let pool = (memory_budget as f64 * BUILD_WORKING_SET_FRACTION) as u64;
+    // Grow concurrency only while each slot still clears the minimum slot size,
+    // so slots stay large (spill-avoiding) rather than splitting into tiny
+    // pieces. At least one slot always.
+    let by_memory = (pool / MIN_BUILD_SLOT_BYTES).max(1) as usize;
+    let concurrency = by_memory.min(cores.max(1)).min(MAX_BUILD_CONCURRENCY);
+    // Each slot's share of the pool is its in-memory budget; a chunk whose
+    // actual working set exceeds this spills. Floored at one MAX_LEAF_POINTS
+    // leaf set so even a tiny budget can make progress one chunk at a time.
+    let min_per_chunk = MAX_LEAF_POINTS.saturating_mul(PER_CHUNK_BYTES_PER_POINT_BUILD);
+    let per_chunk = (pool / concurrency as u64).max(min_per_chunk);
+    (concurrency, per_chunk)
+}
 
 /// Grid cells per axis for LOD thinning. Matches untwine's CellCount = 128.
 /// Higher values keep more points at coarse LOD levels (better progressive rendering).
@@ -2189,62 +2239,71 @@ impl OctreeBuilder {
             split_level
         );
 
-        // Step 3: build each sub-octant from its own temp file (in parallel —
-        // disjoint subtrees never write the same node), collecting the
-        // sub-octant root points for the local merge up to the chunk root.
+        // Step 3: build each sub-octant from its own temp file. Each build
+        // writes its whole subtree (including the sub-octant root) to disk and
+        // returns only node *keys* — we deliberately do NOT carry any points
+        // back into memory, so this loop's resident set is bounded by one
+        // sub-octant build at a time (the spill runs inside the bounded build
+        // pool) plus the accumulating key list (tiny: ~32 B per node).
         let codec = self.temp_compression;
         let nxb = self.num_extra_bytes;
-        let built: Vec<SubtreeBuild> = sub_roots
+        let built: Vec<Vec<(VoxelKey, usize)>> = sub_roots
             .par_iter()
             .enumerate()
-            .map(|(idx, sub_root)| -> Result<_> {
+            .map(|(idx, sub_root)| -> Result<Vec<(VoxelKey, usize)>> {
                 let path = chunk_shard_path(&spill_dir, idx as u32);
                 let f = match File::open(&path) {
                     Ok(f) => f,
                     // A sub-octant index always has a file (we created it on
                     // first point), but be defensive.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok((*sub_root, Vec::new(), Vec::new()));
+                        return Ok(Vec::new());
                     }
                     Err(e) => return Err(e.into()),
                 };
                 let points = read_temp_batches(f, nxb, codec)?;
-                let nodes = self.build_subtree_from_points(*sub_root, points, config)?;
-                // Read back the sub-octant root's retained points for the
-                // merge to chunk.level (bounded by grid_sample's per-node cap).
-                let root_pts = self.read_node(sub_root)?;
-                Ok((*sub_root, nodes, root_pts))
+                self.build_subtree_from_points(*sub_root, points, config)
             })
             .collect::<Result<_>>()?;
 
         let mut all_nodes: Vec<(VoxelKey, usize)> = Vec::new();
-        let mut subroot_points: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
-        for (sub_root, nodes, root_pts) in built {
-            all_nodes.extend(nodes);
-            if !root_pts.is_empty() {
-                subroot_points.insert(sub_root, root_pts);
+        let mut sub_root_keys: Vec<VoxelKey> = Vec::new();
+        let split_level_i32 = split_level as i32;
+        for nodes in built {
+            for (k, _) in &nodes {
+                if k.level == split_level_i32 {
+                    sub_root_keys.push(*k);
+                }
             }
+            all_nodes.extend(nodes);
         }
 
         // The spill files are no longer needed.
         let _ = std::fs::remove_dir_all(&spill_dir);
 
-        if subroot_points.is_empty() {
+        if sub_root_keys.is_empty() {
             return Ok(all_nodes);
         }
 
         // Merge the sub-octant roots (at split_level) up to the chunk root
-        // (at chunk.level). bottom_up_levels rewrites each sub-octant root's
-        // file with its post-merge remainder and writes the new ancestors.
-        let merged =
-            self.bottom_up_levels(subroot_points, split_level, chunk.level, false, config)?;
+        // (at chunk.level) using the disk-based, bounded merge — reading each
+        // parent's children from disk rather than holding every sub-octant's
+        // points resident. Concurrency 1: this spill is already running inside
+        // one slot of the outer build pool, so it must not fan out further.
+        let merged = self.merge_chunk_tops(
+            &sub_root_keys,
+            chunk.level as i32,
+            1,
+            chunk_mem_budget,
+            config,
+        )?;
 
-        // Combine: deeper nodes from the per-sub-octant builds + the merged
-        // ancestors (split_level down to chunk.level). The sub-octant root
-        // counts appear in both `all_nodes` (pre-merge) and `merged`
-        // (post-merge); the caller (build_node_map) re-reads every node count
-        // from disk after the merge, so here we just union the keys.
-        all_nodes.extend(merged);
+        // Combine deeper per-sub-octant nodes with the merged ancestors
+        // (split_level down to chunk.level). `merge_chunk_tops` returns keys
+        // only; the caller (`build_node_map`) re-reads every node's count from
+        // disk after the global merge, so the count carried here is a
+        // placeholder.
+        all_nodes.extend(merged.into_iter().map(|k| (k, 0usize)));
         Ok(all_nodes)
     }
 
@@ -2333,34 +2392,57 @@ impl OctreeBuilder {
         Ok(best.expect("loop ran at least once"))
     }
 
-    /// Merge chunk roots upward from `max_chunk_level` to the global root.
+    /// Merge a set of root keys upward, level by level, down to `stop_level`.
     ///
-    /// Starting from a set of "chunk root" keys (one per chunk, at varying
-    /// levels), we walk levels in reverse and at each level group nodes
-    /// by their parent and run `grid_sample` to produce the parent.
+    /// Starting from `root_keys` (nodes at varying levels), we walk levels in
+    /// reverse and at each level group nodes by their parent and run
+    /// `grid_sample` to produce the parent, reading children from disk and
+    /// writing parents + per-child remainders back to disk. Nothing is held
+    /// resident beyond one bounded batch of parents at a time, so peak memory
+    /// is `≈ build_concurrency × per_parent_budget` regardless of how many
+    /// roots there are.
     ///
-    /// **Variable-level chunks are handled naturally**: when level `d`'s
-    /// children are processed, the set may include both chunk roots that
-    /// happened to be at level `d+1` AND parents that the merge produced
-    /// from level `d+2`. They're treated identically — they're all just
-    /// "nodes at level `d+1`, ready to be grouped by their level-`d` parent".
+    /// **Variable-level roots are handled naturally**: when level `d`'s
+    /// children are processed, the set may include both original roots that
+    /// happened to be at level `d+1` AND parents the merge produced from level
+    /// `d+2`. They're treated identically.
     ///
-    /// Modifies node files on disk: when a parent is produced from its
-    /// children, the children's files are rewritten with the points that
-    /// did NOT get promoted to the parent (`grid_sample` returns this
-    /// "remaining" set per child).
+    /// With `stop_level = 0` this merges all the way to the global root (used
+    /// for the top-level chunk-tops merge). With a positive `stop_level` it
+    /// stops once parents at `stop_level` are produced — used by the spill
+    /// path to merge a chunk's deeper sub-octant roots up to the chunk root
+    /// without materialising every sub-octant's points at once.
     ///
-    /// `chunk_root_keys` lists every chunk root produced by the per-chunk
-    /// build phase. Returns the merge-produced parent keys at every level
-    /// from 0 up to `max_chunk_level - 1`.
+    /// Returns the merge-produced parent keys at every level from `stop_level`
+    /// up to `max(root level) - 1`.
     fn merge_chunk_tops(
         &self,
         chunk_root_keys: &[VoxelKey],
+        stop_level: i32,
+        build_concurrency: usize,
+        per_parent_budget: u64,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<VoxelKey>> {
         if chunk_root_keys.is_empty() {
             return Ok(Vec::new());
         }
+
+        // Bound merge memory the same way phase 1 does: at most
+        // `build_concurrency` parents merge concurrently, each holding its
+        // children's (LOD-thinned) points — capped at `per_parent_budget`. A
+        // bounded pool enforces the concurrency regardless of core count. For
+        // concurrency 1 (e.g. the spill's local merge, already running inside
+        // one outer build slot) skip the pool and run merges inline.
+        let merge_pool = if build_concurrency > 1 {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(build_concurrency)
+                    .build()
+                    .context("building bounded merge thread pool")?,
+            )
+        } else {
+            None
+        };
 
         // Organise chunk roots by level. Like bottom_up_on_disk, we use a
         // HashSet per level so we never get duplicate keys (which can happen
@@ -2392,9 +2474,9 @@ impl OctreeBuilder {
 
         let mut all_new_parents: Vec<VoxelKey> = Vec::new();
 
-        // Walk from the deepest chunk level down to level 0. d is the parent
+        // Walk from the deepest level down to `stop_level`. d is the parent
         // level we're producing in this iteration.
-        for d in (0..max_chunk_level).rev() {
+        for d in (stop_level..max_chunk_level).rev() {
             let child_level = d + 1;
             let child_keys: Vec<VoxelKey> = match keys_by_level.get(&child_level) {
                 Some(v) => v.iter().copied().collect(),
@@ -2422,13 +2504,19 @@ impl OctreeBuilder {
             let mut small_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
             let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
 
+            // A merge parent has no spill path — it must be grid-sampled in
+            // memory — so it is only "too large" when its children exceed what
+            // is physically safe to hold: max(budget, floor). The floor keeps
+            // trivially-small merges (LOD-thinned node data) working even under
+            // an artificially tiny `--memory-limit`.
+            let oom_threshold = config.memory_budget.max(MERGE_PARENT_OOM_FLOOR_BYTES);
             for (parent, children) in parent_children {
                 let est_points: u64 = children
                     .iter()
                     .map(|ck| self.count_node(ck).unwrap_or(0))
                     .sum();
                 let est_mem = est_points.saturating_mul(mem_per_point);
-                if est_mem > config.memory_budget {
+                if est_mem > oom_threshold {
                     large_parents.push((parent, children, est_mem));
                 } else {
                     small_parents.push((parent, children, est_mem));
@@ -2436,29 +2524,29 @@ impl OctreeBuilder {
             }
 
             debug!(
-                "Merge level {}→{}: {} parents ({} small, {} large), budget={} MB",
+                "Merge level {}→{}: {} parents ({} small, {} large), per-parent budget={} MB, concurrency={}",
                 child_level,
                 d,
                 small_parents.len() + large_parents.len(),
                 small_parents.len(),
                 large_parents.len(),
-                config.memory_budget / 1_048_576,
+                per_parent_budget / 1_048_576,
+                build_concurrency,
             );
 
             if let Some((parent, children, est_mem)) = large_parents.first() {
-                // Chunks are sized by `merge_sparse_cells` to fit the
-                // memory budget, so a parent whose combined children
-                // exceed it signals either a pathological chunk plan or a
-                // memory budget set too low for the input. Bail out with
-                // a message the user can act on.
+                // A parent whose combined children exceed what is physically
+                // safe to hold can't be grid-sampled in memory at all — it
+                // signals either a pathological chunk plan or a budget set too
+                // low for the input. Bail out with a message the user can act on.
                 return Err(anyhow::anyhow!(
                     "merge parent {:?} has {} children with combined estimate {} MB, \
-                     exceeding memory budget {} MB. Raise --memory-limit or investigate \
-                     the chunk plan.",
+                     exceeding the {} MB in-memory merge limit. Raise --memory-limit \
+                     or investigate the chunk plan.",
                     parent,
                     children.len(),
                     est_mem / 1_048_576,
-                    config.memory_budget / 1_048_576,
+                    oom_threshold / 1_048_576,
                 ));
             }
 
@@ -2466,13 +2554,18 @@ impl OctreeBuilder {
             // batching greedy stays balanced.
             small_parents.sort_by_key(|p| std::cmp::Reverse(p.2));
 
+            // Cap each batch's combined working set at
+            // `build_concurrency × per_parent_budget` so that, with the merge
+            // pool capping concurrency, peak resident merge memory stays under
+            // `BUILD_PEAK_FRACTION × memory_budget` — the same invariant as
+            // phase 1.
+            let batch_cap = (build_concurrency as u64).saturating_mul(per_parent_budget);
             let mut batch_start = 0;
             while batch_start < small_parents.len() {
                 let mut batch_mem: u64 = 0;
                 let mut batch_end = batch_start;
                 while batch_end < small_parents.len() {
-                    if batch_end > batch_start
-                        && batch_mem + small_parents[batch_end].2 > config.memory_budget
+                    if batch_end > batch_start && batch_mem + small_parents[batch_end].2 > batch_cap
                     {
                         break;
                     }
@@ -2486,30 +2579,36 @@ impl OctreeBuilder {
                     batch.len(),
                     batch_mem / 1_048_576,
                 );
-                batch
-                    .par_iter()
-                    .map(|(parent, children, _)| -> Result<()> {
-                        let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
-                        for (ci, ck) in children.iter().enumerate() {
-                            for p in self.read_node(ck)? {
-                                all_pts.push((ci, p));
+                let process_batch = || -> Result<Vec<()>> {
+                    batch
+                        .par_iter()
+                        .map(|(parent, children, _)| -> Result<()> {
+                            let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
+                            for (ci, ck) in children.iter().enumerate() {
+                                for p in self.read_node(ck)? {
+                                    all_pts.push((ci, p));
+                                }
                             }
-                        }
-                        if all_pts.is_empty() {
-                            return Ok(());
-                        }
-                        let (parent_pts, per_child) =
-                            self.grid_sample(parent, all_pts, children.len());
-                        // Rewrite each child with its remaining points.
-                        for (ci, ck) in children.iter().enumerate() {
-                            self.write_node_to_temp(ck, &per_child[ci])?;
-                        }
-                        if !parent_pts.is_empty() {
-                            self.write_node_to_temp(parent, &parent_pts)?;
-                        }
-                        Ok(())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                            if all_pts.is_empty() {
+                                return Ok(());
+                            }
+                            let (parent_pts, per_child) =
+                                self.grid_sample(parent, all_pts, children.len());
+                            // Rewrite each child with its remaining points.
+                            for (ci, ck) in children.iter().enumerate() {
+                                self.write_node_to_temp(ck, &per_child[ci])?;
+                            }
+                            if !parent_pts.is_empty() {
+                                self.write_node_to_temp(parent, &parent_pts)?;
+                            }
+                            Ok(())
+                        })
+                        .collect::<Result<Vec<_>>>()
+                };
+                match &merge_pool {
+                    Some(pool) => pool.install(process_batch)?,
+                    None => process_batch()?,
+                };
 
                 for (parent, _, _) in &small_parents[batch_start..batch_end] {
                     all_new_parents.push(*parent);
@@ -2550,27 +2649,37 @@ impl OctreeBuilder {
 
         // ---- Phase 1: per-chunk in-memory build ----
         //
-        // Process chunks in batches sized by memory budget. Within each batch,
-        // chunks run fully in parallel via rayon. Per-chunk peak working set
-        // is estimated at `PER_CHUNK_BYTES_PER_POINT_BUILD` bytes per point.
+        // Peak build memory is `(concurrent subtree builds) × (per-subtree
+        // peak)`. Two things make the concurrency hard to see locally: rayon's
+        // global pool runs one task per core, and a spilling chunk itself
+        // fans out a nested `par_iter` over its sub-octants. Both draw from the
+        // same pool, so a naive build could hold `cores × per_chunk_peak`
+        // resident — or worse with nesting — and blow the budget.
         //
-        // The planner's per-chunk `point_count` is an estimate from
-        // grid-resolution occupancy; a chunk can concentrate more points in
-        // one sub-region than the estimate implies. `chunk_mem_budget` is the
-        // ceiling above which a chunk builds via the spilled (sub-divided)
-        // path instead of fully in memory, so peak memory stays bounded even
-        // when the estimate was low.
-        let chunk_mem_budget = (config.memory_budget as f64 * SINGLE_CHUNK_BUILD_FRACTION) as u64;
+        // We bound it with a dedicated build pool of `build_concurrency`
+        // threads and run *all* build work (top-level chunks and the spill's
+        // sub-octant builds) inside it. At most `build_concurrency` subtrees
+        // are ever resident, each capped at `chunk_mem_budget`, so peak ≈
+        // `build_concurrency × chunk_mem_budget ≤ BUILD_PEAK_FRACTION ×
+        // memory_budget`. Chunks (and sub-octants) larger than the per-subtree
+        // budget take the spilled path, keeping each one bounded.
+        let cores = rayon::current_num_threads();
+        let (build_concurrency, chunk_mem_budget) =
+            build_concurrency_and_budget(config.memory_budget, cores);
+        info!(
+            "Build: concurrency={}, per-chunk budget={} MB (build working set ≈ {} MB of {} MB budget)",
+            build_concurrency,
+            chunk_mem_budget / 1_048_576,
+            (build_concurrency as u64 * chunk_mem_budget) / 1_048_576,
+            config.memory_budget / 1_048_576,
+        );
 
-        // Sort chunks by descending point count so the greedy batching stays
-        // balanced (largest chunks first, smaller ones fill the gaps).
-        let mut chunks_indexed: Vec<(u32, &crate::chunking::PlannedChunk)> = plan
+        let chunks_indexed: Vec<(u32, &crate::chunking::PlannedChunk)> = plan
             .chunks
             .iter()
             .enumerate()
             .map(|(i, c)| (i as u32, c))
             .collect();
-        chunks_indexed.sort_by_key(|c| std::cmp::Reverse(c.1.point_count));
 
         config.report(crate::ProgressEvent::StageStart {
             name: "Building",
@@ -2578,37 +2687,18 @@ impl OctreeBuilder {
         });
 
         let chunks_done = AtomicU64::new(0);
-        let mut all_chunk_node_keys: Vec<VoxelKey> = Vec::new();
-        let mut chunk_root_keys: Vec<VoxelKey> = Vec::new();
 
-        let mut batch_start = 0;
-        while batch_start < chunks_indexed.len() {
-            let mut batch_mem: u64 = 0;
-            let mut batch_end = batch_start;
-            while batch_end < chunks_indexed.len() {
-                let est_mem = chunks_indexed[batch_end]
-                    .1
-                    .point_count
-                    .saturating_mul(PER_CHUNK_BYTES_PER_POINT_BUILD);
-                // Always include at least one chunk per batch, even if it
-                // exceeds the budget on its own (better to OOM honestly than
-                // to hang forever in an empty batch).
-                if batch_end > batch_start && batch_mem + est_mem > config.memory_budget {
-                    break;
-                }
-                batch_mem += est_mem;
-                batch_end += 1;
-            }
+        // Build pool with bounded threads. Running phase 1 inside it caps the
+        // total number of concurrently-resident subtree builds — including the
+        // nested sub-octant builds inside a spilling chunk, which inherit this
+        // pool rather than the global one.
+        let build_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(build_concurrency)
+            .build()
+            .context("building bounded build thread pool")?;
 
-            let batch = &chunks_indexed[batch_start..batch_end];
-            debug!(
-                "Build batch: {} chunks, est {} MB",
-                batch.len(),
-                batch_mem / 1_048_576
-            );
-
-            // Process this batch in parallel.
-            let batch_results: Vec<Vec<(VoxelKey, usize)>> = batch
+        let batch_results: Vec<Vec<(VoxelKey, usize)>> = build_pool.install(|| {
+            chunks_indexed
                 .par_iter()
                 .map(|(chunk_idx, chunk)| -> Result<Vec<(VoxelKey, usize)>> {
                     let nodes =
@@ -2617,20 +2707,19 @@ impl OctreeBuilder {
                     config.report(crate::ProgressEvent::StageProgress { done });
                     Ok(nodes)
                 })
-                .collect::<Result<_>>()?;
+                .collect::<Result<_>>()
+        })?;
 
-            // Collect node keys produced by this batch.
-            for ((_chunk_idx, chunk), nodes) in batch.iter().zip(batch_results) {
-                let chunk_level_i32 = chunk.level as i32;
-                for (k, _) in &nodes {
-                    all_chunk_node_keys.push(*k);
-                    if k.level == chunk_level_i32 {
-                        chunk_root_keys.push(*k);
-                    }
+        let mut all_chunk_node_keys: Vec<VoxelKey> = Vec::new();
+        let mut chunk_root_keys: Vec<VoxelKey> = Vec::new();
+        for ((_chunk_idx, chunk), nodes) in chunks_indexed.iter().zip(batch_results) {
+            let chunk_level_i32 = chunk.level as i32;
+            for (k, _) in &nodes {
+                all_chunk_node_keys.push(*k);
+                if k.level == chunk_level_i32 {
+                    chunk_root_keys.push(*k);
                 }
             }
-
-            batch_start = batch_end;
         }
 
         debug!(
@@ -2640,7 +2729,13 @@ impl OctreeBuilder {
         );
 
         // ---- Phase 2: merge chunk tops up to global root ----
-        let merge_parents = self.merge_chunk_tops(&chunk_root_keys, config)?;
+        let merge_parents = self.merge_chunk_tops(
+            &chunk_root_keys,
+            0, // stop at the global root
+            build_concurrency,
+            chunk_mem_budget,
+            config,
+        )?;
         debug!("Merge step produced {} parent nodes", merge_parents.len());
 
         config.report(crate::ProgressEvent::StageDone);
@@ -3148,6 +3243,75 @@ mod tests {
 
         // 100M points → ceil(log8(1000)) = 4
         assert_eq!(chunk_local_extra_levels(100_000_000), 4);
+    }
+
+    #[test]
+    fn build_concurrency_and_budget_scales() {
+        let gib = 1024u64 * 1024 * 1024;
+        let min_per_chunk = MAX_LEAF_POINTS * PER_CHUNK_BYTES_PER_POINT_BUILD;
+        for &budget in &[gib, 2 * gib, 9 * gib, 32 * gib, 64 * gib, 256 * gib] {
+            for &cores in &[1usize, 2, 8, 10, 64] {
+                let (c, per) = build_concurrency_and_budget(budget, cores);
+
+                // Concurrency in [1, min(cores, MAX_BUILD_CONCURRENCY)].
+                assert!(
+                    c >= 1,
+                    "concurrency must be ≥ 1 (budget={budget}, cores={cores})"
+                );
+                assert!(
+                    c <= cores.min(MAX_BUILD_CONCURRENCY),
+                    "concurrency {c} exceeds min(cores={cores}, cap={MAX_BUILD_CONCURRENCY})"
+                );
+
+                // Live build working set = concurrency × per-chunk budget. It
+                // must fit BUILD_WORKING_SET_FRACTION × budget — except when a
+                // budget is too small to fund even one minimum slot, where we
+                // accept one slot at the floor (a chunk can't build in less).
+                let working_set = c as u64 * per;
+                let pool = (budget as f64 * BUILD_WORKING_SET_FRACTION) as u64;
+                assert!(
+                    working_set <= pool || (c == 1 && per == min_per_chunk),
+                    "working set {working_set} exceeds pool {pool} \
+                     (budget={budget}, cores={cores}, c={c}, per={per})"
+                );
+
+                // Each slot is at least one usable leaf set.
+                assert!(
+                    per >= min_per_chunk,
+                    "per-chunk {per} below floor {min_per_chunk}"
+                );
+            }
+        }
+
+        // Tight budget → a single large slot (avoids spilling), not many tiny.
+        let (c1, per1) = build_concurrency_and_budget(gib, 64);
+        assert_eq!(c1, 1, "1 GB budget should use a single build slot");
+        assert!(
+            per1 >= MIN_BUILD_SLOT_BYTES / 2,
+            "single slot should still be sizeable"
+        );
+
+        // Abundant budget + cores → fans out to the cap with large slots.
+        let (c2, per2) = build_concurrency_and_budget(256 * gib, 64);
+        assert_eq!(
+            c2, MAX_BUILD_CONCURRENCY,
+            "huge budget should reach the concurrency cap"
+        );
+        assert!(
+            per2 > MIN_BUILD_SLOT_BYTES * 4,
+            "huge budget should give large per-slot budgets, got {per2}"
+        );
+
+        // More budget never reduces concurrency (monotonic) at fixed cores.
+        let mut prev = 0;
+        for &g in &[1u64, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let (c, _) = build_concurrency_and_budget(g * gib, 64);
+            assert!(
+                c >= prev,
+                "concurrency dropped as budget grew ({g} GB → {c} < {prev})"
+            );
+            prev = c;
+        }
     }
 
     #[test]
