@@ -1962,7 +1962,8 @@ impl OctreeBuilder {
         &self,
         leaves: &mut HashMap<VoxelKey, Vec<RawPoint>>,
         raw: RawPoint,
-        root: VoxelKey,
+        // Only read by the debug-assertion below; unused in release builds.
+        #[cfg_attr(not(debug_assertions), allow(unused_variables))] root: VoxelKey,
         leaf_depth: u32,
     ) {
         let wx = raw.x as f64 * self.scale_x + self.offset_x;
