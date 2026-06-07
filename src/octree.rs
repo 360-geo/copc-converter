@@ -394,6 +394,18 @@ const MAX_BUILD_CONCURRENCY: usize = 16;
 /// always safe to grid-sample regardless of `--memory-limit`.
 const MERGE_PARENT_OOM_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Aggregate counters for the spill path, accumulated across all chunks during
+/// phase 1 and logged once afterwards. Avoids per-chunk / per-sub-octant log
+/// lines (which flood at scale) while still surfacing whether — and how hard —
+/// the spill engaged: the number of chunks that spilled, the deepest extra
+/// split level any of them needed, and the total sub-octant files produced.
+#[derive(Default)]
+struct SpillStats {
+    chunks_spilled: AtomicU64,
+    max_split_extra: AtomicU64,
+    sub_octant_files: AtomicU64,
+}
+
 /// Compute the phase-1 build concurrency and the per-chunk in-memory budget.
 ///
 /// The working-set pool is `BUILD_WORKING_SET_FRACTION × memory_budget`.
@@ -1136,7 +1148,6 @@ impl OctreeBuilder {
         let per_file: Result<Vec<PerFileEntry>> = input_files
             .par_iter()
             .map(|path| -> Result<PerFileEntry> {
-                debug!("Scanning {:?}", path);
                 let reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
                 let header = reader.header();
@@ -1287,7 +1298,7 @@ impl OctreeBuilder {
         // that never ran Drop cleanup). Without this, append-mode writes in
         // distribute/normalize would double-count points from the old run.
         if tmp_dir.exists() {
-            info!("Removing stale temp dir {:?}", tmp_dir);
+            debug!("Removing stale temp dir {:?}", tmp_dir);
             std::fs::remove_dir_all(&tmp_dir)?;
         }
         std::fs::create_dir_all(&tmp_dir)?;
@@ -1420,20 +1431,6 @@ impl OctreeBuilder {
                     done: (actual_max_depth - d) as u64,
                 });
             }
-            let level_points: usize = nodes
-                .iter()
-                .filter(|(k, _)| k.level as u32 == d + 1)
-                .map(|(_, v)| v.len())
-                .sum();
-            debug!(
-                "In-memory level {d}: {} total points at child level, {} nodes in map ({} MB est)",
-                level_points,
-                nodes.len(),
-                (nodes.values().map(|v| v.len()).sum::<usize>()
-                    * (std::mem::size_of::<RawPoint>() + self.num_extra_bytes as usize))
-                    / 1_048_576,
-            );
-
             // Group children at level d+1 by parent (iterate keys, no disk I/O).
             let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
             for k in nodes.keys() {
@@ -1634,7 +1631,7 @@ impl OctreeBuilder {
             config.chunk_target_override,
         )?;
         config.report(crate::ProgressEvent::StageDone);
-        info!(
+        debug!(
             "Distribute: {} chunks, target {} points each, grid {}³",
             plan.chunks.len(),
             plan.chunk_target,
@@ -1742,13 +1739,6 @@ impl OctreeBuilder {
                 for path in &input_files[start..end] {
                     let mut reader = las::Reader::from_path(path)
                         .with_context(|| format!("Cannot open {:?}", path))?;
-                    let file_pts = reader.header().number_of_points();
-                    debug!(
-                        "Distribute worker {} file {:?}: {} points",
-                        worker_id,
-                        path.file_name().unwrap_or_default(),
-                        file_pts
-                    );
 
                     loop {
                         points.clear();
@@ -1897,6 +1887,7 @@ impl OctreeBuilder {
         chunk: &crate::chunking::PlannedChunk,
         chunk_idx: u32,
         chunk_mem_budget: u64,
+        spill_stats: &SpillStats,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
         let chunk_root = VoxelKey {
@@ -1910,17 +1901,8 @@ impl OctreeBuilder {
         if est_bytes <= chunk_mem_budget {
             self.build_subtree_in_memory(chunk_root, chunk_idx, actual_points, config)
         } else {
-            debug!(
-                "Chunk {} (L{} {},{},{}): {} actual points exceed per-chunk budget ({} pts); spilling",
-                chunk_idx,
-                chunk.level,
-                chunk.gx,
-                chunk.gy,
-                chunk.gz,
-                actual_points,
-                chunk_mem_budget / PER_CHUNK_BYTES_PER_POINT_BUILD,
-            );
-            self.build_chunk_spilled(chunk, chunk_idx, chunk_mem_budget, config)
+            spill_stats.chunks_spilled.fetch_add(1, Ordering::Relaxed);
+            self.build_chunk_spilled(chunk, chunk_idx, chunk_mem_budget, spill_stats, config)
         }
     }
 
@@ -2030,10 +2012,6 @@ impl OctreeBuilder {
         if leaves.is_empty() {
             // Empty subtree → no nodes produced. Expected for empty sub-octant
             // slots in the spilled path; defensive otherwise.
-            debug!(
-                "Subtree (L{} {},{},{}) is empty, skipping",
-                root.level, root.x, root.y, root.z
-            );
             return Ok(Vec::new());
         }
 
@@ -2100,16 +2078,6 @@ impl OctreeBuilder {
             }
         }
 
-        debug!(
-            "Subtree (L{} {},{},{}): {} leaves after subdivision, effective depth {}",
-            root.level,
-            root.x,
-            root.y,
-            root.z,
-            leaves.len(),
-            effective_max_depth
-        );
-
         // Run the bottom-up grid-sample loop, stopping at root.level.
         // bottom_up_levels writes every produced node to its canonical temp
         // file path, so the subtree is on disk after this returns. Suppress
@@ -2142,6 +2110,7 @@ impl OctreeBuilder {
         chunk: &crate::chunking::PlannedChunk,
         chunk_idx: u32,
         chunk_mem_budget: u64,
+        spill_stats: &SpillStats,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
         let chunk_root = VoxelKey {
@@ -2157,29 +2126,15 @@ impl OctreeBuilder {
         // up to every shallower level in memory, so the chunk file is read
         // exactly once regardless of how deep the data forces the split.
         let max_points_in_budget = (chunk_mem_budget / PER_CHUNK_BYTES_PER_POINT_BUILD).max(1);
-        let (split_level, densest) =
+        let (split_level, _densest) =
             self.choose_split_level(chunk_idx, chunk_root, max_points_in_budget)?;
-        debug!(
-            "Spilled chunk {} (L{} {},{},{}): split_level {} (densest sub-octant {} pts, budget {} pts)",
-            chunk_idx,
-            chunk.level,
-            chunk.gx,
-            chunk.gy,
-            chunk.gz,
-            split_level,
-            densest,
-            max_points_in_budget,
-        );
-        if densest > max_points_in_budget {
-            // Hit the depth cap with a still-oversized sub-octant (extreme
-            // coincident-point density). finish_subtree's own leaf-depth cap
-            // will absorb it; log so it's visible.
-            debug!(
-                "Spilled chunk {}: densest sub-octant still {} pts > budget {} at the depth cap; \
-                 proceeding (may exceed budget for this chunk)",
-                chunk_idx, densest, max_points_in_budget
-            );
-        }
+        // Track the deepest extra split any chunk needed (aggregate; logged
+        // once after phase 1). `densest > budget` only at the depth cap with
+        // pathological coincident-point density — finish_subtree's leaf-depth
+        // cap absorbs the residual, so no separate warning per chunk.
+        spill_stats
+            .max_split_extra
+            .fetch_max((split_level - chunk.level) as u64, Ordering::Relaxed);
 
         // Step 2: route every point into its sub-octant temp file in ONE pass.
         // Sub-octant `VoxelKey`s are mapped to dense `u32` indices so the
@@ -2247,12 +2202,9 @@ impl OctreeBuilder {
         }
         cache.flush_all()?;
 
-        debug!(
-            "Spilled chunk {}: routed into {} sub-octant files at level {}",
-            chunk_idx,
-            sub_roots.len(),
-            split_level
-        );
+        spill_stats
+            .sub_octant_files
+            .fetch_add(sub_roots.len() as u64, Ordering::Relaxed);
 
         // Step 3: build each sub-octant from its own temp file. Each build
         // writes its whole subtree (including the sub-octant root) to disk and
@@ -2310,6 +2262,7 @@ impl OctreeBuilder {
             chunk.level as i32,
             1,
             chunk_mem_budget,
+            true, // quiet: one local merge per spilled chunk — don't flood
             config,
         )?;
 
@@ -2436,6 +2389,10 @@ impl OctreeBuilder {
         stop_level: i32,
         build_concurrency: usize,
         per_parent_budget: u64,
+        // When true, suppress the per-level / per-batch debug lines. Set for
+        // the spill's local sub-octant merge, which runs once per spilled chunk
+        // and would otherwise flood the log; the single global merge logs.
+        quiet: bool,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<VoxelKey>> {
         if chunk_root_keys.is_empty() {
@@ -2469,11 +2426,13 @@ impl OctreeBuilder {
         }
 
         let max_chunk_level: i32 = keys_by_level.keys().copied().max().unwrap_or(0);
-        debug!(
-            "Merge chunk tops: {} chunk roots, max_chunk_level={}",
-            chunk_root_keys.len(),
-            max_chunk_level
-        );
+        if !quiet {
+            debug!(
+                "Merge chunk tops: {} chunk roots, max_chunk_level={}",
+                chunk_root_keys.len(),
+                max_chunk_level
+            );
+        }
 
         // Reuse the same per-point cost estimate as bottom_up_on_disk's
         // small-parent batching: input vec + per-child remaining. The
@@ -2538,16 +2497,18 @@ impl OctreeBuilder {
                 }
             }
 
-            debug!(
-                "Merge level {}→{}: {} parents ({} small, {} large), per-parent budget={} MB, concurrency={}",
-                child_level,
-                d,
-                small_parents.len() + large_parents.len(),
-                small_parents.len(),
-                large_parents.len(),
-                per_parent_budget / 1_048_576,
-                build_concurrency,
-            );
+            if !quiet {
+                debug!(
+                    "Merge level {}→{}: {} parents ({} small, {} large), per-parent budget={} MB, concurrency={}",
+                    child_level,
+                    d,
+                    small_parents.len() + large_parents.len(),
+                    small_parents.len(),
+                    large_parents.len(),
+                    per_parent_budget / 1_048_576,
+                    build_concurrency,
+                );
+            }
 
             if let Some((parent, children, est_mem)) = large_parents.first() {
                 // A parent whose combined children exceed what is physically
@@ -2589,11 +2550,13 @@ impl OctreeBuilder {
                 }
 
                 let batch = &small_parents[batch_start..batch_end];
-                debug!(
-                    "  Merge batch: {} parents, est {} MB",
-                    batch.len(),
-                    batch_mem / 1_048_576,
-                );
+                if !quiet {
+                    debug!(
+                        "  Merge batch: {} parents, est {} MB",
+                        batch.len(),
+                        batch_mem / 1_048_576,
+                    );
+                }
                 let process_batch = || -> Result<Vec<()>> {
                     batch
                         .par_iter()
@@ -2656,7 +2619,7 @@ impl OctreeBuilder {
             return Ok(Vec::new());
         }
 
-        info!(
+        debug!(
             "Build: {} chunks, max_chunk_level={}",
             n_chunks,
             plan.chunks.iter().map(|c| c.level).max().unwrap_or(0)
@@ -2681,7 +2644,7 @@ impl OctreeBuilder {
         let cores = rayon::current_num_threads();
         let (build_concurrency, chunk_mem_budget) =
             build_concurrency_and_budget(config.memory_budget, cores);
-        info!(
+        debug!(
             "Build: concurrency={}, per-chunk budget={} MB (build working set ≈ {} MB of {} MB budget)",
             build_concurrency,
             chunk_mem_budget / 1_048_576,
@@ -2702,6 +2665,7 @@ impl OctreeBuilder {
         });
 
         let chunks_done = AtomicU64::new(0);
+        let spill_stats = SpillStats::default();
 
         // Build pool with bounded threads. Running phase 1 inside it caps the
         // total number of concurrently-resident subtree builds — including the
@@ -2716,14 +2680,34 @@ impl OctreeBuilder {
             chunks_indexed
                 .par_iter()
                 .map(|(chunk_idx, chunk)| -> Result<Vec<(VoxelKey, usize)>> {
-                    let nodes =
-                        self.build_chunk_in_memory(chunk, *chunk_idx, chunk_mem_budget, config)?;
+                    let nodes = self.build_chunk_in_memory(
+                        chunk,
+                        *chunk_idx,
+                        chunk_mem_budget,
+                        &spill_stats,
+                        config,
+                    )?;
                     let done = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
                     config.report(crate::ProgressEvent::StageProgress { done });
                     Ok(nodes)
                 })
                 .collect::<Result<_>>()
         })?;
+
+        // One aggregate line on whether/how hard the spill engaged, instead of
+        // per-chunk spill logs. `chunks_spilled == 0` means every chunk fit its
+        // in-memory budget; a non-zero count with a modest max split depth is
+        // the spill working as intended.
+        let spilled = spill_stats.chunks_spilled.load(Ordering::Relaxed);
+        if spilled > 0 {
+            debug!(
+                "Build: {} of {} chunks spilled (max +{} levels, {} sub-octant files total)",
+                spilled,
+                n_chunks,
+                spill_stats.max_split_extra.load(Ordering::Relaxed),
+                spill_stats.sub_octant_files.load(Ordering::Relaxed),
+            );
+        }
 
         let mut all_chunk_node_keys: Vec<VoxelKey> = Vec::new();
         let mut chunk_root_keys: Vec<VoxelKey> = Vec::new();
@@ -2749,6 +2733,7 @@ impl OctreeBuilder {
             0, // stop at the global root
             build_concurrency,
             chunk_mem_budget,
+            false, // global merge: log per-level progress
             config,
         )?;
         debug!("Merge step produced {} parent nodes", merge_parents.len());
@@ -2783,7 +2768,7 @@ impl OctreeBuilder {
         result.retain(|(_, count)| *count > 0);
 
         let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
-        info!(
+        debug!(
             "Build: {} nodes, {} total points (input: {}), avg {} pts/node",
             result.len(),
             total_pts,

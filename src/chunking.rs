@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Sentinel population value meaning "this cell is blocked — it must not be
 /// rolled up further because at least one of its children is already a chunk
@@ -305,7 +305,7 @@ pub(crate) fn compute_chunk_plan(
     let chunk_target = chunk_target_override
         .unwrap_or_else(|| compute_chunk_target(config.memory_budget, num_workers, total_points));
 
-    info!(
+    debug!(
         "Chunk plan: total_points={}, grid={}³ (depth {}), chunk_target={}, workers={}",
         total_points, grid_size, grid_depth, chunk_target, num_workers
     );
