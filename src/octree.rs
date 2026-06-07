@@ -1524,6 +1524,21 @@ impl OctreeBuilder {
             return (vec![], vec![vec![]; n_children]);
         }
 
+        // Collapse: if everything gathered here fits a single leaf, keep it all
+        // in the parent and return empty children. Applied bottom-up, this
+        // lifts an under-full subtree into one leaf at the shallowest level it
+        // fits — so output node depth tracks point *density*, not the build's
+        // (memory-driven) spill depth. Without this, a region the spill had to
+        // split deep stays fragmented into many tiny deep nodes even though its
+        // points would comfortably fit one leaf. `pts` here is the full subtree
+        // total because collapse runs deepest-first: a collapsed child folds
+        // all its points into the parent, so the next level up sees the true
+        // total; a non-collapsed (oversized) child correctly stays subdivided.
+        if pts.len() as u64 <= MAX_LEAF_POINTS {
+            let parent_pts = pts.into_iter().map(|(_, p)| p).collect();
+            return (parent_pts, vec![vec![]; n_children]);
+        }
+
         // Parent voxel geometry in integer coordinate space.
         let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
         let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
@@ -2769,11 +2784,36 @@ impl OctreeBuilder {
 
         let total_pts: usize = result.iter().map(|(_, c)| *c).sum();
         info!(
-            "Build: {} nodes, {} total points (input: {})",
+            "Build: {} nodes, {} total points (input: {}), avg {} pts/node",
             result.len(),
             total_pts,
-            self.total_points
+            self.total_points,
+            if result.is_empty() {
+                0
+            } else {
+                total_pts / result.len()
+            },
         );
+        // Per-level node-count + point distribution, to surface
+        // over-fragmentation (many tiny deep nodes) at a glance.
+        {
+            let mut by_level: std::collections::BTreeMap<i32, (usize, usize)> =
+                std::collections::BTreeMap::new();
+            for (k, c) in &result {
+                let e = by_level.entry(k.level).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += *c;
+            }
+            for (lvl, (n, pts)) in &by_level {
+                debug!(
+                    "  level {}: {} nodes, {} pts ({} avg)",
+                    lvl,
+                    n,
+                    pts,
+                    if *n == 0 { 0 } else { pts / n }
+                );
+            }
+        }
         if total_pts as u64 != self.total_points {
             debug!(
                 "COPC contains {} points vs {} from input headers (diff {}). \

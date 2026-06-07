@@ -170,22 +170,23 @@ pub fn write_copc(
     // x/y/z for deterministic order.  COPC hierarchy is a flat lookup table,
     // so strict BFS-reachability from root is not required.
     // -----------------------------------------------------------------------
-    let point_counts: std::collections::HashMap<VoxelKey, usize> =
-        node_keys.iter().copied().collect();
-
-    let mut ordered_keys: Vec<VoxelKey> = node_keys.iter().map(|(k, _)| *k).collect();
-    ordered_keys.sort_by(|a, b| {
-        a.level
-            .cmp(&b.level)
-            .then(a.x.cmp(&b.x))
-            .then(a.y.cmp(&b.y))
-            .then(a.z.cmp(&b.z))
+    // Single sorted (key, count) list — sorted by level (coarse LOD first for
+    // progressive loading) then x/y/z for determinism. Keeping counts paired
+    // with keys avoids a separate `VoxelKey -> count` HashMap, which at tens of
+    // millions of nodes would cost gigabytes on its own.
+    let mut ordered: Vec<(VoxelKey, usize)> = node_keys.to_vec();
+    ordered.sort_by(|a, b| {
+        a.0.level
+            .cmp(&b.0.level)
+            .then(a.0.x.cmp(&b.0.x))
+            .then(a.0.y.cmp(&b.0.y))
+            .then(a.0.z.cmp(&b.0.z))
     });
 
     debug!(
         "Writing {} nodes, {} points",
-        ordered_keys.len(),
-        actual_total_points,
+        ordered.len(),
+        actual_total_points
     );
 
     // -----------------------------------------------------------------------
@@ -317,11 +318,8 @@ pub fn write_copc(
 
     // Only encode nodes that have actual points (empty ancestor nodes are
     // included in the hierarchy EVLR with offset=0/byte_size=0 but not compressed).
-    let data_keys: Vec<VoxelKey> = ordered_keys
-        .iter()
-        .filter(|k| point_counts.get(k).copied().unwrap_or(0) > 0)
-        .copied()
-        .collect();
+    let data_keys: Vec<(VoxelKey, usize)> =
+        ordered.iter().filter(|(_, c)| *c > 0).copied().collect();
 
     // Writer memory model:
     //
@@ -377,7 +375,7 @@ pub fn write_copc(
         "Encoding {} data nodes ({} empty ancestors), budget {} MiB, \
          phase1 {} B/pt incl. fragmentation, compress mini-batch {}",
         data_keys.len(),
-        ordered_keys.len() - data_keys.len(),
+        ordered.len() - data_keys.len(),
         memory_budget / 1_048_576,
         phase1_bytes_per_point,
         WRITER_COMPRESS_MINI_BATCH,
@@ -395,9 +393,7 @@ pub fn write_copc(
         let mut batch_bytes: u64 = 0;
         let mut batch_end = batch_start;
         while batch_end < data_keys.len() {
-            let key = &data_keys[batch_end];
-            let node_bytes =
-                (point_counts.get(key).copied().unwrap_or(0) as u64) * phase1_bytes_per_point;
+            let node_bytes = data_keys[batch_end].1 as u64 * phase1_bytes_per_point;
             // Always include at least one node per batch to avoid stalling.
             if batch_end > batch_start && batch_bytes + node_bytes > memory_budget {
                 break;
@@ -407,10 +403,7 @@ pub fn write_copc(
         }
 
         let batch = &data_keys[batch_start..batch_end];
-        let batch_points: u64 = batch
-            .iter()
-            .map(|k| point_counts.get(k).copied().unwrap_or(0) as u64)
-            .sum();
+        let batch_points: u64 = batch.iter().map(|(_, c)| *c as u64).sum();
         debug!(
             "Write batch {}: {} nodes, {} points, phase1 est {} MB (budget {} MB)",
             batch_start,
@@ -426,7 +419,7 @@ pub fn write_copc(
         type NodeResult = (Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
         let results: Vec<NodeResult> = batch
             .par_iter()
-            .map(|key| -> Result<NodeResult> {
+            .map(|(key, _)| -> Result<NodeResult> {
                 let mut pts = builder.read_node(key)?;
                 pts.sort_unstable_by(|a, b| {
                     a.gps_time
@@ -485,7 +478,7 @@ pub fn write_copc(
             }
             if temporal_index.is_some() {
                 temporal_entries.push(TemporalIndexEntry {
-                    key: batch[i],
+                    key: batch[i].0,
                     samples,
                 });
             }
@@ -580,14 +573,13 @@ pub fn write_copc(
     let mut chunk_info: Vec<(VoxelKey, u64, i32, i32)> = Vec::new();
     let mut chunk_index = 0usize;
 
-    for key in &ordered_keys {
-        let pc = point_counts.get(key).copied().unwrap_or(0);
-        if pc == 0 {
+    for (key, pc) in &ordered {
+        if *pc == 0 {
             // Empty ancestor: present in hierarchy for tree traversal but has no chunk.
             chunk_info.push((*key, 0, 0, 0));
         } else {
             let byte_size = chunk_table[chunk_index].byte_count;
-            chunk_info.push((*key, current_offset, byte_size as i32, pc as i32));
+            chunk_info.push((*key, current_offset, byte_size as i32, *pc as i32));
             current_offset += byte_size;
             chunk_index += 1;
         }

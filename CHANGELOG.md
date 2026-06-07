@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-core hosts. Together these guarantee bounded build memory regardless of
   how points concentrate, letting large, geographically sparse datasets convert
   within a small `--memory-limit`.
+- Such inputs no longer produce a wildly over-fragmented octree (millions of
+  tiny, nearly-empty deep nodes). When the build had to split a region deep for
+  memory reasons, those deep voxels became permanent output nodes even where the
+  data was sparse, bloating the node count ~100× and, in turn, the writer's
+  memory. The bottom-up build now collapses any subtree whose points fit a
+  single leaf into one node, so output node depth tracks point *density* rather
+  than the build's memory-driven split depth. The writer's per-node bookkeeping
+  was also reworked to keep a single key+count list instead of several parallel
+  copies, so it scales to large node counts without holding gigabytes of index.
 
 ## [0.10.1] - 2026-05-28
 
