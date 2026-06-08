@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the build's memory-driven split depth. The writer's per-node bookkeeping
   was also reworked to keep a single key+count list instead of several parallel
   copies, so it scales to large node counts without holding gigabytes of index.
+- The writer no longer OOMs when producing very large outputs. It used to
+  encode a whole memory-budget-sized batch of nodes before compressing, holding
+  the entire batch's encoded bytes (which could be ~half the budget) resident
+  alongside the compressor's working set. It now streams a fixed-size window of
+  points at a time — encode in parallel, compress in order, free, advance — so
+  the writer's peak memory is a small constant independent of the output size or
+  `--memory-limit`.
 
 ## [0.10.1] - 2026-05-28
 
