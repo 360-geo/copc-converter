@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-09
+
 ### Fixed
 
 - Inputs whose dense data is spread across a very large extent (e.g. a few
@@ -128,7 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validation enforces an identical VLR and uniform `num_extra_bytes` across
   inputs.
 
-[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/360-geo/copc-converter/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/360-geo/copc-converter/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/360-geo/copc-converter/compare/v0.9.15...v0.10.0
 [0.9.15]: https://github.com/360-geo/copc-converter/compare/v0.9.14...v0.9.15
