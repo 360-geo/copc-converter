@@ -328,10 +328,10 @@ pub fn write_copc(
     // parallel, then hand the window to laz in order.
     //
     // Peak memory is bounded by a *fixed* window size in points — NOT by the
-    // memory budget. An earlier design sized the window to the budget, so the
-    // window's encoded `Vec<Vec<u8>>` alone could be half the budget and,
+    // memory budget. Sizing the window to the budget would let the window's
+    // encoded `Vec<Vec<u8>>` alone reach a large fraction of the budget and,
     // together with the parallel encoders' transient read buffers and laz's
-    // compressor working set, blow past it. A fixed window makes the writer's
+    // compressor working set, exceed it. A fixed window makes the writer's
     // peak a small constant (a few hundred MB) regardless of budget or node
     // sizes, so the writer can never be the thing that OOMs.
     //

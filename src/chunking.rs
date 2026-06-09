@@ -866,7 +866,7 @@ mod tests {
         assert_eq!(split_extra_levels(800, 100), 1);
         // 8x over → still 1 (800/8 = 100 <= 100). 8x + 1 → 2.
         assert_eq!(split_extra_levels(801, 100), 2);
-        // 648M into ~4.3M target (the motivating disjoint-NL case): need
+        // A large population into a smaller target needs more levels:
         // ceil(log8(648M/4.3M)) = ceil(log8(150.7)) = 3.
         assert_eq!(split_extra_levels(648_000_000, 4_300_000), 3);
         // Clamped at the cap for absurd ratios.
