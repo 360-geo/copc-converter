@@ -1200,6 +1200,14 @@ pub struct OctreeBuilder {
     pub point_format: u8,
     /// Chunk plan computed by `distribute` and consumed by `build_node_map`.
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
+    /// Exact per-chunk point counts tallied while distribute appended
+    /// points to the chunk temp files — indexed by chunk index, parallel
+    /// to `chunked_plan.chunks`. This is the same truth-on-disk that
+    /// re-counting a chunk file would produce, captured for free at write
+    /// time; the build phase's in-memory-vs-spill dispatch reads it
+    /// instead of re-walking every chunk file (which under LZ4 temp
+    /// compression meant a full decompression pass over all scratch data).
+    pub(crate) chunk_actual_counts: Option<Vec<u64>>,
     /// Compression codec applied to scratch temp files.
     pub(crate) temp_compression: crate::TempCompression,
     /// Storage backend for per-node point data. `Arc` so rayon workers
@@ -1414,6 +1422,7 @@ impl OctreeBuilder {
             num_extra_bytes,
             point_format: validated.point_format,
             chunked_plan: None,
+            chunk_actual_counts: None,
             temp_compression: config.temp_compression,
             node_store,
         })
@@ -1825,6 +1834,12 @@ impl OctreeBuilder {
         let files_per_worker = input_files.len().div_ceil(num_workers);
         let progress = AtomicU64::new(0);
 
+        // Exact per-chunk point counts, tallied as groups are flushed to the
+        // shard files. Contention is negligible: one fetch_add per flushed
+        // group (thousands of points), not per point.
+        let chunk_counts: Vec<AtomicU64> =
+            (0..plan.chunks.len()).map(|_| AtomicU64::new(0)).collect();
+
         // 5. Partition pass — stream every point into its chunk's shard
         //    file. This is the second full pass over the input and is
         //    reported as its own `Distributing` stage.
@@ -1945,6 +1960,8 @@ impl OctreeBuilder {
                         // Flush each group to the cache. Drain so vec capacity
                         // doesn't accumulate across batches.
                         for (chunk_idx, pts) in groups.drain() {
+                            chunk_counts[chunk_idx as usize]
+                                .fetch_add(pts.len() as u64, Ordering::Relaxed);
                             cache.append(chunk_idx, shard_dir, &pts)?;
                         }
 
@@ -1960,7 +1977,14 @@ impl OctreeBuilder {
         merge_chunk_shards(&shards_root, &chunks_root, plan.chunks.len() as u32)?;
         config.report(crate::ProgressEvent::StageDone);
 
-        // 7. Stash the chunk plan for the build phase to consume.
+        // 7. Stash the chunk plan and the exact per-chunk counts for the
+        //    build phase to consume.
+        self.chunk_actual_counts = Some(
+            chunk_counts
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect(),
+        );
         self.chunked_plan = Some(plan);
         Ok(())
     }
@@ -1994,14 +2018,16 @@ impl OctreeBuilder {
     /// bounded subtrees so peak memory stays under budget regardless of how
     /// the points are distributed inside the chunk.
     ///
-    /// The dispatch reads the chunk file's **actual** point count rather than
+    /// The dispatch uses the chunk's **actual** point count rather than
     /// trusting the planner's `point_count`, which is only an estimate (the
     /// planner sees occupancy at grid resolution and, for a sub-split cell,
     /// divides a cell's count evenly across sub-octants). A chunk whose real
     /// distribution is far denser than the estimate — e.g. a road corridor
     /// concentrated in one sub-octant — must still take the spilled path, so
-    /// the gate has to be the truth on disk. The count is one cheap streaming
-    /// pass (seek-based for uncompressed temp files).
+    /// the gate has to be the truth on disk. Distribute tallies that truth
+    /// as it writes each chunk file (`chunk_actual_counts`), so no re-read
+    /// is needed; the streaming re-count survives only as a fallback for
+    /// builders without distribute-time counts.
     fn build_chunk_in_memory(
         &self,
         chunk: &crate::chunking::PlannedChunk,
@@ -2016,7 +2042,10 @@ impl OctreeBuilder {
             y: chunk.gy,
             z: chunk.gz,
         };
-        let actual_points = self.count_chunk_file(chunk_idx)?;
+        let actual_points = match &self.chunk_actual_counts {
+            Some(counts) => counts[chunk_idx as usize],
+            None => self.count_chunk_file(chunk_idx)?,
+        };
         let est_bytes = actual_points.saturating_mul(PER_CHUNK_BYTES_PER_POINT_BUILD);
         if est_bytes <= chunk_mem_budget {
             self.build_subtree_in_memory(chunk_root, chunk_idx, actual_points, config)

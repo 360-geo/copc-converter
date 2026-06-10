@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   computed once per point instead of per comparison, and the sampling
   output buffer is sized to the input instead of preallocating ~134 MB
   per parent node.
+- Distribute no longer rewrites the whole dataset when merging per-worker
+  shard files into canonical chunk files: single-shard chunks (the common
+  case) are renamed in place, and multi-shard chunks append via in-kernel
+  `copy_file_range` on Linux instead of 8 KiB userspace copy loops.
+- The build phase no longer re-reads every chunk file to count its points
+  before deciding the in-memory-vs-spill path — distribute tallies exact
+  per-chunk counts as it writes them. With `--temp-compression lz4` the
+  old re-count was a full decompression pass over all scratch data.
 
 ## [0.11.0] - 2026-06-09
 
