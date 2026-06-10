@@ -502,30 +502,43 @@ impl RawPoint {
         Ok(())
     }
 
+    /// Decode one on-disk record. `rec` must be exactly
+    /// `record_size(num_extra_bytes)` bytes (offsets mirror
+    /// [`Self::write_base_into`]). The only allocation is the extras
+    /// `Box<[u8]>`, and only when `num_extra_bytes > 0`.
+    fn from_record(rec: &[u8], num_extra_bytes: u16) -> Self {
+        debug_assert_eq!(rec.len(), Self::record_size(num_extra_bytes));
+        let i32le = |o: usize| i32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
+        let u16le = |o: usize| u16::from_le_bytes(rec[o..o + 2].try_into().unwrap());
+        RawPoint {
+            x: i32le(0),
+            y: i32le(4),
+            z: i32le(8),
+            intensity: u16le(12),
+            return_number: rec[14],
+            number_of_returns: rec[15],
+            classification: rec[16],
+            scan_angle: i16::from_le_bytes(rec[17..19].try_into().unwrap()),
+            user_data: rec[19],
+            point_source_id: u16le(20),
+            gps_time: f64::from_le_bytes(rec[22..30].try_into().unwrap()),
+            red: u16le(30),
+            green: u16le(32),
+            blue: u16le(34),
+            nir: u16le(36),
+            extras: rec[Self::BASE_BYTE_SIZE..].to_vec().into_boxed_slice(),
+        }
+    }
+
+    /// Read a single record from a reader. Production code decodes points
+    /// in bulk via [`for_each_point_in_batches`]; this single-point form
+    /// is kept for round-trip tests.
+    #[cfg(test)]
     pub fn read<R: std::io::Read>(r: &mut R, num_extra_bytes: u16) -> Result<Self> {
         let record_size = Self::record_size(num_extra_bytes);
         let mut buf = vec![0u8; record_size];
         r.read_exact(&mut buf)?;
-        let (base, extras) = buf.split_at(Self::BASE_BYTE_SIZE);
-        let mut c = std::io::Cursor::new(base);
-        Ok(RawPoint {
-            x: c.read_i32::<LittleEndian>()?,
-            y: c.read_i32::<LittleEndian>()?,
-            z: c.read_i32::<LittleEndian>()?,
-            intensity: c.read_u16::<LittleEndian>()?,
-            return_number: c.read_u8()?,
-            number_of_returns: c.read_u8()?,
-            classification: c.read_u8()?,
-            scan_angle: c.read_i16::<LittleEndian>()?,
-            user_data: c.read_u8()?,
-            point_source_id: c.read_u16::<LittleEndian>()?,
-            gps_time: c.read_f64::<LittleEndian>()?,
-            red: c.read_u16::<LittleEndian>()?,
-            green: c.read_u16::<LittleEndian>()?,
-            blue: c.read_u16::<LittleEndian>()?,
-            nir: c.read_u16::<LittleEndian>()?,
-            extras: extras.to_vec().into_boxed_slice(),
-        })
+        Ok(Self::from_record(&buf, num_extra_bytes))
     }
 
     /// Write multiple points to a writer in a single bulk operation.
@@ -668,24 +681,50 @@ fn read_batches_loop<R: std::io::Read>(r: &mut R, num_extra_bytes: u16) -> Resul
     Ok(out)
 }
 
+/// Upper bound on points decoded per contiguous read in
+/// [`for_each_point_in_batches`]. Caps the reused payload buffer at
+/// `65_536 × record_size` (~2.5 MB at the 38-byte base record) so streaming
+/// over a file whose batches are huge (e.g. a whole node written as one
+/// batch) never materialises the full payload at once.
+const MAX_POINTS_PER_READ: usize = 65_536;
+
 /// Stream every point in a batch reader, invoking `f` on each one.
 ///
 /// The chunk build path uses this to classify points into their leaf
 /// voxels as they are decoded, avoiding an intermediate `Vec<RawPoint>`
 /// that would hold every point in the chunk resident at once.
+///
+/// Points are decoded from contiguous sub-batch reads (capped at
+/// [`MAX_POINTS_PER_READ`]) into a single reused buffer, rather than one
+/// tiny read + heap allocation per point — temp files are re-read several
+/// times across build, merge, and write, so the per-point path used to
+/// dominate allocator traffic.
 fn for_each_point_in_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
     r: &mut R,
     num_extra_bytes: u16,
     mut f: F,
 ) -> Result<()> {
+    let record_size = RawPoint::record_size(num_extra_bytes);
+    // Grown lazily so reading a small node file doesn't pay the full cap.
+    let mut buf: Vec<u8> = Vec::new();
     loop {
         let count = match r.read_u32::<LittleEndian>() {
             Ok(n) => n as usize,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         };
-        for _ in 0..count {
-            f(RawPoint::read(r, num_extra_bytes)?)?;
+        let mut remaining = count;
+        while remaining > 0 {
+            let take = remaining.min(MAX_POINTS_PER_READ);
+            let need = take * record_size;
+            if buf.len() < need {
+                buf.resize(need, 0);
+            }
+            r.read_exact(&mut buf[..need])?;
+            for rec in buf[..need].chunks_exact(record_size) {
+                f(RawPoint::from_record(rec, num_extra_bytes))?;
+            }
+            remaining -= take;
         }
     }
     Ok(())
@@ -3072,6 +3111,34 @@ mod tests {
             assert_eq!(decoded.len(), points.len());
             for (orig, got) in points.iter().zip(decoded.iter()) {
                 assert_eq!(&*orig.extras, &*got.extras, "extras must survive {codec:?}");
+            }
+        }
+    }
+
+    /// A single batch larger than `MAX_POINTS_PER_READ` must decode across
+    /// multiple sub-batch reads without losing or corrupting points.
+    #[test]
+    fn batch_larger_than_subread_cap_round_trips() {
+        let n = MAX_POINTS_PER_READ + 1_000;
+        let points: Vec<RawPoint> = (0..n)
+            .map(|i| {
+                let mut p = sample_point();
+                p.x = i as i32;
+                p.gps_time = i as f64;
+                p
+            })
+            .collect();
+
+        for codec in [crate::TempCompression::None, crate::TempCompression::Lz4] {
+            let mut buf = Vec::new();
+            write_temp_batch(&mut buf, &points, 0, codec).unwrap();
+            let decoded = read_temp_batches(std::io::Cursor::new(&buf[..]), 0, codec).unwrap();
+            assert_eq!(decoded.len(), n, "point count must survive {codec:?}");
+            // Spot-check fields either side of the sub-read boundary.
+            for i in [0, MAX_POINTS_PER_READ - 1, MAX_POINTS_PER_READ, n - 1] {
+                assert_eq!(decoded[i].x, i as i32, "x at {i} ({codec:?})");
+                assert_eq!(decoded[i].gps_time, i as f64, "gps_time at {i} ({codec:?})");
+                assert_eq!(decoded[i].nir, 32768, "nir at {i} ({codec:?})");
             }
         }
     }

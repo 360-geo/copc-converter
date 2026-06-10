@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the input, so large conversions should see a substantial wall-clock
   reduction. Until the PR is merged and released, the `las` dependency is
   pinned to a fork via `[patch.crates-io]`.
+- Temp-file reads now decode points from bulk contiguous reads instead of
+  one small read plus a heap allocation per point. Scratch data is re-read
+  several times across the build, merge, and write stages, so this cuts
+  allocator traffic substantially on large conversions.
 
 ## [0.11.0] - 2026-06-09
 
