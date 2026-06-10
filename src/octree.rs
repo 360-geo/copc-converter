@@ -1625,21 +1625,18 @@ impl OctreeBuilder {
         // Grid resolution: fixed cells per axis, matching untwine's CellCount.
         let cell = (int_size / GRID_CELLS_PER_AXIS).max(1);
 
-        // Sort by Morton code within the parent voxel for spatially coherent traversal.
-        pts.sort_unstable_by_key(|(_, p)| {
+        // Sort by Morton code within the parent voxel for spatially coherent
+        // traversal. `sort_by_cached_key` computes one Morton code per point
+        // (instead of two per comparison with `sort_unstable_by_key`) and
+        // moves the 64-byte elements once in a final permutation pass rather
+        // than swapping them throughout the sort. The transient key+index
+        // table costs ~16 B/pt, well inside the build's 600 B/pt estimate.
+        pts.sort_by_cached_key(|(_, p)| {
             let dx = (p.x as i64 - origin_x).max(0) as u32;
             let dy = (p.y as i64 - origin_y).max(0) as u32;
             let dz = (p.z as i64 - origin_z).max(0) as u32;
             morton3(dx, dy, dz)
         });
-
-        let grid_key = |p: &RawPoint| -> (i32, i32, i32) {
-            (
-                ((p.x as i64 - origin_x) / cell) as i32,
-                ((p.y as i64 - origin_y) / cell) as i32,
-                ((p.z as i64 - origin_z) / cell) as i32,
-            )
-        };
 
         // Track which children actually have points so we can protect them.
         let mut child_has_pts = vec![false; n_children];
@@ -1647,15 +1644,36 @@ impl OctreeBuilder {
             child_has_pts[*ci] = true;
         }
 
-        // Partition: accepted for parent vs remaining for children. No cloning.
-        let mut occupied: FxHashSet<(i32, i32, i32)> = FxHashSet::default();
-        let max_accepted =
-            (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS) as usize;
-        let mut parent_pts: Vec<(usize, RawPoint)> = Vec::with_capacity(max_accepted);
+        // Occupancy bitmap over the fixed 128³ sampling grid (256 KiB),
+        // replacing a hashed per-point set insert with a load+OR. This
+        // path only runs for parents holding > MAX_LEAF_POINTS, so the
+        // fixed allocation amortizes to under 3 bytes per thousand points.
+        // Cell coordinates are clamped to the grid, so a boundary point
+        // that rounds one cell out (the origins are rounded to integer
+        // coordinates) shares the face cell instead of occupying a
+        // phantom out-of-grid cell.
+        let g = GRID_CELLS_PER_AXIS;
+        let n_cells = (g * g * g) as usize;
+        let mut occupied = vec![0u64; n_cells / 64];
+        let grid_idx = |p: &RawPoint| -> usize {
+            let gx = ((p.x as i64 - origin_x) / cell).clamp(0, g - 1);
+            let gy = ((p.y as i64 - origin_y) / cell).clamp(0, g - 1);
+            let gz = ((p.z as i64 - origin_z) / cell).clamp(0, g - 1);
+            (gx + gy * g + gz * g * g) as usize
+        };
+
+        // Partition: accepted for parent vs remaining for children. No
+        // cloning. Accepted points are structurally capped at one per grid
+        // cell (n_cells total) by the bitmap, so no explicit cap check is
+        // needed; capacity is sized to the input, not the theoretical max.
+        let mut parent_pts: Vec<(usize, RawPoint)> = Vec::with_capacity(pts.len().min(n_cells));
         let mut remaining: Vec<Vec<RawPoint>> = vec![Vec::new(); n_children];
 
         for (ci, p) in pts {
-            if parent_pts.len() < max_accepted && occupied.insert(grid_key(&p)) {
+            let idx = grid_idx(&p);
+            let (word, mask) = (idx >> 6, 1u64 << (idx & 63));
+            if occupied[word] & mask == 0 {
+                occupied[word] |= mask;
                 parent_pts.push((ci, p));
             } else {
                 remaining[ci].push(p);

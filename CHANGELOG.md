@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one small read plus a heap allocation per point. Scratch data is re-read
   several times across the build, merge, and write stages, so this cuts
   allocator traffic substantially on large conversions.
+- Build-stage hot paths got cheaper per point: internal scratch maps use
+  FxHash instead of SipHash, LOD grid sampling tracks cell occupancy in a
+  fixed 256 KiB bitmap instead of a hashed set, Morton sort keys are
+  computed once per point instead of per comparison, and the sampling
+  output buffer is sized to the input instead of preallocating ~134 MB
+  per parent node.
 
 ## [0.11.0] - 2026-06-09
 
