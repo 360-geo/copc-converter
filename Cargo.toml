@@ -59,6 +59,12 @@ reqwest = { version = "0.12", features = ["rustls-tls"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 crs-definitions = "0.4.0"
 
+# CPU-bound binary: cross-crate inlining (las/laz decode loops feeding our
+# per-point paths) is worth the slower release build.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [dev-dependencies]
 byteorder = "1.5"
 
