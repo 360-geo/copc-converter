@@ -1348,45 +1348,69 @@ impl OctreeBuilder {
         self.node_store.count(key)
     }
 
-    /// Convert a `las::Point` to a `RawPoint` using the builder's scale/offset.
-    fn convert_point(&self, p: &las::Point) -> RawPoint {
-        let ix = ((p.x - self.offset_x) / self.scale_x).round() as i32;
-        let iy = ((p.y - self.offset_y) / self.scale_y).round() as i32;
-        let iz = ((p.z - self.offset_z) / self.scale_z).round() as i32;
-        let extras = if self.num_extra_bytes == 0 {
-            Box::<[u8]>::default()
-        } else {
-            // Validate matches the per-file header against the canonical
-            // count, so the only way to land here with a wrong length is
-            // a corrupt file. Pad-or-truncate to keep the pipeline going
-            // and surface a single warning rather than aborting.
-            let want = self.num_extra_bytes as usize;
-            if p.extra_bytes.len() == want {
-                p.extra_bytes.clone().into_boxed_slice()
+    /// Stream every point in a `PointData` byte slab as a `RawPoint`,
+    /// re-encoding coordinates against the builder's scale/offset.
+    ///
+    /// Walks the slab via per-field column iterators instead of
+    /// materialising `las::Point` values — no per-point allocation (the
+    /// `extra_bytes` Vec in particular) and no `Option`/enum decoding for
+    /// fields the format doesn't carry. Field semantics match what
+    /// `las::Point` would have produced: legacy classifications have their
+    /// flag bits masked off, scan angles are normalised to degrees and
+    /// re-encoded as extended `i16` units, and absent gps/rgb/nir default
+    /// to zero.
+    fn for_each_raw_point<F: FnMut(RawPoint)>(&self, pd: &las::PointData, mut f: F) {
+        let mut xs = pd.x();
+        let mut ys = pd.y();
+        let mut zs = pd.z();
+        let mut intensities = pd.intensity();
+        let mut return_numbers = pd.return_number();
+        let mut numbers_of_returns = pd.number_of_returns();
+        let mut classifications = pd.classification();
+        let mut scan_angles = pd.scan_angle_degrees();
+        let mut user_datas = pd.user_data();
+        let mut point_source_ids = pd.point_source_id();
+        let mut gps_times = pd.gps_time();
+        let mut rgbs = pd.rgb();
+        let mut nirs = pd.nir();
+        // Extra bytes are the trailing `num_extra_bytes` of each record.
+        // Validate enforces a uniform extras width across inputs, and the
+        // slab's record length comes from the same header, so the slice
+        // width is exact by construction.
+        let record_len = pd.record_len();
+        let nxb = self.num_extra_bytes as usize;
+        let mut records = pd.raw_bytes().chunks_exact(record_len);
+
+        for _ in 0..pd.len() {
+            let x = xs.next().expect("x column ends early");
+            let y = ys.next().expect("y column ends early");
+            let z = zs.next().expect("z column ends early");
+            let extras = if nxb == 0 {
+                Box::<[u8]>::default()
             } else {
-                let mut buf = vec![0u8; want];
-                let n = p.extra_bytes.len().min(want);
-                buf[..n].copy_from_slice(&p.extra_bytes[..n]);
-                buf.into_boxed_slice()
-            }
-        };
-        RawPoint {
-            x: ix,
-            y: iy,
-            z: iz,
-            intensity: p.intensity,
-            return_number: p.return_number,
-            number_of_returns: p.number_of_returns,
-            classification: p.classification.into(),
-            scan_angle: (p.scan_angle / 0.006).round() as i16,
-            user_data: p.user_data,
-            point_source_id: p.point_source_id,
-            gps_time: p.gps_time.unwrap_or(0.0),
-            red: p.color.as_ref().map(|c| c.red).unwrap_or(0),
-            green: p.color.as_ref().map(|c| c.green).unwrap_or(0),
-            blue: p.color.as_ref().map(|c| c.blue).unwrap_or(0),
-            nir: p.nir.unwrap_or(0),
-            extras,
+                let rec = records.next().expect("record column ends early");
+                rec[record_len - nxb..].to_vec().into_boxed_slice()
+            };
+            let (red, green, blue) = rgbs.as_mut().and_then(|it| it.next()).unwrap_or((0, 0, 0));
+            f(RawPoint {
+                x: ((x - self.offset_x) / self.scale_x).round() as i32,
+                y: ((y - self.offset_y) / self.scale_y).round() as i32,
+                z: ((z - self.offset_z) / self.scale_z).round() as i32,
+                intensity: intensities.next().expect("intensity column ends early"),
+                return_number: return_numbers.next().expect("rn column ends early"),
+                number_of_returns: numbers_of_returns.next().expect("nor column ends early"),
+                classification: classifications.next().expect("class column ends early"),
+                scan_angle: (scan_angles.next().expect("angle column ends early") / 0.006).round()
+                    as i16,
+                user_data: user_datas.next().expect("user_data column ends early"),
+                point_source_id: point_source_ids.next().expect("psid column ends early"),
+                gps_time: gps_times.as_mut().and_then(|it| it.next()).unwrap_or(0.0),
+                red,
+                green,
+                blue,
+                nir: nirs.as_mut().and_then(|it| it.next()).unwrap_or(0),
+                extras,
+            });
         }
     }
 
@@ -1666,15 +1690,15 @@ impl OctreeBuilder {
         let per_worker_cap = (CHUNKED_OPEN_FILES_CAP / num_workers).max(MIN_PER_WORKER_CHUNK_FILES);
 
         // Per-worker memory budget for the input chunk size. The transient
-        // peak is `Vec<las::Point>` (~120 B/pt for format 3) plus the cache's
-        // BufWriter overhead (negligible) plus the per-point Extra Bytes
-        // payloads (`las::Point.extra_bytes` carries `num_extra_bytes`
-        // bytes that don't appear in `size_of::<las::Point>`). Size for
-        // 1/8 of the per-worker budget so there's headroom for the LAZ
-        // decoder + grouping overhead.
+        // peak per point is the `PointData` byte slab (on-disk record
+        // layout, ≤ ~67 B + extras) plus the grouped `RawPoint` awaiting
+        // flush (~56 B + a boxed extras payload) plus the cache's BufWriter
+        // overhead (negligible). Extras are resident twice — once in the
+        // slab record, once in the RawPoint box. Size for 1/8 of the
+        // per-worker budget so there's headroom for the LAZ decoder.
         const BASE_BYTES_PER_POINT_TRANSIENT: u64 = 120;
         let bytes_per_point_transient =
-            BASE_BYTES_PER_POINT_TRANSIENT + self.num_extra_bytes as u64;
+            BASE_BYTES_PER_POINT_TRANSIENT + 2 * self.num_extra_bytes as u64;
         let per_worker_budget = config.memory_budget / num_workers as u64;
         let read_chunk_size =
             ((per_worker_budget / 8) / bytes_per_point_transient).clamp(50_000, 2_000_000) as usize;
@@ -1730,7 +1754,6 @@ impl OctreeBuilder {
                     self.num_extra_bytes,
                     self.temp_compression,
                 );
-                let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
                 // Group buffer reused across batches so capacity amortizes.
                 // Drained at the end of each batch so retained Vec capacity
                 // stays bounded by the working set, not by all-time peak.
@@ -1739,10 +1762,17 @@ impl OctreeBuilder {
                 for path in &input_files[start..end] {
                     let mut reader = las::Reader::from_path(path)
                         .with_context(|| format!("Cannot open {:?}", path))?;
+                    // Per-file byte slab: `fill_points` reuses the buffer
+                    // across batches but only re-checks the *format* on
+                    // reuse, while the coordinate transforms (scale/offset)
+                    // can legitimately differ per file — so build against
+                    // each file's header.
+                    let mut pd = las::PointDataBuilder::new()
+                        .for_header(reader.header())
+                        .build();
 
                     loop {
-                        points.clear();
-                        let n = reader.read_points_into(read_chunk_size as u64, &mut points)?;
+                        let n = reader.fill_points(read_chunk_size as u64, &mut pd)?;
                         if n == 0 {
                             break;
                         }
@@ -1751,9 +1781,7 @@ impl OctreeBuilder {
                         // them in memory before writing. Grouping batches
                         // many points per writer call → fewer LRU touches
                         // and better amortization than per-point appends.
-                        for p in &points {
-                            let raw = self.convert_point(p);
-
+                        self.for_each_raw_point(&pd, |raw| {
                             // Classify to grid cell via point_to_key at the
                             // grid depth, using round-tripped world coords.
                             // This is the same function the per-chunk build
@@ -1817,10 +1845,7 @@ impl OctreeBuilder {
                                 idx => idx,
                             };
                             groups.entry(chunk_idx).or_default().push(raw);
-                        }
-
-                        // Free the las::Point buffer before flushing groups.
-                        points.clear();
+                        });
 
                         // Flush each group to the cache. Drain so vec capacity
                         // doesn't accumulate across batches.

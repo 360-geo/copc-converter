@@ -1385,18 +1385,40 @@ fn extra_bytes_per_point_payload_round_trips() {
     let output = Path::new("tests/data/test_extras_per_point.copc.laz");
     run_converter(input, output);
 
+    // Decoded point view for this test: world coordinates plus the
+    // trailing extra-bytes payload, pulled from the `PointData` byte slab
+    // (extras are the last `format.extra_bytes` bytes of each record).
+    struct Pt {
+        x: f64,
+        y: f64,
+        z: f64,
+        extras: Vec<u8>,
+    }
+    fn read_pts(path: &Path) -> Vec<Pt> {
+        let mut reader = las::Reader::from_path(path).expect("open file");
+        let pd = reader.read_all().expect("read all points");
+        let record_len = pd.record_len();
+        let nxb = pd.format().extra_bytes as usize;
+        let extras = pd
+            .raw_bytes()
+            .chunks_exact(record_len)
+            .map(|rec| rec[record_len - nxb..].to_vec());
+        pd.x()
+            .zip(pd.y())
+            .zip(pd.z())
+            .zip(extras)
+            .map(|(((x, y), z), extras)| Pt { x, y, z, extras })
+            .collect()
+    }
+
     // Read input extras stats: compute per-field min/max across all input
     // points, then assert the output covers the same value range (the
     // converter does not drop points; thinning only redistributes them
     // across LOD nodes — every input point still appears somewhere).
-    let mut in_reader = las::Reader::from_path(input).expect("open input");
-    let mut in_pts: Vec<las::Point> = Vec::new();
-    in_reader
-        .read_points_into(u64::MAX, &mut in_pts)
-        .expect("read input points");
+    let in_pts = read_pts(input);
     assert!(!in_pts.is_empty(), "input must have points");
     assert!(
-        in_pts.iter().all(|p| p.extra_bytes.len() == 12),
+        in_pts.iter().all(|p| p.extras.len() == 12),
         "every input point should carry 12 extras"
     );
 
@@ -1405,9 +1427,9 @@ fn extra_bytes_per_point_payload_round_trips() {
     // declares that). We only need to know which bytes carry non-zero
     // values so the assertions catch a regression where the converter
     // writes zeros instead of pass-through bytes.
-    let n_extras = in_pts[0].extra_bytes.len();
+    let n_extras = in_pts[0].extras.len();
     let in_byte_max: Vec<u8> = (0..n_extras)
-        .map(|i| in_pts.iter().map(|p| p.extra_bytes[i]).max().unwrap_or(0))
+        .map(|i| in_pts.iter().map(|p| p.extras[i]).max().unwrap_or(0))
         .collect();
     assert!(
         in_byte_max.iter().any(|m| *m > 0),
@@ -1415,20 +1437,15 @@ fn extra_bytes_per_point_payload_round_trips() {
          (test would be vacuous otherwise)"
     );
 
-    let mut out_reader = las::Reader::from_path(output).expect("open output");
-    let mut out_pts: Vec<las::Point> = Vec::new();
-    out_reader
-        .read_points_into(u64::MAX, &mut out_pts)
-        .expect("read output points");
-
+    let out_pts = read_pts(output);
     assert!(!out_pts.is_empty(), "output must have points");
     assert!(
-        out_pts.iter().all(|p| p.extra_bytes.len() == 12),
+        out_pts.iter().all(|p| p.extras.len() == 12),
         "every output point must carry 12 extras"
     );
 
     let out_byte_max: Vec<u8> = (0..n_extras)
-        .map(|i| out_pts.iter().map(|p| p.extra_bytes[i]).max().unwrap_or(0))
+        .map(|i| out_pts.iter().map(|p| p.extras[i]).max().unwrap_or(0))
         .collect();
 
     // The converter does not drop points; LOD thinning only redistributes
@@ -1447,14 +1464,14 @@ fn extra_bytes_per_point_payload_round_trips() {
     let in_lookup: HashMap<(i32, i32, i32), &[u8]> = in_pts
         .iter()
         .map(|p| {
-            // las::Point coordinates are already in scaled f64 — quantise
+            // Decoded coordinates are already in scaled f64 — quantise
             // back to ints for stable hashing.
             let key = (
                 (p.x * 1000.0).round() as i32,
                 (p.y * 1000.0).round() as i32,
                 (p.z * 1000.0).round() as i32,
             );
-            (key, p.extra_bytes.as_slice())
+            (key, p.extras.as_slice())
         })
         .collect();
 
@@ -1468,7 +1485,7 @@ fn extra_bytes_per_point_payload_round_trips() {
         );
         if let Some(in_extras) = in_lookup.get(&key) {
             checked += 1;
-            if &out_p.extra_bytes[..] == *in_extras {
+            if &out_p.extras[..] == *in_extras {
                 matched += 1;
             }
         }

@@ -60,3 +60,10 @@ crs-definitions = "0.4.0"
 
 [dev-dependencies]
 byteorder = "1.5"
+
+# Byte-slab read API (PointData / Reader::fill_points) from
+# https://github.com/gadomski/las-rs/pull/143, not yet merged upstream.
+# Pinned to the fork until it ships in a las release; remove this patch
+# (and bump the `las` version requirement) once it does.
+[patch.crates-io]
+las = { git = "https://github.com/jacovdbergh/las-rs", rev = "d3bffa632a191b70e10820f53bcc1d71a057e4d8" }

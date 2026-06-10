@@ -446,13 +446,14 @@ fn count_points(
     let files_per_worker = input_files.len().div_ceil(num_workers);
     let progress = AtomicU64::new(0);
 
-    // Transient `las::Point` buffer cost (~120 B/pt). Match distribute:
-    // take 1/8 of the per-worker budget to leave headroom for the LAS
-    // decoder's own buffers.
-    const BYTES_PER_LAS_POINT: u64 = 120;
+    // Transient read-buffer cost per point. The byte-slab (`PointData`)
+    // holds points in on-disk layout (≤ ~67 B + extras per record); 120 is
+    // a conservative ceiling that also covers the LAZ decoder's own
+    // buffers. Match distribute: take 1/8 of the per-worker budget.
+    const BYTES_PER_POINT_TRANSIENT: u64 = 120;
     let per_worker_budget = config.memory_budget / num_workers as u64;
     let read_chunk_size =
-        ((per_worker_budget / 8) / BYTES_PER_LAS_POINT).clamp(50_000, 2_000_000) as usize;
+        ((per_worker_budget / 8) / BYTES_PER_POINT_TRANSIENT).clamp(50_000, 2_000_000) as usize;
 
     debug!(
         "Counting with {} workers, {} files per worker, read_chunk_size={}",
@@ -469,31 +470,33 @@ fn count_points(
                 return Ok(local_bounds);
             }
 
-            // Reuse a single point buffer across files in this worker to
-            // amortize allocation cost.
-            let mut points: Vec<las::Point> = Vec::with_capacity(read_chunk_size);
-
             for path in &input_files[start..end] {
                 let mut reader = las::Reader::from_path(path)
                     .with_context(|| format!("Cannot open {:?}", path))?;
+                // Per-file byte slab: `fill_points` reuses the buffer across
+                // batches but only re-checks the *format* on reuse, while the
+                // coordinate transforms (scale/offset) can legitimately differ
+                // per file — so build against each file's header.
+                let mut pd = las::PointDataBuilder::new()
+                    .for_header(reader.header())
+                    .build();
                 loop {
-                    points.clear();
-                    let n = reader.read_points_into(read_chunk_size as u64, &mut points)?;
+                    let n = reader.fill_points(read_chunk_size as u64, &mut pd)?;
                     if n == 0 {
                         break;
                     }
-                    for p in &points {
+                    for ((x, y), z) in pd.x().zip(pd.y()).zip(pd.z()) {
                         // Classify using the same round-tripped coordinates
                         // the distribute phase will use, so the grid cell
                         // counted here is exactly the cell the LUT will look
-                        // up for the same point at distribute time. Raw `p.x`
+                        // up for the same point at distribute time. Raw `x`
                         // and `raw.x*scale+offset` can differ by up to half a
                         // scale step due to LAS scale/offset rounding, which
                         // would put boundary points in different cells and
                         // cause point loss during build.
-                        let ix = ((p.x - builder.offset_x) / builder.scale_x).round() as i32;
-                        let iy = ((p.y - builder.offset_y) / builder.scale_y).round() as i32;
-                        let iz = ((p.z - builder.offset_z) / builder.scale_z).round() as i32;
+                        let ix = ((x - builder.offset_x) / builder.scale_x).round() as i32;
+                        let iy = ((y - builder.offset_y) / builder.scale_y).round() as i32;
+                        let iz = ((z - builder.offset_z) / builder.scale_z).round() as i32;
                         let wx = ix as f64 * builder.scale_x + builder.offset_x;
                         let wy = iy as f64 * builder.scale_y + builder.offset_y;
                         let wz = iz as f64 * builder.scale_z + builder.offset_z;
