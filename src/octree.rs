@@ -276,8 +276,18 @@ fn build_chunk_lut(plan: &crate::chunking::ChunkPlan) -> ChunkLut {
     ChunkLut { cells, sub }
 }
 
-/// Concatenate per-worker shard files into the canonical
-/// `tmp_dir/chunks/chunk_N` location. Runs in parallel over chunk indices.
+/// Move per-worker shard files into the canonical `tmp_dir/chunks/chunk_N`
+/// location. Runs in parallel over chunk indices.
+///
+/// A chunk covers a contiguous spatial region while each worker streams a
+/// contiguous slice of the input files, so most chunks receive points from
+/// few workers — frequently exactly one. The single-shard case is a
+/// `rename` (no data movement at all; shards and chunks live under the
+/// same temp directory). With multiple shards, the first is renamed and
+/// the rest are appended via plain `File`-to-`File` `io::copy`, which on
+/// Linux specializes to in-kernel `copy_file_range` — the destination is
+/// deliberately *not* opened in append mode and not wrapped in a
+/// `BufWriter`, since either would force the userspace fallback path.
 ///
 /// After this returns successfully, the `shards/` subdirectory is removed
 /// and only the canonical chunk files remain under `chunks/`.
@@ -298,29 +308,51 @@ fn merge_chunk_shards(shards_root: &Path, chunks_root: &Path, n_chunks: u32) -> 
     (0..n_chunks)
         .into_par_iter()
         .try_for_each(|chunk_idx| -> Result<()> {
+            use std::io::{Seek, SeekFrom};
+
             let canonical = chunk_canonical_path(chunks_root, chunk_idx);
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&canonical)
-                .with_context(|| format!("opening canonical chunk file {:?}", canonical))?;
-            let mut out = BufWriter::new(f);
-            for w in 0..num_workers {
-                let shard_path = shards_root
-                    .join(w.to_string())
-                    .join(format!("chunk_{chunk_idx}"));
-                match File::open(&shard_path) {
-                    Ok(f) => {
-                        let mut reader = BufReader::new(f);
-                        std::io::copy(&mut reader, &mut out).with_context(|| {
-                            format!("copying shard {:?} into {:?}", shard_path, canonical)
+            let shard_paths: Vec<PathBuf> = (0..num_workers)
+                .map(|w| {
+                    shards_root
+                        .join(w.to_string())
+                        .join(format!("chunk_{chunk_idx}"))
+                })
+                .filter(|p| p.exists())
+                .collect();
+
+            match shard_paths.as_slice() {
+                [] => {
+                    // No worker produced points for this chunk (the planner
+                    // emits all 8^k sub-octants of a sub-split cell, some of
+                    // which are empty). The build phase streams every
+                    // planned chunk's canonical file, so it must exist.
+                    File::create(&canonical)
+                        .with_context(|| format!("creating empty chunk file {:?}", canonical))?;
+                }
+                [single] => {
+                    std::fs::rename(single, &canonical).with_context(|| {
+                        format!("renaming shard {:?} to {:?}", single, canonical)
+                    })?;
+                }
+                [first, rest @ ..] => {
+                    std::fs::rename(first, &canonical).with_context(|| {
+                        format!("renaming shard {:?} to {:?}", first, canonical)
+                    })?;
+                    let mut out = OpenOptions::new()
+                        .write(true)
+                        .open(&canonical)
+                        .with_context(|| format!("opening canonical chunk file {:?}", canonical))?;
+                    out.seek(SeekFrom::End(0))
+                        .context("seeking to end of canonical chunk file")?;
+                    for shard in rest {
+                        let mut input = File::open(shard)
+                            .with_context(|| format!("opening shard {:?}", shard))?;
+                        std::io::copy(&mut input, &mut out).with_context(|| {
+                            format!("copying shard {:?} into {:?}", shard, canonical)
                         })?;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e.into()),
                 }
             }
-            out.flush().context("flush merged chunk file")?;
             Ok(())
         })?;
 
