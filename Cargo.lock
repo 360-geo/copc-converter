@@ -254,6 +254,7 @@ dependencies = [
  "mimalloc",
  "rayon",
  "reqwest",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror",

@@ -20,7 +20,13 @@ use crate::node_store::{FileNodeStore, NodeStore, PackedNodeStore};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+// Internal scratch maps are keyed by voxel coordinates / chunk indices and
+// hashed once or more per *point* in the hot paths (leaf classification,
+// distribute grouping, spill routing). FxHash trades SipHash's HashDoS
+// resistance — irrelevant for internal temp state derived from point
+// geometry — for a hash that is a few cycles per key instead of dozens.
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -49,7 +55,7 @@ const MIN_PER_WORKER_CHUNK_FILES: usize = 32;
 /// dropped, releasing both its buffer and its file descriptor. Subsequent
 /// writes to the same chunk index reopen the file in append mode.
 struct ChunkWriterCache {
-    writers: HashMap<u32, BufWriter<File>>,
+    writers: FxHashMap<u32, BufWriter<File>>,
     /// Insertion / access order. Front = least recently used.
     order: VecDeque<u32>,
     capacity: usize,
@@ -60,7 +66,7 @@ struct ChunkWriterCache {
 impl ChunkWriterCache {
     fn new(capacity: usize, num_extra_bytes: u16, codec: TempCompression) -> Self {
         ChunkWriterCache {
-            writers: HashMap::new(),
+            writers: FxHashMap::default(),
             order: VecDeque::new(),
             capacity,
             num_extra_bytes,
@@ -187,7 +193,7 @@ struct SubSplit {
 /// `u32::MAX` when no chunk covers it (a malformed plan; treated as a bug).
 struct ChunkLut {
     cells: Vec<u32>,
-    sub: HashMap<usize, SubSplit>,
+    sub: FxHashMap<usize, SubSplit>,
 }
 
 /// Local octant index of a deeper sub-chunk voxel within its `grid_depth`
@@ -213,7 +219,7 @@ fn build_chunk_lut(plan: &crate::chunking::ChunkPlan) -> ChunkLut {
     let g = plan.grid_size as usize;
     let n_cells = g * g * g;
     let mut cells = vec![u32::MAX; n_cells];
-    let mut sub: HashMap<usize, SubSplit> = HashMap::new();
+    let mut sub: FxHashMap<usize, SubSplit> = FxHashMap::default();
 
     for (chunk_idx, chunk) in plan.chunks.iter().enumerate() {
         let chunk_idx = chunk_idx as u32;
@@ -1482,7 +1488,7 @@ impl OctreeBuilder {
     /// different unit of progress (e.g. chunks-done).
     fn bottom_up_levels(
         &self,
-        mut nodes: HashMap<VoxelKey, Vec<RawPoint>>,
+        mut nodes: FxHashMap<VoxelKey, Vec<RawPoint>>,
         actual_max_depth: u32,
         min_level: u32,
         report_progress: bool,
@@ -1495,7 +1501,7 @@ impl OctreeBuilder {
                 });
             }
             // Group children at level d+1 by parent (iterate keys, no disk I/O).
-            let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
+            let mut parent_children: FxHashMap<VoxelKey, Vec<VoxelKey>> = FxHashMap::default();
             for k in nodes.keys() {
                 if k.level as u32 == d + 1
                     && let Some(p) = k.parent()
@@ -1642,7 +1648,7 @@ impl OctreeBuilder {
         }
 
         // Partition: accepted for parent vs remaining for children. No cloning.
-        let mut occupied: HashSet<(i32, i32, i32)> = HashSet::new();
+        let mut occupied: FxHashSet<(i32, i32, i32)> = FxHashSet::default();
         let max_accepted =
             (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS) as usize;
         let mut parent_pts: Vec<(usize, RawPoint)> = Vec::with_capacity(max_accepted);
@@ -1796,7 +1802,7 @@ impl OctreeBuilder {
                 // Group buffer reused across batches so capacity amortizes.
                 // Drained at the end of each batch so retained Vec capacity
                 // stays bounded by the working set, not by all-time peak.
-                let mut groups: HashMap<u32, Vec<RawPoint>> = HashMap::new();
+                let mut groups: FxHashMap<u32, Vec<RawPoint>> = FxHashMap::default();
 
                 for path in &input_files[start..end] {
                     let mut reader = las::Reader::from_path(path)
@@ -1992,7 +1998,7 @@ impl OctreeBuilder {
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
         let leaf_depth = root.level as u32 + chunk_local_extra_levels(est_points);
-        let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        let mut leaves: FxHashMap<VoxelKey, Vec<RawPoint>> = FxHashMap::default();
         self.stream_chunk_file(chunk_idx, |raw| {
             self.push_into_leaf(&mut leaves, raw, root, leaf_depth);
             Ok(())
@@ -2011,7 +2017,7 @@ impl OctreeBuilder {
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
         let leaf_depth = root.level as u32 + chunk_local_extra_levels(points.len() as u64);
-        let mut leaves: HashMap<VoxelKey, Vec<RawPoint>> = HashMap::new();
+        let mut leaves: FxHashMap<VoxelKey, Vec<RawPoint>> = FxHashMap::default();
         for raw in points {
             self.push_into_leaf(&mut leaves, raw, root, leaf_depth);
         }
@@ -2024,7 +2030,7 @@ impl OctreeBuilder {
     /// routing and the build's leaf derivation (both use `point_to_key`).
     fn push_into_leaf(
         &self,
-        leaves: &mut HashMap<VoxelKey, Vec<RawPoint>>,
+        leaves: &mut FxHashMap<VoxelKey, Vec<RawPoint>>,
         raw: RawPoint,
         // Only read by the debug-assertion below; unused in release builds.
         #[cfg_attr(not(debug_assertions), allow(unused_variables))] root: VoxelKey,
@@ -2069,7 +2075,7 @@ impl OctreeBuilder {
     fn finish_subtree(
         &self,
         root: VoxelKey,
-        mut leaves: HashMap<VoxelKey, Vec<RawPoint>>,
+        mut leaves: FxHashMap<VoxelKey, Vec<RawPoint>>,
         leaf_depth: u32,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
@@ -2214,14 +2220,14 @@ impl OctreeBuilder {
         std::fs::create_dir_all(&spill_dir)
             .with_context(|| format!("creating spill dir {spill_dir:?}"))?;
 
-        let mut sub_index: HashMap<VoxelKey, u32> = HashMap::new();
+        let mut sub_index: FxHashMap<VoxelKey, u32> = FxHashMap::default();
         let mut sub_roots: Vec<VoxelKey> = Vec::new();
         let per_worker_cap = CHUNKED_OPEN_FILES_CAP.max(MIN_PER_WORKER_CHUNK_FILES);
         let mut cache =
             ChunkWriterCache::new(per_worker_cap, self.num_extra_bytes, self.temp_compression);
         // Group points per sub-octant before appending so each cache touch
         // writes a batch rather than a single point.
-        let mut pending: HashMap<u32, Vec<RawPoint>> = HashMap::new();
+        let mut pending: FxHashMap<u32, Vec<RawPoint>> = FxHashMap::default();
         let mut pending_points: usize = 0;
         // Flush threshold in points: a fraction of budget so the grouping
         // buffer never dominates memory during routing.
@@ -2371,7 +2377,7 @@ impl OctreeBuilder {
         let deepest = chunk_root.level as u32 + SPILL_DEPTH_CAP;
 
         // Count occupancy at the deepest candidate level in one pass.
-        let mut deep_counts: HashMap<VoxelKey, u64> = HashMap::new();
+        let mut deep_counts: FxHashMap<VoxelKey, u64> = FxHashMap::default();
         self.stream_chunk_file(chunk_idx, |raw| {
             let wx = raw.x as f64 * self.scale_x + self.offset_x;
             let wy = raw.y as f64 * self.scale_y + self.offset_y;
@@ -2405,7 +2411,7 @@ impl OctreeBuilder {
         for s in 1..=SPILL_DEPTH_CAP {
             let level = root_level + s;
             let shift = deepest - level;
-            let mut level_counts: HashMap<VoxelKey, u64> = HashMap::new();
+            let mut level_counts: FxHashMap<VoxelKey, u64> = FxHashMap::default();
             for (k, c) in &deep_counts {
                 let anc = VoxelKey {
                     level: level as i32,
@@ -2485,7 +2491,7 @@ impl OctreeBuilder {
         // HashSet per level so we never get duplicate keys (which can happen
         // if two chunks somehow share the same root key — should not occur
         // for a well-formed plan, but defensive).
-        let mut keys_by_level: HashMap<i32, HashSet<VoxelKey>> = HashMap::new();
+        let mut keys_by_level: FxHashMap<i32, FxHashSet<VoxelKey>> = FxHashMap::default();
         for k in chunk_root_keys {
             keys_by_level.entry(k.level).or_default().insert(*k);
         }
@@ -2526,7 +2532,7 @@ impl OctreeBuilder {
             }
 
             // Group children at level d+1 by their parent at level d.
-            let mut parent_children: HashMap<VoxelKey, Vec<VoxelKey>> = HashMap::new();
+            let mut parent_children: FxHashMap<VoxelKey, Vec<VoxelKey>> = FxHashMap::default();
             for ck in &child_keys {
                 if let Some(parent) = ck.parent() {
                     parent_children.entry(parent).or_default().push(*ck);
@@ -2876,7 +2882,7 @@ impl OctreeBuilder {
 
         // Ensure every ancestor of every data node is present (the writer
         // requires zero-point ancestors so validators can traverse top-down).
-        let mut present: HashSet<VoxelKey> = result.iter().map(|(k, _)| *k).collect();
+        let mut present: FxHashSet<VoxelKey> = result.iter().map(|(k, _)| *k).collect();
         let mut extra: Vec<VoxelKey> = Vec::new();
         for (key, _) in &result {
             let mut k = *key;
