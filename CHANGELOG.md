@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before deciding the in-memory-vs-spill path — distribute tallies exact
   per-chunk counts as it writes them. With `--temp-compression lz4` the
   old re-count was a full decompression pass over all scratch data.
+- Peak temp-disk usage roughly halved: each chunk's temp file is deleted
+  as soon as its subtree is built, instead of lingering until end-of-run
+  cleanup alongside the node files (two full dataset copies on scratch).
 
 ## [0.11.0] - 2026-06-09
 

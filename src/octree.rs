@@ -2837,6 +2837,17 @@ impl OctreeBuilder {
                         &spill_stats,
                         config,
                     )?;
+                    // The chunk's canonical temp file is fully consumed by
+                    // the build (the merge and write phases read node files
+                    // only). Delete it now instead of at end-of-run cleanup,
+                    // so peak scratch is ~one dataset copy (node files) plus
+                    // in-flight chunks rather than two full copies. Failure
+                    // to delete is harmless — Drop removes the whole temp
+                    // dir anyway — so it only logs.
+                    let chunk_file = chunk_canonical_path(&self.tmp_dir.join("chunks"), *chunk_idx);
+                    if let Err(e) = std::fs::remove_file(&chunk_file) {
+                        debug!("could not remove consumed chunk file {chunk_file:?}: {e}");
+                    }
                     let done = chunks_done.fetch_add(1, Ordering::Relaxed) + 1;
                     config.report(crate::ProgressEvent::StageProgress { done });
                     Ok(nodes)
