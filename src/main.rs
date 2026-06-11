@@ -209,7 +209,39 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
 }
 
 /// Total pipeline stages: Scanning + Counting + Distributing + Building + Writing.
-const TOTAL_STEPS: u32 = 5;
+const TOTAL_STEPS: u32 = 6;
+
+/// Raise the soft open-file limit toward the hard limit (capped at 8192).
+///
+/// macOS defaults the soft limit to 256, which the distribute and spill
+/// writer caches plus input readers can legitimately exceed; Linux
+/// container defaults are usually ample. The library also clamps its
+/// writer caches to the effective limit, so this is belt and braces —
+/// failure to raise is ignored and the clamps take over.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the provided struct; setrlimit reads a
+    // valid one.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            let want = lim.rlim_max.min(8192);
+            if lim.rlim_cur < want {
+                let new = libc::rlimit {
+                    rlim_cur: want,
+                    rlim_max: lim.rlim_max,
+                };
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &new);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
 
 fn human_count(n: u64) -> String {
     if n >= 1_000_000_000 {
@@ -491,6 +523,8 @@ fn main() -> Result<()> {
         )
         .with_target(false)
         .init();
+
+    raise_open_file_limit();
 
     let args = Args::parse();
 

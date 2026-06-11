@@ -40,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as soon as its subtree is built, instead of lingering until end-of-run
   cleanup alongside the node files (two full dataset copies on scratch).
 
+### Fixed
+
+- The build progress bar no longer rewinds toward zero whenever a chunk
+  takes the spill path: spill-local merges no longer emit progress events,
+  and the final cross-chunk merge reports as its own `Merging` stage (CLI
+  stage count is now 6).
+- "Too many open files" on hosts with low file-descriptor limits (macOS
+  defaults to 256): the chunk writer caches now derive their size from the
+  process's actual `RLIMIT_NOFILE`, concurrently spilling chunks share the
+  open-file budget instead of each claiming all of it, and the CLI raises
+  the soft limit toward the hard limit at startup.
+
 ## [0.11.0] - 2026-06-09
 
 ### Fixed

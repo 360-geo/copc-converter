@@ -250,6 +250,7 @@ dependencies = [
  "indicatif",
  "las",
  "laz",
+ "libc",
  "lz4_flex",
  "mimalloc",
  "rayon",

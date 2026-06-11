@@ -38,16 +38,39 @@ use tracing::{debug, info};
 // Distribute constants and helper types
 // ---------------------------------------------------------------------------
 
-/// Maximum number of leaf chunk files kept open simultaneously across all
-/// distribute workers. Divided evenly between workers.
+/// Preferred number of chunk temp files kept open simultaneously across all
+/// concurrent writer caches (distribute workers, or spilling build slots).
 ///
 /// Each entry holds a `BufWriter<File>` (~8 KiB internal buffer) plus an OS
-/// file descriptor. Capping prevents FD exhaustion on hosts with low ulimits
-/// (default 256 on macOS, 1024 on most Linux containers).
+/// file descriptor. The effective cap is the smaller of this and what the
+/// process's file-descriptor limit allows — see [`open_files_cap`].
 const CHUNKED_OPEN_FILES_CAP: usize = 512;
 
 /// Minimum per-worker LRU capacity for the chunk writer cache.
 const MIN_PER_WORKER_CHUNK_FILES: usize = 32;
+
+/// Total open-file budget for chunk writer caches: [`CHUNKED_OPEN_FILES_CAP`]
+/// clamped by the process's soft `RLIMIT_NOFILE`, minus headroom for
+/// everything else holding descriptors (input readers, node files, pack
+/// files, stdio). macOS defaults the soft limit to 256, where the full 512
+/// preferred cap would exhaust the process by itself.
+fn open_files_cap() -> usize {
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes into the provided struct.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            // Guard against RLIM_INFINITY before narrowing.
+            let soft = lim.rlim_cur.min(1 << 20) as usize;
+            let budget = soft.saturating_sub(128).max(MIN_PER_WORKER_CHUNK_FILES);
+            return CHUNKED_OPEN_FILES_CAP.min(budget);
+        }
+    }
+    CHUNKED_OPEN_FILES_CAP
+}
 
 /// Bounded LRU cache of append-mode `BufWriter`s for chunk temp files.
 ///
@@ -1791,7 +1814,7 @@ impl OctreeBuilder {
             .collect::<Result<Vec<_>>>()?;
 
         // 4. Compute per-worker resources.
-        let per_worker_cap = (CHUNKED_OPEN_FILES_CAP / num_workers).max(MIN_PER_WORKER_CHUNK_FILES);
+        let per_worker_cap = (open_files_cap() / num_workers).max(MIN_PER_WORKER_CHUNK_FILES);
 
         // Per-worker memory budget for the input chunk size. The transient
         // peak per point is the `PointData` byte slab (on-disk record
@@ -2301,9 +2324,16 @@ impl OctreeBuilder {
 
         let mut sub_index: FxHashMap<VoxelKey, u32> = FxHashMap::default();
         let mut sub_roots: Vec<VoxelKey> = Vec::new();
-        let per_worker_cap = CHUNKED_OPEN_FILES_CAP.max(MIN_PER_WORKER_CHUNK_FILES);
+        // Up to MAX_BUILD_CONCURRENCY chunks can be spilling concurrently,
+        // each with its own routing cache — share the global open-file
+        // budget between them instead of letting every spill claim all of
+        // it (512 FDs per spilled chunk blew through macOS's default
+        // 256-FD soft limit). The LRU evicts and reopens in append mode,
+        // so a small cap costs reopen churn, never correctness.
+        let spill_cache_cap =
+            (open_files_cap() / MAX_BUILD_CONCURRENCY).max(MIN_PER_WORKER_CHUNK_FILES);
         let mut cache =
-            ChunkWriterCache::new(per_worker_cap, self.num_extra_bytes, self.temp_compression);
+            ChunkWriterCache::new(spill_cache_cap, self.num_extra_bytes, self.temp_compression);
         // Group points per sub-octant before appending so each cache touch
         // writes a batch rather than a single point.
         let mut pending: FxHashMap<u32, Vec<RawPoint>> = FxHashMap::default();
@@ -2745,11 +2775,15 @@ impl OctreeBuilder {
                 batch_start = batch_end;
             }
 
-            // Report progress: one tick per merged level (the caller knows
-            // the total via max_chunk_level).
-            config.report(crate::ProgressEvent::StageProgress {
-                done: (max_chunk_level - d) as u64,
-            });
+            // Report progress: one tick per merged level. Quiet (spill-local)
+            // merges must not report — they run *during* the Building stage,
+            // and their tiny per-level `done` values would rewind the
+            // chunk-count progress bar to near zero on every spilled chunk.
+            if !quiet {
+                config.report(crate::ProgressEvent::StageProgress {
+                    done: (max_chunk_level - d) as u64,
+                });
+            }
         }
 
         Ok(all_new_parents)
@@ -2888,7 +2922,20 @@ impl OctreeBuilder {
             chunk_root_keys.len()
         );
 
+        // Building (phase 1) is complete; the merge gets its own stage so
+        // its per-level progress (small numbers) doesn't rewind the
+        // chunk-count bar that just finished at n_chunks.
+        config.report(crate::ProgressEvent::StageDone);
+
         // ---- Phase 2: merge chunk tops up to global root ----
+        // Total = the deepest chunk-root level: the merge produces parents
+        // one level at a time from there up to the root, reporting one tick
+        // per level.
+        let max_root_level = chunk_root_keys.iter().map(|k| k.level).max().unwrap_or(0);
+        config.report(crate::ProgressEvent::StageStart {
+            name: "Merging",
+            total: max_root_level as u64,
+        });
         let merge_parents = self.merge_chunk_tops(
             &chunk_root_keys,
             0, // stop at the global root
