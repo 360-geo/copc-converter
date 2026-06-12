@@ -211,6 +211,78 @@ fn parse_memory_limit(s: &str) -> Result<u64> {
 /// Total pipeline stages: Scanning + Counting + Distributing + Building + Writing.
 const TOTAL_STEPS: u32 = 6;
 
+/// Records the wall-clock duration of every pipeline stage while forwarding
+/// events unchanged to the wrapped observer. [`Self::log_summary`] emits one
+/// `debug!` line per stage after the run, so any `RUST_LOG=debug` run doubles
+/// as a per-stage measurement — comparable across builds without separate
+/// benchmark infrastructure.
+struct StageTimings {
+    inner: std::sync::Arc<dyn ProgressObserver>,
+    current: Mutex<Option<(&'static str, std::time::Instant, u64)>>,
+    finished: Mutex<Vec<(&'static str, std::time::Duration, u64)>>,
+}
+
+impl StageTimings {
+    fn new(inner: std::sync::Arc<dyn ProgressObserver>) -> Self {
+        Self {
+            inner,
+            current: Mutex::new(None),
+            finished: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn log_summary(&self) {
+        let finished = self.finished.lock().unwrap();
+        let mut total = std::time::Duration::ZERO;
+        for (name, dur, units) in finished.iter() {
+            total += *dur;
+            let secs = dur.as_secs_f64();
+            if *units > 0 && secs > 0.0 {
+                tracing::debug!(
+                    "stage {name}: {} ({} units, {}/s)",
+                    human_duration(*dur),
+                    human_count(*units),
+                    human_count((*units as f64 / secs) as u64),
+                );
+            } else {
+                tracing::debug!("stage {name}: {}", human_duration(*dur));
+            }
+        }
+        tracing::debug!("all stages: {}", human_duration(total));
+    }
+}
+
+impl ProgressObserver for StageTimings {
+    fn on_progress(&self, event: ProgressEvent) {
+        match &event {
+            ProgressEvent::StageStart { name, total } => {
+                *self.current.lock().unwrap() = Some((name, std::time::Instant::now(), *total));
+            }
+            ProgressEvent::StageDone => {
+                if let Some((name, started, units)) = self.current.lock().unwrap().take() {
+                    self.finished
+                        .lock()
+                        .unwrap()
+                        .push((name, started.elapsed(), units));
+                }
+            }
+            ProgressEvent::StageProgress { .. } => {}
+        }
+        self.inner.on_progress(event);
+    }
+}
+
+fn human_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}h{:02}m{:02}s", s / 3600, (s % 3600) / 60, s % 60)
+    } else if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
 /// Raise the soft open-file limit toward the hard limit (capped at 8192).
 ///
 /// macOS defaults the soft limit to 256, which the distribute and spill
@@ -571,6 +643,8 @@ fn main() -> Result<()> {
         ProgressMode::Plain => std::sync::Arc::new(PlainProgress::new(TOTAL_STEPS)),
         ProgressMode::Json => std::sync::Arc::new(JsonProgress::new(TOTAL_STEPS)),
     };
+    let timings = std::sync::Arc::new(StageTimings::new(progress));
+    let progress: std::sync::Arc<dyn ProgressObserver> = timings.clone();
 
     let config = PipelineConfig {
         memory_budget,
@@ -605,6 +679,8 @@ fn main() -> Result<()> {
     }
 
     distributed.build()?.write(&output)?;
+
+    timings.log_summary();
 
     Ok(())
 }
