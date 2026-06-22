@@ -504,6 +504,18 @@ fn build_concurrency_and_budget(memory_budget: u64, cores: usize) -> (usize, u64
 /// Higher values keep more points at coarse LOD levels (better progressive rendering).
 pub(crate) const GRID_CELLS_PER_AXIS: i64 = 128;
 
+/// Map a single-axis offset-from-origin onto a sampling-grid cell index in
+/// `[0, GRID_CELLS_PER_AXIS)`. Scaling the offset across the full voxel extent
+/// distributes cells uniformly even when `int_size` is not a multiple of the
+/// grid size; the clamp catches the rounding overflow at the far edge.
+///
+/// `int_size` must be ≥ `GRID_CELLS_PER_AXIS` (the caller floors it).
+#[inline]
+fn grid_cell_axis(offset: i64, int_size: i64) -> i64 {
+    let g = GRID_CELLS_PER_AXIS;
+    ((offset.max(0) * g) / int_size).clamp(0, g - 1)
+}
+
 // ---------------------------------------------------------------------------
 // Raw point storage
 // ---------------------------------------------------------------------------
@@ -1683,11 +1695,11 @@ impl OctreeBuilder {
             - self.offset_z)
             / self.scale_z)
             .round() as i64;
-        let int_size =
-            (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z)).round() as i64;
-
-        // Grid resolution: fixed cells per axis, matching untwine's CellCount.
-        let cell = (int_size / GRID_CELLS_PER_AXIS).max(1);
+        // Voxel extent in integer coordinates, floored at the grid size so
+        // every cell spans ≥1 integer unit.
+        let int_size = (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z))
+            .round()
+            .max(GRID_CELLS_PER_AXIS as f64) as i64;
 
         // Sort by Morton code within the parent voxel for spatially coherent
         // traversal. `sort_by_cached_key` computes one Morton code per point
@@ -1708,21 +1720,15 @@ impl OctreeBuilder {
             child_has_pts[*ci] = true;
         }
 
-        // Occupancy bitmap over the fixed 128³ sampling grid (256 KiB),
-        // replacing a hashed per-point set insert with a load+OR. This
-        // path only runs for parents holding > MAX_LEAF_POINTS, so the
-        // fixed allocation amortizes to under 3 bytes per thousand points.
-        // Cell coordinates are clamped to the grid, so a boundary point
-        // that rounds one cell out (the origins are rounded to integer
-        // coordinates) shares the face cell instead of occupying a
-        // phantom out-of-grid cell.
+        // Occupancy bitmap over the fixed 128³ sampling grid (256 KiB): one
+        // load+OR per point marks the cell that point falls in.
         let g = GRID_CELLS_PER_AXIS;
         let n_cells = (g * g * g) as usize;
         let mut occupied = vec![0u64; n_cells / 64];
         let grid_idx = |p: &RawPoint| -> usize {
-            let gx = ((p.x as i64 - origin_x) / cell).clamp(0, g - 1);
-            let gy = ((p.y as i64 - origin_y) / cell).clamp(0, g - 1);
-            let gz = ((p.z as i64 - origin_z) / cell).clamp(0, g - 1);
+            let gx = grid_cell_axis(p.x as i64 - origin_x, int_size);
+            let gy = grid_cell_axis(p.y as i64 - origin_y, int_size);
+            let gz = grid_cell_axis(p.z as i64 - origin_z, int_size);
             (gx + gy * g + gz * g * g) as usize
         };
 
@@ -3116,6 +3122,54 @@ mod tests {
             halfsize <= 50.05,
             "halfsize {halfsize} must stay close to half x-range"
         );
+    }
+
+    #[test]
+    fn grid_cell_axis_covers_full_voxel_when_int_size_not_divisible() {
+        // When int_size is not a multiple of the grid size, the far edge of
+        // the voxel must still map across distinct cells up to the last one.
+        let g = GRID_CELLS_PER_AXIS;
+        let int_size = 1000;
+
+        // Offsets stay in range and the mapping is monotonic.
+        let mut prev = -1;
+        for off in 0..int_size {
+            let c = grid_cell_axis(off, int_size);
+            assert!((0..g).contains(&c), "offset {off} -> cell {c} out of range");
+            assert!(c >= prev, "cell index must be monotonic in offset");
+            prev = c;
+        }
+
+        // Endpoints reach the first and last cell; the far edge is not
+        // collapsed into one cell.
+        assert_eq!(grid_cell_axis(0, int_size), 0);
+        assert_eq!(grid_cell_axis(int_size - 1, int_size), g - 1);
+        assert_ne!(grid_cell_axis(900, int_size), grid_cell_axis(950, int_size));
+
+        // Out-of-range offsets clamp to the nearest cell.
+        assert_eq!(grid_cell_axis(-5, int_size), 0);
+        assert_eq!(grid_cell_axis(int_size + 50, int_size), g - 1);
+    }
+
+    #[test]
+    fn grid_cell_axis_distributes_offsets_uniformly() {
+        // Each cell must own an equal slice of the voxel: with integer-uniform
+        // mapping every cell holds floor or ceil of int_size/g offsets, so the
+        // busiest and emptiest cells differ by at most one.
+        let g = GRID_CELLS_PER_AXIS;
+        for &int_size in &[200, 1000, 128 * 50, 128 * 50 + 127, 999_983] {
+            let mut per_cell = vec![0i64; g as usize];
+            for off in 0..int_size {
+                per_cell[grid_cell_axis(off, int_size) as usize] += 1;
+            }
+            let max = *per_cell.iter().max().unwrap();
+            let min = *per_cell.iter().min().unwrap();
+            assert!(
+                max - min <= 1,
+                "int_size={int_size}: cell occupancy spread {} (max {max}, min {min})",
+                max - min
+            );
+        }
     }
 
     fn sample_point() -> RawPoint {
