@@ -213,10 +213,11 @@ dependencies = [
 
 [[package]]
 name = "copc-streaming"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77dc2d974a4249167c4e42e5af2220d0f3ce907e117cec0f8747bcfe7fb154ac"
+checksum = "3a8abb0cfd31a03ccee05b754573da7ea8f59bc9348bbb7cadb7750694043bbd"
 dependencies = [
+ "bitflags",
  "byteorder",
  "las",
  "laz",
@@ -225,9 +226,9 @@ dependencies = [
 
 [[package]]
 name = "copc-temporal"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b0f88e98528393e46f8872d2fb2e3a00f2658df73adbc7220e135e253e9791a"
+checksum = "0034c8568d118acb7a54c925ca754223aba99c881fa99035a3ed3cca806d078f"
 dependencies = [
  "byteorder",
  "copc-streaming",
@@ -912,8 +913,9 @@ dependencies = [
 
 [[package]]
 name = "las"
-version = "0.9.11"
-source = "git+https://github.com/jacovdbergh/las-rs?rev=d3bffa632a191b70e10820f53bcc1d71a057e4d8#d3bffa632a191b70e10820f53bcc1d71a057e4d8"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62f1a1abaa9217530731d35a08a5e37828b2f6158196cdd61252c017bbdace95"
 dependencies = [
  "byteorder",
  "chrono",

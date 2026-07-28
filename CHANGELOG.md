@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allocation for Extra Bytes payloads. Upstream benchmarks show 1.5–2×
   faster reads with parallel LAZ decoding; both stages are full passes over
   the input, so large conversions should see a substantial wall-clock
-  reduction. Until the PR is merged and released, the `las` dependency is
-  pinned to a fork via `[patch.crates-io]`.
+  reduction. The PR shipped in `las` 0.10, which is now the minimum
+  version.
 - Temp-file reads now decode points from bulk contiguous reads instead of
   one small read plus a heap allocation per point. Scratch data is re-read
   several times across the build, merge, and write stages, so this cuts

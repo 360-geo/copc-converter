@@ -36,7 +36,7 @@ required-features = ["tools"]
 tools = ["dep:reqwest", "dep:tokio", "dep:copc-streaming", "dep:copc-temporal", "dep:futures"]
 
 [dependencies]
-las = { version = "0.9", features = ["laz-parallel"] }
+las = { version = "0.10", features = ["laz-parallel"] }
 laz = { version = "0.12", features = ["parallel"] }
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
@@ -52,8 +52,8 @@ rustc-hash = "2"
 lz4_flex = { version = "0.13", default-features = false, features = ["frame"] }
 mimalloc = "0.1"
 dashmap = "6"
-copc-streaming = { version = "0.1.5", optional = true }
-copc-temporal = { version = "0.1.5", optional = true }
+copc-streaming = { version = "0.2.0", optional = true }
+copc-temporal = { version = "0.2.0", optional = true }
 futures = { version = "0.3", optional = true }
 reqwest = { version = "0.12", features = ["rustls-tls"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
@@ -70,10 +70,3 @@ codegen-units = 1
 
 [dev-dependencies]
 byteorder = "1.5"
-
-# Byte-slab read API (PointData / Reader::fill_points) from
-# https://github.com/gadomski/las-rs/pull/143, not yet merged upstream.
-# Pinned to the fork until it ships in a las release; remove this patch
-# (and bump the `las` version requirement) once it does.
-[patch.crates-io]
-las = { git = "https://github.com/jacovdbergh/las-rs", rev = "d3bffa632a191b70e10820f53bcc1d71a057e4d8" }
