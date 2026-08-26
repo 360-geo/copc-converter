@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Extra Bytes min/max stats are now decoded and re-encoded per the LAS 1.4
+  "anytype" rules — integer-typed fields store their stats as 64-bit
+  integers, float-typed fields as doubles — instead of always being read
+  and written as doubles. Integer-encoded stats (common in TerraScan
+  output) previously decoded as NaN, which poisoned the min/max merge and
+  could serialize the `f64::INFINITY` fold initializer into the output
+  VLR, surfacing in spec-following readers as bigint 9218868437227405312.
+  Non-finite float stats are now skipped when merging, and a field with no
+  trustworthy range gets its min/max bits cleared instead of advertising
+  garbage values.
+
 ## [0.12.0] - 2026-07-28
 
 ### Changed

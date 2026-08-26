@@ -49,6 +49,37 @@ pub(crate) fn data_type_name(data_type: u8) -> &'static str {
     }
 }
 
+/// Decode one 8-byte "anytype" stat slot (no_data/min/max) per the
+/// descriptor's data type. LAS 1.4 stores integer-typed stats upcast to
+/// u64/i64 and float-typed stats upcast to double — reading every slot
+/// as a double (the old behaviour) turns e.g. TerraScan's i64 `-5000`
+/// Reflectance min into NaN, which then poisons the min/max fold and
+/// leaves the `f64::INFINITY` fold initializer to be serialized into
+/// the output VLR (bigint 9218868437227405312 to a spec-following
+/// reader). Returns `None` for undocumented/raw types (0, 11+), whose
+/// stat slots have no defined interpretation.
+pub(crate) fn anytype_to_f64(data_type: u8, raw: u64) -> Option<f64> {
+    match data_type {
+        1 | 3 | 5 | 7 => Some(raw as f64),
+        2 | 4 | 6 | 8 => Some(raw as i64 as f64),
+        9 | 10 => Some(f64::from_bits(raw)),
+        _ => None,
+    }
+}
+
+/// Encode a stat value back into an 8-byte anytype slot, inverse of
+/// [`anytype_to_f64`]. Integer domains round and saturate; u64 values
+/// beyond 2^53 lose low-bit precision on the f64 round-trip, which is
+/// acceptable for advisory stats.
+pub(crate) fn f64_to_anytype(data_type: u8, value: f64) -> Option<u64> {
+    match data_type {
+        1 | 3 | 5 | 7 => Some(value.round() as u64),
+        2 | 4 | 6 | 8 => Some(value.round() as i64 as u64),
+        9 | 10 => Some(value.to_bits()),
+        _ => None,
+    }
+}
+
 /// Structural fingerprint of one Extra Bytes field — the parts that
 /// define the per-point byte layout and value decoding. Two fields with
 /// identical `FieldSchema` produce identical per-point bytes for the same
@@ -134,14 +165,20 @@ impl ParsedExtraBytes {
                 *slot = r.read_u64::<LittleEndian>()?;
             }
 
+            // Min/max are "anytype" slots: their encoding depends on
+            // data_type. Undecodable slots (undocumented types) read as
+            // NaN and are masked out of the stat bits below so the merge
+            // never folds or re-serializes them.
             let mut min = [0f64; 3];
             for slot in &mut min {
-                *slot = r.read_f64::<LittleEndian>()?;
+                let raw = r.read_u64::<LittleEndian>()?;
+                *slot = anytype_to_f64(data_type, raw).unwrap_or(f64::NAN);
             }
 
             let mut max = [0f64; 3];
             for slot in &mut max {
-                *slot = r.read_f64::<LittleEndian>()?;
+                let raw = r.read_u64::<LittleEndian>()?;
+                *slot = anytype_to_f64(data_type, raw).unwrap_or(f64::NAN);
             }
 
             let mut scale = [0f64; 3];
@@ -172,9 +209,16 @@ impl ParsedExtraBytes {
                 offset,
                 no_data,
             });
+            // For undocumented data types the min/max slots are
+            // uninterpretable — drop their stat bits so downstream
+            // merging leaves those descriptors untouched.
+            let stat_mask = if anytype_to_f64(data_type, 0).is_some() {
+                options_bits::NO_DATA | options_bits::MIN | options_bits::MAX
+            } else {
+                options_bits::NO_DATA
+            };
             stats.push(FieldStats {
-                options_stats: options
-                    & (options_bits::NO_DATA | options_bits::MIN | options_bits::MAX),
+                options_stats: options & stat_mask,
                 min,
                 max,
             });
@@ -327,11 +371,16 @@ pub(crate) fn merge_stats_into_canonical(
     for field_idx in 0..n_fields {
         // Collect all per-file stats for this field. Each file's parsed
         // payload has `fields.len() == n_fields` (validated upstream).
-        let mut any_min = false;
-        let mut any_max = false;
         let mut any_no_data = false;
         let mut merged_min = [f64::INFINITY; 3];
         let mut merged_max = [f64::NEG_INFINITY; 3];
+        // Whether a finite value was folded into each axis. Non-finite
+        // stats (NaN slots from garbage float stats) must neither poison
+        // the fold via a false comparison nor let the fold initializers
+        // leak into the output — an axis nothing folded into keeps its
+        // stat bit clear.
+        let mut min_folded = [false; 3];
+        let mut max_folded = [false; 3];
 
         for parsed in per_file_parsed {
             if parsed.fields.len() != n_fields {
@@ -346,25 +395,44 @@ pub(crate) fn merge_stats_into_canonical(
                 any_no_data = true;
             }
             if stats.options_stats & options_bits::MIN != 0 {
-                any_min = true;
-                for (merged, &incoming) in merged_min.iter_mut().zip(stats.min.iter()) {
-                    if incoming < *merged {
-                        *merged = incoming;
+                for ((merged, folded), &incoming) in merged_min
+                    .iter_mut()
+                    .zip(&mut min_folded)
+                    .zip(stats.min.iter())
+                {
+                    if incoming.is_finite() {
+                        *folded = true;
+                        if incoming < *merged {
+                            *merged = incoming;
+                        }
                     }
                 }
             }
             if stats.options_stats & options_bits::MAX != 0 {
-                any_max = true;
-                for (merged, &incoming) in merged_max.iter_mut().zip(stats.max.iter()) {
-                    if incoming > *merged {
-                        *merged = incoming;
+                for ((merged, folded), &incoming) in merged_max
+                    .iter_mut()
+                    .zip(&mut max_folded)
+                    .zip(stats.max.iter())
+                {
+                    if incoming.is_finite() {
+                        *folded = true;
+                        if incoming > *merged {
+                            *merged = incoming;
+                        }
                     }
                 }
             }
         }
+        // Gate the stat bits on axis 0, the meaningful axis (multi-axis
+        // extra bytes are spec-deprecated; axes 1-2 are zero padding in
+        // practice, and zeros always fold as finite). A field whose
+        // axis-0 stat never folded has no trustworthy range to advertise.
+        let any_min = min_folded[0];
+        let any_max = max_folded[0];
 
         let off = field_idx * DESCRIPTOR_SIZE;
         let descriptor = &mut canonical[off..off + DESCRIPTOR_SIZE];
+        let data_type = descriptor[2];
 
         // Patch the options byte: keep the structural bits (scale_bit,
         // offset_bit) from the canonical VLR, OR in the union of stat
@@ -380,19 +448,32 @@ pub(crate) fn merge_stats_into_canonical(
             | (if any_max { options_bits::MAX } else { 0 });
         descriptor[3] = new_options;
 
-        // Patch min / max if any input had them. no_data values are left
-        // alone — they're producer-defined sentinels, not data-derived.
+        // Patch min / max if any input had them, re-encoding per the
+        // field's data type (integers as 64-bit ints, floats as doubles
+        // — the LAS 1.4 anytype rules). Axes nothing finite folded into
+        // are zeroed. no_data values are left alone — they're
+        // producer-defined sentinels, not data-derived.
         if any_min {
             let mut min_off = 4 + 32 + 4 + 24; // skip header + name + unused + no_data
-            for v in &merged_min {
-                descriptor[min_off..min_off + 8].copy_from_slice(&v.to_le_bytes());
+            for (v, folded) in merged_min.iter().zip(min_folded) {
+                let raw = if folded {
+                    f64_to_anytype(data_type, *v).unwrap_or(0)
+                } else {
+                    0
+                };
+                descriptor[min_off..min_off + 8].copy_from_slice(&raw.to_le_bytes());
                 min_off += 8;
             }
         }
         if any_max {
             let mut max_off = 4 + 32 + 4 + 24 + 24; // ... + min[3]
-            for v in &merged_max {
-                descriptor[max_off..max_off + 8].copy_from_slice(&v.to_le_bytes());
+            for (v, folded) in merged_max.iter().zip(max_folded) {
+                let raw = if folded {
+                    f64_to_anytype(data_type, *v).unwrap_or(0)
+                } else {
+                    0
+                };
+                descriptor[max_off..max_off + 8].copy_from_slice(&raw.to_le_bytes());
                 max_off += 8;
             }
         }
@@ -647,6 +728,120 @@ mod tests {
         assert_eq!(
             merged.stats[0].options_stats & (options_bits::MIN | options_bits::MAX),
             options_bits::MIN | options_bits::MAX
+        );
+    }
+
+    /// Overwrite the first min/max anytype slots with raw little-endian
+    /// bytes, for building integer-encoded fixtures (`build_single_field`
+    /// writes f64 bytes, which is only valid for float-typed fields).
+    fn set_raw_stat_slots(payload: &mut [u8], min_raw: u64, max_raw: u64) {
+        payload[64..72].copy_from_slice(&min_raw.to_le_bytes());
+        payload[88..96].copy_from_slice(&max_raw.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_integer_typed_stats_per_spec() {
+        // TerraScan-style i16 field: min stored as i64 -5000, max as 15000.
+        // The old f64-everywhere parse decoded that min as NaN.
+        let mut payload = build_single_field(
+            4, // i16
+            "Reflectance",
+            "",
+            options_bits::MIN | options_bits::MAX,
+            [0.0; 3],
+            [0.0; 3],
+            [0.0; 3],
+            [0.0; 3],
+            [0; 3],
+        );
+        set_raw_stat_slots(&mut payload, (-5000i64) as u64, 15000);
+        let parsed = ParsedExtraBytes::parse(&payload).unwrap();
+        assert_eq!(parsed.stats[0].min[0], -5000.0);
+        assert_eq!(parsed.stats[0].max[0], 15000.0);
+    }
+
+    #[test]
+    fn merge_preserves_integer_stats() {
+        // Regression: NaN-decoded integer mins used to poison the fold,
+        // serializing the f64::INFINITY initializer (bit pattern
+        // 0x7FF0000000000000) into the output — which spec-following
+        // readers surface as bigint 9218868437227405312.
+        let build = |min: i64, max: i64| {
+            let mut p = build_single_field(
+                4, // i16
+                "Reflectance",
+                "",
+                options_bits::MIN | options_bits::MAX,
+                [0.0; 3],
+                [0.0; 3],
+                [0.0; 3],
+                [0.0; 3],
+                [0; 3],
+            );
+            set_raw_stat_slots(&mut p, min as u64, max as u64);
+            p
+        };
+        let a = build(-5000, 15000);
+        let b = build(-4000, 15500);
+        let pa = ParsedExtraBytes::parse(&a).unwrap();
+        let pb = ParsedExtraBytes::parse(&b).unwrap();
+
+        let mut canonical = a.clone();
+        merge_stats_into_canonical(&mut canonical, &[pa, pb]).unwrap();
+
+        let min_raw = u64::from_le_bytes(canonical[64..72].try_into().unwrap());
+        let max_raw = u64::from_le_bytes(canonical[88..96].try_into().unwrap());
+        assert_ne!(
+            min_raw,
+            f64::INFINITY.to_bits(),
+            "must not leak the fold initializer"
+        );
+        assert_eq!(min_raw as i64, -5000);
+        assert_eq!(max_raw as i64, 15500);
+    }
+
+    #[test]
+    fn merge_skips_non_finite_float_stats() {
+        let garbage = build_single_field(
+            10,
+            "zNorm",
+            "",
+            options_bits::MIN | options_bits::MAX,
+            [f64::NAN, 0.0, 0.0],
+            [f64::INFINITY, 0.0, 0.0],
+            [0.0; 3],
+            [0.0; 3],
+            [0; 3],
+        );
+        let good = build_single_field(
+            10,
+            "zNorm",
+            "",
+            options_bits::MIN | options_bits::MAX,
+            [-2.0, 0.0, 0.0],
+            [7.5, 0.0, 0.0],
+            [0.0; 3],
+            [0.0; 3],
+            [0; 3],
+        );
+        let pg = ParsedExtraBytes::parse(&garbage).unwrap();
+        let pk = ParsedExtraBytes::parse(&good).unwrap();
+
+        // Garbage + good: the finite stats win.
+        let mut canonical = garbage.clone();
+        merge_stats_into_canonical(&mut canonical, &[pg.clone(), pk]).unwrap();
+        let merged = ParsedExtraBytes::parse(&canonical).unwrap();
+        assert_eq!(merged.stats[0].min[0], -2.0);
+        assert_eq!(merged.stats[0].max[0], 7.5);
+
+        // Garbage only: no finite value ever folds, so the stat bits
+        // must come out cleared rather than advertising the initializers.
+        let mut canonical = garbage.clone();
+        merge_stats_into_canonical(&mut canonical, &[pg]).unwrap();
+        let merged = ParsedExtraBytes::parse(&canonical).unwrap();
+        assert_eq!(
+            merged.stats[0].options_stats & (options_bits::MIN | options_bits::MAX),
+            0
         );
     }
 
