@@ -1275,7 +1275,7 @@ mod tests {
                 size.is_multiple_of(32),
                 "hierarchy page size must be a multiple of 32"
             );
-            for entry_bytes in page.chunks_exact(32) {
+            for entry_bytes in page.as_chunks::<32>().0 {
                 let level = i32::from_le_bytes(entry_bytes[0..4].try_into().unwrap());
                 let x = i32::from_le_bytes(entry_bytes[4..8].try_into().unwrap());
                 let y = i32::from_le_bytes(entry_bytes[8..12].try_into().unwrap());
@@ -1474,7 +1474,7 @@ mod tests {
         // Collect both regular entries and page pointers from the root.
         let mut root_regular: Vec<(VoxelKey, i32)> = Vec::new();
         let mut root_pointers: Vec<VoxelKey> = Vec::new();
-        for chunk in root_bytes.chunks_exact(32) {
+        for chunk in root_bytes.as_chunks::<32>().0 {
             let level = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
             let x = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
             let y = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
