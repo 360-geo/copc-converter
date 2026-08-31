@@ -52,7 +52,7 @@ fn encode_point_base(rp: &RawPoint, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&rp.intensity.to_le_bytes());
     let return_byte = (rp.return_number & 0x0F) | ((rp.number_of_returns & 0x0F) << 4);
     buf.push(return_byte);
-    buf.push(0u8); // classification flags / scanner channel / scan dir / edge
+    buf.push(rp.flags); // classification flags / scanner channel / scan dir / edge
     buf.push(rp.classification);
     buf.push(rp.user_data);
     buf.extend_from_slice(&rp.scan_angle.to_le_bytes());
@@ -1100,6 +1100,7 @@ mod tests {
             intensity: 65535,
             return_number: 3,
             number_of_returns: 5,
+            flags: 0b1011_1101,
             classification: 6,
             scan_angle: -15000,
             user_data: 42,
@@ -1117,6 +1118,14 @@ mod tests {
         let mut p = sample_point();
         p.extras = extras.to_vec().into_boxed_slice();
         p
+    }
+
+    #[test]
+    fn encode_point_preserves_las_1_4_flags() {
+        let p = sample_point();
+        let mut buf = Vec::new();
+        encode_point(&p, 8, &mut buf);
+        assert_eq!(buf[15], p.flags);
     }
 
     #[test]

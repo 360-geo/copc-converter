@@ -240,6 +240,7 @@ mod tests {
             intensity: 100,
             return_number: 1,
             number_of_returns: 1,
+            flags: 0,
             classification: 0,
             scan_angle: 0,
             user_data: 0,

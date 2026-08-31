@@ -342,6 +342,85 @@ fn read_file(path: &Path) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn point_flags_round_trip() {
+    use las::point::{Classification, Format, ScanDirection};
+    use las::{Builder, Color, Point, Writer};
+
+    let input = Path::new("tests/data/test_point_flags_input.las");
+    let output = Path::new("tests/data/test_point_flags_output.copc.laz");
+    let mut builder = Builder::from((1, 4));
+    builder.point_format = Format::new(8).unwrap();
+    let mut writer = Writer::from_path(input, builder.into_header().unwrap()).unwrap();
+    let mut expected = HashMap::new();
+
+    for i in 0..32u8 {
+        let point = Point {
+            x: f64::from(i),
+            y: f64::from(i) * 2.0,
+            z: f64::from(i) * 3.0,
+            return_number: i % 4 + 1,
+            number_of_returns: 4,
+            scan_direction: if i & 1 == 0 {
+                ScanDirection::RightToLeft
+            } else {
+                ScanDirection::LeftToRight
+            },
+            is_edge_of_flight_line: i & 2 != 0,
+            classification: Classification::new(i % 12).unwrap(),
+            is_synthetic: i & 1 != 0,
+            is_key_point: i & 2 != 0,
+            is_withheld: i & 4 != 0,
+            is_overlap: i & 8 != 0,
+            scanner_channel: i % 4,
+            gps_time: Some(1_000_000.0 + f64::from(i)),
+            color: Some(Color::new(u16::from(i), u16::from(i), u16::from(i))),
+            nir: Some(u16::from(i)),
+            ..Default::default()
+        };
+        expected.insert(
+            i,
+            (
+                point.is_synthetic,
+                point.is_key_point,
+                point.is_withheld,
+                point.is_overlap,
+                point.scanner_channel,
+                point.scan_direction,
+                point.is_edge_of_flight_line,
+            ),
+        );
+        writer.write_point(point).unwrap();
+    }
+    writer.close().unwrap();
+
+    run_converter(input, output);
+    let mut reader = las::Reader::from_path(output).unwrap();
+    let points: Vec<_> = reader
+        .read_all()
+        .unwrap()
+        .points()
+        .collect::<las::Result<_>>()
+        .unwrap();
+    assert_eq!(points.len(), expected.len());
+    for point in points {
+        let key = point.x.round() as u8;
+        let actual = (
+            point.is_synthetic,
+            point.is_key_point,
+            point.is_withheld,
+            point.is_overlap,
+            point.scanner_channel,
+            point.scan_direction,
+            point.is_edge_of_flight_line,
+        );
+        assert_eq!(actual, expected[&key], "point flags changed for x={key}");
+    }
+
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
 fn header_matches_reference() {
     let output = Path::new("tests/data/test_output.copc.laz");
     run_converter(Path::new("tests/data/input.laz"), output);
