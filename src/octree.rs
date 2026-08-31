@@ -520,6 +520,15 @@ fn grid_cell_axis(offset: i64, int_size: i64) -> i64 {
 // Raw point storage
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn normalized_las_1_4_flags(record: &[u8], is_new_point_format: bool) -> u8 {
+    if is_new_point_format {
+        record[15]
+    } else {
+        (record[15] >> 5) | (record[14] & 0xC0)
+    }
+}
+
 /// A raw point stored as scaled integer coordinates plus attributes.
 /// Scaled ints allow exact LAS round-trip without floating-point loss.
 ///
@@ -534,6 +543,7 @@ pub struct RawPoint {
     pub intensity: u16,
     pub return_number: u8,
     pub number_of_returns: u8,
+    pub flags: u8,
     pub classification: u8,
     pub scan_angle: i16,
     pub user_data: u8,
@@ -548,7 +558,7 @@ pub struct RawPoint {
 
 impl RawPoint {
     /// Size of the fixed (non-extras) portion of the on-disk record.
-    pub const BASE_BYTE_SIZE: usize = 4 + 4 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 8 + 2 + 2 + 2 + 2; // 38
+    pub const BASE_BYTE_SIZE: usize = 4 + 4 + 4 + 2 + 1 + 1 + 1 + 1 + 2 + 1 + 2 + 8 + 2 + 2 + 2 + 2; // 39
 
     /// Total on-disk record size for the given extras width.
     pub const fn record_size(num_extra_bytes: u16) -> usize {
@@ -562,6 +572,7 @@ impl RawPoint {
         c.write_u16::<LittleEndian>(self.intensity)?;
         c.write_u8(self.return_number)?;
         c.write_u8(self.number_of_returns)?;
+        c.write_u8(self.flags)?;
         c.write_u8(self.classification)?;
         c.write_i16::<LittleEndian>(self.scan_angle)?;
         c.write_u8(self.user_data)?;
@@ -590,15 +601,16 @@ impl RawPoint {
             intensity: u16le(12),
             return_number: rec[14],
             number_of_returns: rec[15],
-            classification: rec[16],
-            scan_angle: i16::from_le_bytes(rec[17..19].try_into().unwrap()),
-            user_data: rec[19],
-            point_source_id: u16le(20),
-            gps_time: f64::from_le_bytes(rec[22..30].try_into().unwrap()),
-            red: u16le(30),
-            green: u16le(32),
-            blue: u16le(34),
-            nir: u16le(36),
+            flags: rec[16],
+            classification: rec[17],
+            scan_angle: i16::from_le_bytes(rec[18..20].try_into().unwrap()),
+            user_data: rec[20],
+            point_source_id: u16le(21),
+            gps_time: f64::from_le_bytes(rec[23..31].try_into().unwrap()),
+            red: u16le(31),
+            green: u16le(33),
+            blue: u16le(35),
+            nir: u16le(37),
             extras: rec[Self::BASE_BYTE_SIZE..].to_vec().into_boxed_slice(),
         }
     }
@@ -1501,17 +1513,19 @@ impl OctreeBuilder {
         let record_len = pd.record_len();
         let nxb = self.num_extra_bytes as usize;
         let mut records = pd.raw_bytes().chunks_exact(record_len);
+        let is_extended_point_format = pd.format().is_extended;
 
         for _ in 0..pd.len() {
             let x = xs.next().expect("x column ends early");
             let y = ys.next().expect("y column ends early");
             let z = zs.next().expect("z column ends early");
+            let rec = records.next().expect("record column ends early");
             let extras = if nxb == 0 {
                 Box::<[u8]>::default()
             } else {
-                let rec = records.next().expect("record column ends early");
                 rec[record_len - nxb..].to_vec().into_boxed_slice()
             };
+            let flags = normalized_las_1_4_flags(rec, is_extended_point_format);
             let (red, green, blue) = rgbs.as_mut().and_then(|it| it.next()).unwrap_or((0, 0, 0));
             f(RawPoint {
                 x: ((x - self.offset_x) / self.scale_x).round() as i32,
@@ -1520,6 +1534,7 @@ impl OctreeBuilder {
                 intensity: intensities.next().expect("intensity column ends early"),
                 return_number: return_numbers.next().expect("rn column ends early"),
                 number_of_returns: numbers_of_returns.next().expect("nor column ends early"),
+                flags,
                 classification: classifications.next().expect("class column ends early"),
                 scan_angle: (scan_angles.next().expect("angle column ends early") / 0.006).round()
                     as i16,
@@ -3180,6 +3195,7 @@ mod tests {
             intensity: 65535,
             return_number: 3,
             number_of_returns: 5,
+            flags: 0b1011_1101,
             classification: 6,
             scan_angle: -15000,
             user_data: 42,
@@ -3213,6 +3229,7 @@ mod tests {
         assert_eq!(p.intensity, p2.intensity);
         assert_eq!(p.return_number, p2.return_number);
         assert_eq!(p.number_of_returns, p2.number_of_returns);
+        assert_eq!(p.flags, p2.flags);
         assert_eq!(p.classification, p2.classification);
         assert_eq!(p.scan_angle, p2.scan_angle);
         assert_eq!(p.user_data, p2.user_data);
@@ -3236,6 +3253,7 @@ mod tests {
                 intensity: 0,
                 return_number: 0,
                 number_of_returns: 0,
+                flags: 0,
                 classification: 0,
                 scan_angle: 0,
                 user_data: 0,
@@ -3403,9 +3421,20 @@ mod tests {
     fn rawpoint_record_size_arithmetic() {
         // Base record is 38 bytes; extras shift the total by exactly the
         // declared width.
-        assert_eq!(RawPoint::record_size(0), 38);
-        assert_eq!(RawPoint::record_size(12), 50);
-        assert_eq!(RawPoint::record_size(255), 38 + 255);
+        assert_eq!(RawPoint::record_size(0), 39);
+        assert_eq!(RawPoint::record_size(12), 51);
+        assert_eq!(RawPoint::record_size(255), 39 + 255);
+    }
+
+    #[test]
+    fn normalize_point_flags_for_extended_and_legacy_formats() {
+        let mut record = [0u8; 20];
+        record[15] = 0b1011_1101;
+        assert_eq!(normalized_las_1_4_flags(&record, true), 0b1011_1101);
+
+        record[14] = 0b1100_0000;
+        record[15] = 0b1110_0110;
+        assert_eq!(normalized_las_1_4_flags(&record, false), 0b1100_0111);
     }
 
     #[test]
