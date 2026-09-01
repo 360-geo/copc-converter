@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-01
+
 ### Fixed
 
 - Point flags are no longer zeroed during conversion: the LAS 1.4 flags
@@ -204,7 +206,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validation enforces an identical VLR and uniform `num_extra_bytes` across
   inputs.
 
-[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/360-geo/copc-converter/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/360-geo/copc-converter/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/360-geo/copc-converter/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/360-geo/copc-converter/compare/v0.10.1...v0.11.0
