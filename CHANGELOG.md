@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Point flags are no longer zeroed during conversion: the LAS 1.4 flags
+  byte — classification flags (synthetic, key-point, withheld, overlap),
+  scanner channel, scan direction, and edge-of-flight-line — is now
+  carried from input to output. Previously the writer emitted zero for
+  all of these on every point. Legacy inputs (point formats 0–5) have
+  their flag bits remapped into the extended layout, including the scan
+  direction and edge-of-flight-line bits from the legacy return byte.
+  Contributed by [@yvind](https://github.com/yvind) in
+  [#22](https://github.com/360-geo/copc-converter/pull/22).
+
 ## [0.13.0] - 2026-08-26
 
 ### Fixed
