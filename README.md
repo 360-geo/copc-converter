@@ -17,7 +17,7 @@ A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [CO
 
 ## Installation
 
-Requires Rust 1.85+.
+Requires Rust 1.88+.
 
 ### From crates.io
 
@@ -106,8 +106,9 @@ run on a modest wall-time budget.
 ```sh
 copc_converter ./my_survey/ survey.copc.laz --memory-limit 8G
 
-# With temporal index (useful for multi-pass mobile mapping data)
-copc_converter ./my_survey/ survey.copc.laz --temporal-index
+# With temporal index (useful for multi-pass mobile mapping data),
+# sampling every 1000th point
+copc_converter ./my_survey/ survey.copc.laz --temporal-index 1000
 ```
 
 ## Library usage

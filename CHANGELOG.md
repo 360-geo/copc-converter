@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Declared the minimum supported Rust version (`rust-version = "1.88"`
+  in Cargo.toml), so older toolchains now fail with a clear cargo error
+  instead of a mid-build compile failure. The README previously claimed
+  1.85+, which stopped being true when lib code started using
+  `usize::is_multiple_of` (needs 1.87) and the test suite `as_chunks`
+  (needs 1.88).
+
 ## [0.14.0] - 2026-09-01
 
 ### Fixed

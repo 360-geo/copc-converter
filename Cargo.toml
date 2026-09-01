@@ -2,6 +2,9 @@
 name = "copc_converter"
 version = "0.0.0-dev"
 edition = "2024"
+# Verified floor: `usize::is_multiple_of` in lib code needs 1.87, the
+# `as_chunks` calls in tests need 1.88.
+rust-version = "1.88"
 description = "Fast, memory-efficient converter from LAS/LAZ to COPC (Cloud-Optimized Point Cloud)"
 license = "MIT"
 readme = "README.md"
