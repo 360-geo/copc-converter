@@ -218,8 +218,9 @@ pub fn write_copc(
         .enumerate()
         .for_each(|(i, &c)| gensoft[i] = c);
     w.write_all(&gensoft)?;
-    w.write_u16::<LittleEndian>(1)?; // file creation day
-    w.write_u16::<LittleEndian>(2024)?; // file creation year
+    let (creation_doy, creation_year) = file_creation_date();
+    w.write_u16::<LittleEndian>(creation_doy)?;
+    w.write_u16::<LittleEndian>(creation_year)?;
     w.write_u16::<LittleEndian>(375)?; // header size
     w.write_u32::<LittleEndian>(offset_to_point_data)?;
     w.write_u32::<LittleEndian>(num_vlrs)?; // number of VLRs
@@ -595,8 +596,69 @@ pub fn write_copc(
         file.write_all(&count.to_le_bytes())?;
     }
 
+    // Patch the legacy (LAS 1.0–1.3) point counts at header offset 107:
+    // u32 total + 5 × u32 by return. Populated only when they fit, as
+    // untwine and PDAL do, so pre-1.4 readers still see the counts.
+    let (legacy_total, legacy_returns) = legacy_point_counts(actual_total_points, &return_counts);
+    file.seek(SeekFrom::Start(107))?;
+    file.write_all(&legacy_total.to_le_bytes())?;
+    for &count in &legacy_returns {
+        file.write_all(&count.to_le_bytes())?;
+    }
+
     info!("COPC file written: {:?}", output_path);
     Ok(())
+}
+
+/// Today's date as `(day_of_year, year)` for the LAS header's File Creation
+/// fields, derived from the system clock (UTC). Returns `(0, 0)` if the
+/// clock is before the Unix epoch.
+fn file_creation_date() -> (u16, u16) {
+    let secs = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return (0, 0),
+    };
+    civil_date_from_unix_days((secs / 86_400) as i64)
+}
+
+/// Convert days since 1970-01-01 to `(day_of_year, year)` with day-of-year
+/// starting at 1 (Howard Hinnant's `civil_from_days`).
+fn civil_date_from_unix_days(days: i64) -> (u16, u16) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy_march = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy_march + 2) / 153;
+    let day = doy_march - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    const CUMULATIVE: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut doy = CUMULATIVE[(month - 1) as usize] + day;
+    if leap && month > 2 {
+        doy += 1;
+    }
+    (doy as u16, year as u16)
+}
+
+/// Legacy `u32` point counts for the LAS 1.4 header (offset 107). The spec
+/// requires zeros whenever the true counts do not fit in `u32`; a return
+/// number above 5 also has no legacy slot, so the whole block is zeroed
+/// rather than published as an inconsistent partial sum.
+fn legacy_point_counts(total: u64, by_return: &[u64; 15]) -> (u32, [u32; 5]) {
+    let fits = total <= u32::MAX as u64 && by_return[5..].iter().all(|&c| c == 0);
+    if !fits {
+        return (0, [0; 5]);
+    }
+    let mut legacy = [0u32; 5];
+    for (dst, &src) in legacy.iter_mut().zip(&by_return[..5]) {
+        *dst = src as u32;
+    }
+    (total as u32, legacy)
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,5 +1583,43 @@ mod tests {
         let mut expected = entries.clone();
         expected.sort_by_key(|(k, _, _, _)| (k.level, k.x, k.y, k.z));
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn civil_date_known_days() {
+        assert_eq!(civil_date_from_unix_days(0), (1, 1970));
+        // 2024-12-31 is day 366 of a leap year (20_088 days since epoch)
+        assert_eq!(civil_date_from_unix_days(20_088), (366, 2024));
+        // 2025-03-01 = 20_148 days since epoch, day 60 in a common year
+        assert_eq!(civil_date_from_unix_days(20_148), (60, 2025));
+        // 2024-03-01 = 19_783 days since epoch, day 61 in a leap year
+        assert_eq!(civil_date_from_unix_days(19_783), (61, 2024));
+    }
+
+    #[test]
+    fn legacy_counts_populated_when_they_fit() {
+        let mut by_return = [0u64; 15];
+        by_return[0] = 10;
+        by_return[1] = 5;
+        by_return[4] = 1;
+        assert_eq!(legacy_point_counts(16, &by_return), (16, [10, 5, 0, 0, 1]));
+    }
+
+    #[test]
+    fn legacy_counts_zeroed_when_total_overflows_u32() {
+        let mut by_return = [0u64; 15];
+        by_return[0] = u32::MAX as u64 + 1;
+        assert_eq!(
+            legacy_point_counts(u32::MAX as u64 + 1, &by_return),
+            (0, [0; 5])
+        );
+    }
+
+    #[test]
+    fn legacy_counts_zeroed_when_returns_above_five_exist() {
+        let mut by_return = [0u64; 15];
+        by_return[0] = 3;
+        by_return[6] = 1;
+        assert_eq!(legacy_point_counts(4, &by_return), (0, [0; 5]));
     }
 }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The LAS header's File Creation Day/Year now record the actual conversion
+  date instead of a hardcoded day 1 of 2024.
+- The legacy LAS 1.0–1.3 point count and points-by-return fields (header
+  offset 107) are now populated when they fit in `u32`, matching untwine and
+  PDAL so pre-1.4 readers see the real counts. They stay zero, as the spec
+  requires, when the total exceeds `u32::MAX` or any return number above 5
+  is present.
+
 ### Changed
 
 - Declared the minimum supported Rust version (`rust-version = "1.88"`
