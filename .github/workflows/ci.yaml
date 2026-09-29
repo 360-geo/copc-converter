@@ -95,10 +95,6 @@ jobs:
     permissions:
       contents: read
 
-    env:
-      # Shared by both steps so the synthetic inputs are generated once.
-      WORK: ${{ runner.temp }}/memtest
-
     steps:
       - name: Checkout the code
         uses: actions/checkout@v6
@@ -110,7 +106,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pdal
       - name: Build release binary
         run: cargo build --release
+      # Both steps share WORK so the synthetic inputs are generated once.
+      # (`runner` isn't available in job-level env, only in steps.)
       - name: Stay within container memory limits
         run: scripts/ci/memory-limits.sh gating
+        env:
+          WORK: ${{ runner.temp }}/memtest
       - name: Known memory issues (report only)
         run: scripts/ci/memory-limits.sh known-issues
+        env:
+          WORK: ${{ runner.temp }}/memtest
