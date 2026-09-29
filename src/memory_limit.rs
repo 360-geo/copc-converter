@@ -214,6 +214,9 @@ pub fn is_ram_backed(dir: &Path) -> bool {
         return false;
     }
     // SAFETY: statfs succeeded, so it initialised `stat`.
+    // `f_type`'s integer type differs between targets (i64 on x86_64, i32 on
+    // some 32-bit ones), so widen it explicitly before comparing.
+    #[allow(clippy::unnecessary_cast)]
     let f_type = unsafe { stat.assume_init() }.f_type as i64;
     f_type == TMPFS_MAGIC || f_type == RAMFS_MAGIC
 }
