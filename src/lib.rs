@@ -101,6 +101,19 @@ pub enum Error {
         format_b: u8,
     },
 
+    /// Input files disagree on GPS time type (week time vs adjusted standard
+    /// time), which can't be reconciled without the GPS week number.
+    #[error(
+        "GPS time type mismatch: {file_a:?} and {file_b:?} differ in whether GPS time is \
+         week time or adjusted standard time (LAS global encoding bit 0)"
+    )]
+    GpsTimeTypeMismatch {
+        /// Path of the first file.
+        file_a: PathBuf,
+        /// Path of the differing file.
+        file_b: PathBuf,
+    },
+
     /// Temporal index requested but point format lacks GPS time.
     #[error("Temporal index requested but input point format {format} does not include GPS time")]
     NoGpsTime {

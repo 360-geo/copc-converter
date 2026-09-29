@@ -465,6 +465,192 @@ fn header_matches_reference() {
     let _ = std::fs::remove_file(output);
 }
 
+/// Write a small format-6 LAS 1.4 file with the given GPS time type.
+fn write_gps_las(path: &Path, gps_time_type: las::GpsTimeType, n_points: u32) {
+    use las::point::Format;
+    use las::{Builder, Point, Writer};
+
+    let mut builder = Builder::from((1, 4));
+    builder.point_format = Format::new(6).unwrap();
+    builder.gps_time_type = gps_time_type;
+    let mut writer = Writer::from_path(path, builder.into_header().unwrap()).unwrap();
+    for i in 0..n_points {
+        writer
+            .write_point(Point {
+                x: f64::from(i),
+                y: f64::from(i) * 2.0,
+                z: f64::from(i) * 0.5,
+                return_number: 1,
+                number_of_returns: 1,
+                gps_time: Some(100_000.0 + f64::from(i)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+}
+
+fn global_encoding(data: &[u8]) -> u16 {
+    u16::from_le_bytes([data[6], data[7]])
+}
+
+#[test]
+fn legacy_point_counts_are_zero() {
+    // LAS 1.4 R15: the legacy count fields must be zero for point data
+    // record formats 6 and above, which is every format COPC can hold.
+    let output = Path::new("tests/data/test_legacy_counts.copc.laz");
+    run_converter(Path::new("tests/data/input.laz"), output);
+    let data = read_file(output);
+    assert!(
+        data[107..131].iter().all(|&b| b == 0),
+        "legacy point count fields (header offset 107..131) must be zero"
+    );
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn gps_time_type_is_preserved() {
+    for (label, gps_type, expect_bit) in [
+        ("week", las::GpsTimeType::Week, 0),
+        ("standard", las::GpsTimeType::Standard, 1),
+    ] {
+        let input = std::path::PathBuf::from(format!("tests/data/test_gps_{label}.las"));
+        let output = std::path::PathBuf::from(format!("tests/data/test_gps_{label}.copc.laz"));
+        write_gps_las(&input, gps_type, 100);
+        run_converter(&input, &output);
+        let enc = global_encoding(&read_file(&output));
+        assert_eq!(enc & 0x0001, expect_bit, "{label}: GPS time type bit");
+        assert_eq!(enc & 0x0010, 0x0010, "{label}: WKT bit must be set");
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+    }
+}
+
+#[test]
+fn mixed_gps_time_types_are_rejected() {
+    // Week time can't be converted to standard time without the week
+    // number, so merging the two would silently corrupt GPS times.
+    let dir = std::env::temp_dir().join(format!("copc_gps_mixed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    write_gps_las(&dir.join("a.las"), las::GpsTimeType::Standard, 50);
+    write_gps_las(&dir.join("b.las"), las::GpsTimeType::Week, 50);
+    let output = dir.join("out.copc.laz");
+    let result = Command::new(converter_bin())
+        .arg(&dir)
+        .arg(&output)
+        .args(["--progress", "plain"])
+        .output()
+        .expect("failed to run copc_converter");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "mixed GPS time types must fail");
+    assert!(
+        stderr.contains("GPS time type mismatch"),
+        "unexpected error: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_input_writes_readable_hierarchy() {
+    // Readers start at the root hierarchy entry; with no points there must
+    // still be one (as a zero-point node) or the file can't be opened.
+    let input = Path::new("tests/data/test_empty_input.las");
+    let output = Path::new("tests/data/test_empty_input.copc.laz");
+    write_gps_las(input, las::GpsTimeType::Standard, 0);
+    run_converter(input, output);
+    let data = read_file(output);
+    assert_eq!(read_las_header(&data).total_points, 0);
+    let hier = read_hierarchy(&data);
+    assert_eq!(hier.len(), 1, "expected only the root entry: {hier:?}");
+    let root = &hier[0];
+    assert_eq!(
+        root.key,
+        VoxelKey {
+            level: 0,
+            x: 0,
+            y: 0,
+            z: 0
+        }
+    );
+    assert_eq!((root.point_count, root.offset, root.byte_size), (0, 0, 0));
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn empty_tile_does_not_stretch_cube() {
+    // An empty tile's header bounds are meaningless — PDAL writes them as
+    // 0,0,0 — and must not pull the root cube out to the coordinate origin.
+    let dir = std::env::temp_dir().join(format!("copc_empty_tile_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy("tests/data/input.laz", dir.join("a.laz")).unwrap();
+    // Empty tile sharing input.laz's header (CRS, point format, GPS type).
+    let empty = dir.join("b.las");
+    let header = las::Reader::from_path("tests/data/input.laz")
+        .unwrap()
+        .header()
+        .clone();
+    las::Writer::from_path(&empty, header)
+        .unwrap()
+        .close()
+        .unwrap();
+    // Overwrite las-rs's ±inf empty bounds with PDAL-style zeros.
+    let mut bytes = std::fs::read(&empty).unwrap();
+    bytes[179..227].fill(0);
+    std::fs::write(&empty, bytes).unwrap();
+
+    let with_empty = dir.join("with_empty.copc.laz");
+    let alone = dir.join("alone.copc.laz");
+    run_converter(&dir, &with_empty);
+    run_converter(Path::new("tests/data/input.laz"), &alone);
+    let info_with = read_copc_info(&read_file(&with_empty));
+    let info_alone = read_copc_info(&read_file(&alone));
+    assert_eq!(
+        (info_with.center_x, info_with.center_y, info_with.halfsize),
+        (
+            info_alone.center_x,
+            info_alone.center_y,
+            info_alone.halfsize
+        ),
+        "empty tile changed the root cube"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn json_progress_stdout_is_pure_ndjson() {
+    // Logs must not interleave with `--progress json` on stdout, or NDJSON
+    // consumers break. RUST_LOG=debug guarantees plenty of log output.
+    let output = Path::new("tests/data/test_json_progress.copc.laz");
+    let result = Command::new(converter_bin())
+        .arg("tests/data/input.laz")
+        .arg(output)
+        .args(["--progress", "json"])
+        .env("RUST_LOG", "debug")
+        .output()
+        .expect("failed to run copc_converter");
+    assert!(result.status.success(), "converter exited with error");
+
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(
+        !stdout.trim().is_empty(),
+        "expected JSON progress on stdout"
+    );
+    for line in stdout.lines() {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(line).is_ok(),
+            "non-JSON line on stdout: {line:?}"
+        );
+    }
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("DEBUG"), "debug logs should go to stderr");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "no ANSI colour codes when stderr is not a terminal"
+    );
+    let _ = std::fs::remove_file(output);
+}
+
 #[test]
 fn copc_info_matches_reference() {
     let output = Path::new("tests/data/test_copc_info.copc.laz");

@@ -51,31 +51,22 @@ const PER_POINT_OVERHEAD_BYTES: u64 = 170;
 
 /// Lower clamp on chunk target size (points). Below this, fixed per-chunk
 /// overhead (file open, octree node bookkeeping) dominates point processing.
-const MIN_CHUNK_POINTS: u64 = 1_000_000;
-
-/// Per-chunk peak working set during the in-memory build phase, matching
-/// `PER_CHUNK_BYTES_PER_POINT` in octree.rs. Used here to derive the upper
-/// clamp on chunk target size so a single chunk can never exceed the
-/// configured memory budget.
-const PER_CHUNK_PEAK_BYTES_PER_POINT: u64 = 600;
-
-/// Fraction of the memory budget a single chunk is allowed to occupy.
-/// Set below 0.5 so rayon can run at least two chunks in parallel while
-/// leaving slack for allocator overhead and concurrent stages.
-const SINGLE_CHUNK_BUDGET_FRACTION: f64 = 0.4;
+/// Kept below the smallest regular build slot (`MIN_BUILD_SLOT_BYTES` /
+/// 600 B/pt ≈ 895k points) so the floor never pushes a chunk past its slot.
+const MIN_CHUNK_POINTS: u64 = 500_000;
 
 /// Aim for at least this many chunks per worker so small datasets still
 /// have parallelism headroom.
 const PARALLELISM_TARGET_PER_WORKER: u64 = 4;
 
-/// Dynamic upper clamp on chunk target size, derived from the memory
-/// budget so a single chunk's in-memory build can never exceed the
-/// configured budget. Clamped below by `MIN_CHUNK_POINTS` to avoid
-/// degenerate chunking on tiny budgets.
-pub(crate) fn max_chunk_points(memory_budget: u64) -> u64 {
-    let raw = ((memory_budget as f64 * SINGLE_CHUNK_BUDGET_FRACTION)
-        / PER_CHUNK_PEAK_BYTES_PER_POINT as f64) as u64;
-    raw.max(MIN_CHUNK_POINTS)
+/// Upper clamp on chunk target size: the largest chunk one build slot can
+/// hold in memory (see `octree::max_in_memory_chunk_points`). Planning
+/// chunks larger than a slot would send every full-size chunk down the
+/// much slower spill path, which is meant only as a safety net for chunks
+/// whose actual size exceeds the planner's estimate. Clamped below by
+/// `MIN_CHUNK_POINTS` to avoid degenerate chunking on tiny budgets.
+fn max_chunk_points(memory_budget: u64, build_cores: usize) -> u64 {
+    crate::octree::max_in_memory_chunk_points(memory_budget, build_cores).max(MIN_CHUNK_POINTS)
 }
 
 /// Hard cap on how many extra octree levels a single over-target finest cell
@@ -205,6 +196,22 @@ impl ChunkPlan {
 /// produce larger chunks (less coordination, more cache pressure per chunk);
 /// smaller budgets and more workers produce smaller chunks.
 pub fn compute_chunk_target(memory_budget: u64, num_workers: usize, total_points: u64) -> u64 {
+    // The build sizes its slots from the same (global pool) thread count.
+    chunk_target_for_cores(
+        memory_budget,
+        num_workers,
+        total_points,
+        rayon::current_num_threads(),
+    )
+}
+
+/// [`compute_chunk_target`] with the build's core count passed explicitly.
+fn chunk_target_for_cores(
+    memory_budget: u64,
+    num_workers: usize,
+    total_points: u64,
+    build_cores: usize,
+) -> u64 {
     let workers = num_workers.max(1) as u64;
     let raw = ((memory_budget as f64 * SAFETY_FACTOR) / (workers * PER_POINT_OVERHEAD_BYTES) as f64)
         as u64;
@@ -217,7 +224,7 @@ pub fn compute_chunk_target(memory_budget: u64, num_workers: usize, total_points
         .map(|v| v.max(MIN_CHUNK_POINTS))
         .unwrap_or(u64::MAX);
 
-    let max_chunk = max_chunk_points(memory_budget);
+    let max_chunk = max_chunk_points(memory_budget, build_cores);
     raw.min(max_for_parallelism)
         .clamp(MIN_CHUNK_POINTS, max_chunk)
 }
@@ -361,6 +368,11 @@ fn detect_header_mismatch(
     let flag = |hdr: f64, act: f64, scale: f64| -> Option<(f64, f64)> {
         ((hdr - act).abs() > 1.5 * scale).then_some((hdr, act))
     };
+    // No points were counted (empty input): there are no actual bounds to
+    // compare against, only the ±inf sentinels.
+    if actual.min_x > actual.max_x {
+        return None;
+    }
     let hdr = &builder.bounds;
     let result = HeaderBoundsMismatch {
         min_x: flag(hdr.min_x, actual.min_x, builder.scale_x),
@@ -819,42 +831,54 @@ mod tests {
         assert_eq!(select_grid_size(10_000_000_000, mid), 256);
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
     #[test]
-    fn chunk_target_scales_with_budget() {
-        // 64 GB budget, 5 workers: raw target hits the dynamic single-chunk cap.
-        let target = compute_chunk_target(64 * 1024 * 1024 * 1024, 5, 42_800_000_000);
-        assert!((45_000_000..=47_000_000).contains(&target), "got {target}");
-
-        // 32 GB budget, 10 workers: raw target sits below the cap.
-        let target = compute_chunk_target(32 * 1024 * 1024 * 1024, 10, 42_800_000_000);
-        assert!((11_000_000..=13_000_000).contains(&target), "got {target}");
-
-        // 16 GB budget, 4 workers: cap is binding.
-        let target = compute_chunk_target(16 * 1024 * 1024 * 1024, 4, 42_800_000_000);
-        assert!((10_500_000..=11_800_000).contains(&target), "got {target}");
+    fn chunk_target_fits_one_build_slot() {
+        // Regression: the target used to be sized against the whole budget
+        // while the build compares chunks to one slot's share, so every
+        // full-size chunk took the slow spill path whenever build
+        // concurrency was above 1.
+        for budget_gib in [1, 2, 4, 6, 8, 12, 16, 24, 32, 64, 128] {
+            for cores in [1, 4, 8, 10, 16, 64] {
+                let budget = budget_gib * GIB;
+                let target = chunk_target_for_cores(budget, 8, 42_800_000_000, cores);
+                let slot_points = crate::octree::max_in_memory_chunk_points(budget, cores);
+                assert!(
+                    target <= slot_points.max(MIN_CHUNK_POINTS),
+                    "{budget_gib} GiB, {cores} cores: target {target} > slot {slot_points}"
+                );
+                // A regular slot (≥ 512 MiB) always fits the min-size floor.
+                if budget as f64 * 0.4 >= 512.0 * 1024.0 * 1024.0 {
+                    assert!(
+                        slot_points >= MIN_CHUNK_POINTS,
+                        "{budget_gib} GiB, {cores} cores"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn chunk_target_dynamic_max_scales_with_budget() {
-        // Tiny budget must shrink the cap so no single chunk can blow it.
-        let target = compute_chunk_target(4 * 1024 * 1024 * 1024, 1, 10_000_000_000);
-        assert!(target <= 3_000_000, "got {target}, must be ≤ 3M");
-        assert!(target >= MIN_CHUNK_POINTS);
+    fn chunk_target_scales_with_budget() {
+        let small = chunk_target_for_cores(4 * GIB, 8, 42_800_000_000, 10);
+        let large = chunk_target_for_cores(64 * GIB, 8, 42_800_000_000, 10);
+        assert!(large > small, "small={small} large={large}");
     }
 
     #[test]
     fn chunk_target_parallelism_floor() {
         // Small dataset (50M points), big budget, modest workers — without the
         // parallelism floor, we'd get one chunk total.
-        let target = compute_chunk_target(64 * 1024 * 1024 * 1024, 5, 50_000_000);
+        let target = chunk_target_for_cores(64 * GIB, 5, 50_000_000, 10);
         // Parallelism floor: 50M / (5 * 4) = 2.5M per chunk
-        assert!((2_000_000..=3_000_000).contains(&target));
+        assert!((2_000_000..=3_000_000).contains(&target), "got {target}");
     }
 
     #[test]
     fn chunk_target_clamps_to_min() {
-        // Tiny budget that would otherwise produce sub-1M chunks.
-        let target = compute_chunk_target(512 * 1024 * 1024, 32, 42_800_000_000);
+        // Tiny budget that would otherwise produce sub-minimum chunks.
+        let target = chunk_target_for_cores(512 * 1024 * 1024, 32, 42_800_000_000, 10);
         assert_eq!(target, MIN_CHUNK_POINTS);
     }
 

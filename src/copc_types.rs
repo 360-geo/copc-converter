@@ -138,8 +138,16 @@ pub fn write_vlr<W: Write>(
     w.write_all(&uid)?;
     // record_id
     w.write_u16::<LittleEndian>(record_id)?;
-    // record_length_after_header
-    w.write_u16::<LittleEndian>(payload.len() as u16)?;
+    // record_length_after_header — a VLR payload is capped at u16::MAX bytes;
+    // anything larger would silently truncate the length and corrupt the file.
+    let len = u16::try_from(payload.len()).map_err(|_| {
+        anyhow::anyhow!(
+            "VLR {user_id}/{record_id} payload is {} bytes, exceeding the {} byte VLR limit",
+            payload.len(),
+            u16::MAX
+        )
+    })?;
+    w.write_u16::<LittleEndian>(len)?;
     // description (32 bytes, null-padded)
     let mut desc = [0u8; 32];
     let db = description.as_bytes();
