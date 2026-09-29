@@ -81,11 +81,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+      # Ubuntu 24.04 doesn't package PDAL; take it from conda-forge.
       - name: Install PDAL
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pdal
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: pdal
+          create-args: pdal
+          init-shell: bash
+          cache-environment: true
       - name: Build release binary
         run: cargo build --release
       - name: Check converted fixtures with PDAL and copc-validator
+        shell: bash -el {0}
         run: scripts/ci/external-validators.sh
 
   memory-limits:
@@ -102,17 +109,25 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+      # Ubuntu 24.04 doesn't package PDAL; take it from conda-forge.
       - name: Install PDAL
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pdal
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: pdal
+          create-args: pdal
+          init-shell: bash
+          cache-environment: true
       - name: Build release binary
         run: cargo build --release
       # Both steps share WORK so the synthetic inputs are generated once.
       # (`runner` isn't available in job-level env, only in steps.)
       - name: Stay within container memory limits
+        shell: bash -el {0}
         run: scripts/ci/memory-limits.sh gating
         env:
           WORK: ${{ runner.temp }}/memtest
       - name: Known memory issues (report only)
+        shell: bash -el {0}
         run: scripts/ci/memory-limits.sh known-issues
         env:
           WORK: ${{ runner.temp }}/memtest
