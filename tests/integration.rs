@@ -1971,18 +1971,16 @@ fn validator_catches_wrong_gps_range() {
     });
 }
 
-#[test]
-#[ignore = "known issue: the octree cube is built from input header bounds, so a \
-            header that understates the data puts points outside their nodes"]
-fn understated_header_bounds_still_produce_valid_copc() {
+/// Write a 50k-point grid over x [1000, 1100), y [2000, 2100), z [0, 7),
+/// then overwrite the header's max_x or min_x (bytes 179 / 187) with
+/// `patch`, if any, to simulate an inaccurate header.
+fn write_grid_las(path: &Path, patch: Option<(usize, f64)>) {
     use las::point::Format;
     use las::{Builder, Point, Writer};
 
-    let input = Path::new("tests/data/test_understated_bounds.las");
-    let output = Path::new("tests/data/test_understated_bounds.copc.laz");
     let mut builder = Builder::from((1, 4));
     builder.point_format = Format::new(6).unwrap();
-    let mut writer = Writer::from_path(input, builder.into_header().unwrap()).unwrap();
+    let mut writer = Writer::from_path(path, builder.into_header().unwrap()).unwrap();
     for i in 0..50_000u32 {
         writer
             .write_point(Point {
@@ -1997,15 +1995,49 @@ fn understated_header_bounds_still_produce_valid_copc() {
             .unwrap();
     }
     writer.close().unwrap();
-    // Understate max_x (header offset 179) by half the true x extent.
-    let mut bytes = std::fs::read(input).unwrap();
-    bytes[179..187].copy_from_slice(&1050.0f64.to_le_bytes());
-    std::fs::write(input, bytes).unwrap();
+    if let Some((at, value)) = patch {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+}
 
-    // run_converter validates the output.
+#[test]
+fn understated_header_bounds_still_produce_valid_copc() {
+    // A header whose max_x understates the data by half its extent used to
+    // put points outside their nodes (the cube came from the header). The
+    // counted extents now drive the frame; run_converter validates.
+    let input = Path::new("tests/data/test_understated_bounds.las");
+    let output = Path::new("tests/data/test_understated_bounds.copc.laz");
+    write_grid_las(input, Some((179, 1050.0)));
     run_converter(input, output);
     let _ = std::fs::remove_file(input);
     let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn overstated_header_bounds_get_a_tight_cube() {
+    // A header claiming min_x = 0 for data starting at 1000 would size the
+    // cube for 1100 m instead of 100 m. The output must match a conversion
+    // of the same points with an accurate header.
+    let accurate = Path::new("tests/data/test_accurate_bounds.las");
+    let loose = Path::new("tests/data/test_overstated_bounds.las");
+    let out_accurate = Path::new("tests/data/test_accurate_bounds.copc.laz");
+    let out_loose = Path::new("tests/data/test_overstated_bounds.copc.laz");
+    write_grid_las(accurate, None);
+    write_grid_las(loose, Some((187, 0.0)));
+    run_converter(accurate, out_accurate);
+    run_converter(loose, out_loose);
+    let a = read_copc_info(&read_file(out_accurate));
+    let b = read_copc_info(&read_file(out_loose));
+    assert_eq!(
+        (a.center_x, a.center_y, a.center_z, a.halfsize),
+        (b.center_x, b.center_y, b.center_z, b.halfsize),
+        "overstated header bounds changed the cube"
+    );
+    for p in [accurate, loose, out_accurate, out_loose] {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 #[test]

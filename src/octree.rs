@@ -1064,13 +1064,10 @@ impl Bounds {
 
     /// Cube that contains this AABB, padded by one scale unit per axis.
     ///
-    /// The COPC spec reconstructs each node's per-axis cube bound via
-    /// `cx − halfsize + (vx + 1) × (2 × halfsize / 2^depth)`. That float
-    /// multiplication chain loses ~1 ULP at every depth, so a point sitting
-    /// exactly on a cell boundary can land 1 ULP outside the
-    /// spec-reconstructed bound while still being "the same point" at the
-    /// file's stored precision. Padding halfsize by one scale unit gives
-    /// every face slack far larger than any ULP drift.
+    /// Readers reconstruct node bounds with float arithmetic (e.g.
+    /// `cx − halfsize + vx × side`), which can drift by an ulp or so. Padding
+    /// halfsize by one scale unit keeps the cube's outer faces far enough
+    /// from the extreme points that no reconstruction puts them outside.
     pub fn to_cube(&self, scale_x: f64, scale_y: f64, scale_z: f64) -> (f64, f64, f64, f64) {
         let cx = (self.min_x + self.max_x) / 2.0;
         let cy = (self.min_y + self.max_y) / 2.0;
@@ -1112,11 +1109,56 @@ fn fit_offset_scale(offset: &mut f64, scale: &mut f64, min: f64, max: f64) -> bo
     (*offset, *scale) != original
 }
 
+/// The output's coordinate frame: integer encoding (scale/offset) and the
+/// octree cube.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    scale: [f64; 3],
+    offset: [f64; 3],
+    center: [f64; 3],
+    halfsize: f64,
+}
+
+/// Fit a frame to `bounds`, starting from the first input's scale/offset and
+/// adjusting them only as needed to encode the bounds in i32.
+fn fit_frame(bounds: &Bounds, input_scale: [f64; 3], input_offset: [f64; 3]) -> Frame {
+    let (mut scale, mut offset) = (input_scale, input_offset);
+    let mins = [bounds.min_x, bounds.min_y, bounds.min_z];
+    let maxs = [bounds.max_x, bounds.max_y, bounds.max_z];
+    let mut adjusted = false;
+    for a in 0..3 {
+        adjusted |= fit_offset_scale(&mut offset[a], &mut scale[a], mins[a], maxs[a]);
+    }
+    if adjusted {
+        info!(
+            "Adjusted output offset/scale to fit combined extents in i32: \
+             offset=({:.6}, {:.6}, {:.6}) scale=({:e}, {:e}, {:e})",
+            offset[0], offset[1], offset[2], scale[0], scale[1], scale[2],
+        );
+    }
+    let (cx, cy, cz, halfsize) = bounds.to_cube(scale[0], scale[1], scale[2]);
+    Frame {
+        scale,
+        offset,
+        center: [cx, cy, cz],
+        halfsize,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VoxelKey assignment
 // ---------------------------------------------------------------------------
 
 /// Assign a point to the voxel at the given tree depth.
+///
+/// Node bounds are derived exactly the way copc.js (the reference COPC
+/// reader, also behind copc-validator) derives them: start from the cube
+/// `center ± halfsize` and at each level split at `min + (max − min) / 2`.
+/// Deciding with the very same floating-point operations guarantees every
+/// point lies inside the bounds such a reader reconstructs for its node,
+/// even a point sitting exactly on a split plane. (Readers using the direct
+/// `center − halfsize + v × side` formula can disagree with it by an ulp at
+/// exact boundaries; no single choice can match every formula.)
 #[allow(clippy::too_many_arguments)]
 pub fn point_to_key(
     x: f64,
@@ -1128,47 +1170,27 @@ pub fn point_to_key(
     halfsize: f64,
     depth: u32,
 ) -> VoxelKey {
-    let mut vx = 0i32;
-    let mut vy = 0i32;
-    let mut vz = 0i32;
-    let mut half = halfsize;
-    let mut ox = cx;
-    let mut oy = cy;
-    let mut oz = cz;
-
-    for _ in 0..depth {
-        half /= 2.0;
-        let bx = if x >= ox {
-            vx = vx * 2 + 1;
-            ox + half
-        } else {
-            vx *= 2;
-            ox - half
-        };
-        let by = if y >= oy {
-            vy = vy * 2 + 1;
-            oy + half
-        } else {
-            vy *= 2;
-            oy - half
-        };
-        let bz = if z >= oz {
-            vz = vz * 2 + 1;
-            oz + half
-        } else {
-            vz *= 2;
-            oz - half
-        };
-        ox = bx;
-        oy = by;
-        oz = bz;
+    #[inline]
+    fn axis(v: f64, center: f64, halfsize: f64, depth: u32) -> i32 {
+        let (mut min, mut max) = (center - halfsize, center + halfsize);
+        let mut index = 0i32;
+        for _ in 0..depth {
+            let mid = min + (max - min) / 2.0;
+            if v >= mid {
+                index = index * 2 + 1;
+                min = mid;
+            } else {
+                index *= 2;
+                max = mid;
+            }
+        }
+        index
     }
-
     VoxelKey {
         level: depth as i32,
-        x: vx,
-        y: vy,
-        z: vz,
+        x: axis(x, cx, halfsize, depth),
+        y: axis(y, cy, halfsize, depth),
+        z: axis(z, cz, halfsize, depth),
     }
 }
 
@@ -1382,6 +1404,9 @@ pub struct OctreeBuilder {
     pub gps_time_standard: bool,
     /// Largest LAZ chunk (in points) per input file, in input order.
     pub(crate) input_max_laz_chunk_points: Vec<u64>,
+    /// The first input's scale/offset, where frame fitting starts.
+    input_scale: [f64; 3],
+    input_offset: [f64; 3],
     /// Chunk plan computed by `distribute` and consumed by `build_node_map`.
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
     /// Exact per-chunk point counts tallied while distribute appended
@@ -1528,9 +1553,9 @@ impl OctreeBuilder {
         }
 
         let first = &scan_results[0];
-        let (mut scale_x, mut scale_y, mut scale_z) = (first.scale_x, first.scale_y, first.scale_z);
-        let (mut offset_x, mut offset_y, mut offset_z) =
-            (first.offset_x, first.offset_y, first.offset_z);
+        let input_scale = [first.scale_x, first.scale_y, first.scale_z];
+        let input_offset = [first.offset_x, first.offset_y, first.offset_z];
+        let [offset_x, offset_y, offset_z] = input_offset;
 
         if total_points == 0 {
             // No points at all: anchor a minimal cube at the first file's
@@ -1564,21 +1589,15 @@ impl OctreeBuilder {
         // can fall outside the i32 representable range. Rust's saturating
         // `f64 as i32` cast then clamps every overflowing point to
         // `i32::MIN`/`MAX`, collapsing them onto the same wrong coordinate.
-        // Re-center the offset and, if necessary, coarsen the scale so the
-        // combined bounds fit. Scale only ever grows (precision is never
-        // tightened beyond what the first file claimed).
-        let adjusted_x = fit_offset_scale(&mut offset_x, &mut scale_x, bounds.min_x, bounds.max_x);
-        let adjusted_y = fit_offset_scale(&mut offset_y, &mut scale_y, bounds.min_y, bounds.max_y);
-        let adjusted_z = fit_offset_scale(&mut offset_z, &mut scale_z, bounds.min_z, bounds.max_z);
-        if adjusted_x || adjusted_y || adjusted_z {
-            info!(
-                "Adjusted output offset/scale to fit combined extents in i32: \
-                 offset=({offset_x:.6}, {offset_y:.6}, {offset_z:.6}) \
-                 scale=({scale_x:e}, {scale_y:e}, {scale_z:e})",
-            );
-        }
-
-        let (cx, cy, cz, halfsize) = bounds.to_cube(scale_x, scale_y, scale_z);
+        // `fit_frame` re-centers the offset and, if necessary, coarsens the
+        // scale so the combined bounds fit. Scale only ever grows (precision
+        // is never tightened beyond what the first file claimed). These are
+        // header bounds; distribute refits once the actual extents are known.
+        let frame = fit_frame(&bounds, input_scale, input_offset);
+        let [scale_x, scale_y, scale_z] = frame.scale;
+        let [offset_x, offset_y, offset_z] = frame.offset;
+        let [cx, cy, cz] = frame.center;
+        let halfsize = frame.halfsize;
 
         // Choose depth so that leaf voxels hold ≤ MAX_LEAF_POINTS on average.
         let depth = {
@@ -1643,6 +1662,8 @@ impl OctreeBuilder {
                 .iter()
                 .map(|r| r.max_laz_chunk_points)
                 .collect(),
+            input_scale,
+            input_offset,
             chunked_plan: None,
             chunk_actual_counts: None,
             temp_compression: config.temp_compression,
@@ -1743,6 +1764,37 @@ impl OctreeBuilder {
             }
         }
         Ok(false)
+    }
+
+    /// Whether the frame fitted to the input headers has to be rebuilt for
+    /// the points' `actual` extents: a point outside the cube, or one the
+    /// scale/offset can't encode in i32, would corrupt the output, and a cube
+    /// much larger than the data wastes octree levels.
+    fn frame_needs_refit(&self, actual: &Bounds) -> bool {
+        let mins = [actual.min_x, actual.min_y, actual.min_z];
+        let maxs = [actual.max_x, actual.max_y, actual.max_z];
+        let center = [self.cx, self.cy, self.cz];
+        let scale = [self.scale_x, self.scale_y, self.scale_z];
+        let offset = [self.offset_x, self.offset_y, self.offset_z];
+        let outside_cube = (0..3)
+            .any(|a| mins[a] < center[a] - self.halfsize || maxs[a] > center[a] + self.halfsize);
+        let unencodable = (0..3).any(|a| {
+            [mins[a], maxs[a]]
+                .iter()
+                .any(|v| ((v - offset[a]) / scale[a]).abs() > I32_HEADROOM)
+        });
+        // Header bounds are often rounded outward a little; only refit when
+        // the data needs a clearly smaller cube.
+        let (_, _, _, fitted) = actual.to_cube(scale[0], scale[1], scale[2]);
+        let oversized = fitted < 0.9 * self.halfsize;
+        outside_cube || unencodable || oversized
+    }
+
+    fn set_frame(&mut self, frame: Frame) {
+        [self.scale_x, self.scale_y, self.scale_z] = frame.scale;
+        [self.offset_x, self.offset_y, self.offset_z] = frame.offset;
+        [self.cx, self.cy, self.cz] = frame.center;
+        self.halfsize = frame.halfsize;
     }
 
     /// Visit every point of a node without holding them all in memory.
@@ -2001,12 +2053,32 @@ impl OctreeBuilder {
             name: "Counting",
             total: self.total_points,
         });
-        let plan = crate::chunking::compute_chunk_plan(
+        let mut plan = crate::chunking::compute_chunk_plan(
             self,
             input_files,
             config,
             config.chunk_target_override,
         )?;
+        if let Some(actual) = plan.actual_bounds.clone() {
+            if self.frame_needs_refit(&actual) {
+                // The frame came from the input headers, which don't match
+                // the points: rebuild it from the counted extents and count
+                // again against it. Only inaccurate headers pay this pass.
+                info!(
+                    "Input header bounds don't match the point data; fitting the \
+                     octree to the actual extents and counting again"
+                );
+                self.set_frame(fit_frame(&actual, self.input_scale, self.input_offset));
+                plan = crate::chunking::compute_chunk_plan(
+                    self,
+                    input_files,
+                    config,
+                    config.chunk_target_override,
+                )?;
+            }
+            // The output header records the points' actual extents.
+            self.bounds = actual;
+        }
         config.report(crate::ProgressEvent::StageDone);
         debug!(
             "Distribute: {} chunks, target {} points each, grid {}³",
@@ -3378,6 +3450,59 @@ impl Drop for OctreeBuilder {
 mod tests {
     use super::*;
 
+    /// copc.js-style bounds of `index` at `depth` along one axis.
+    fn stepped_bounds(center: f64, halfsize: f64, index: i32, depth: u32) -> (f64, f64) {
+        let (mut min, mut max) = (center - halfsize, center + halfsize);
+        for level in (0..depth).rev() {
+            let mid = min + (max - min) / 2.0;
+            if (index >> level) & 1 == 1 {
+                min = mid;
+            } else {
+                max = mid;
+            }
+        }
+        (min, max)
+    }
+
+    #[test]
+    fn points_on_split_planes_stay_inside_their_node() {
+        // Regression: a point exactly on a split plane was assigned by
+        // comparing against an incrementally computed midpoint, which can
+        // differ by an ulp from the bounds readers reconstruct, leaving the
+        // point just outside its node. Place points exactly on every split
+        // plane readers compute and check each lands inside its node.
+        for (center, halfsize) in [
+            (25.000486155209114_f64, 25.0106_f64),
+            (543275.02, 3430.523018),
+            (152981.37, 105283.119),
+            (0.0, 1.0),
+        ] {
+            let depth = 12;
+            let (mut min, mut max) = (center - halfsize, center + halfsize);
+            let mut planes = Vec::new();
+            for level in 0..depth {
+                let mid = min + (max - min) / 2.0;
+                planes.extend([mid, mid.next_up(), mid.next_down()]);
+                // Walk alternately up and down so planes come from many nodes.
+                if level % 2 == 0 {
+                    min = mid;
+                } else {
+                    max = mid;
+                }
+            }
+            for v in planes {
+                let key = point_to_key(v, v, v, center, center, center, halfsize, depth);
+                for idx in [key.x, key.y, key.z] {
+                    let (lo, hi) = stepped_bounds(center, halfsize, idx, depth);
+                    assert!(
+                        lo <= v && v <= hi,
+                        "{v} outside its node [{lo}, {hi}] (center {center}, halfsize {halfsize})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn fit_offset_scale_keeps_first_file_offset_when_bounds_fit() {
         // Single-file or homogeneous-extent inputs should be bit-identical
@@ -3778,6 +3903,7 @@ mod tests {
             total_points,
             chunks,
             header_mismatch: None,
+            actual_bounds: None,
         }
     }
 

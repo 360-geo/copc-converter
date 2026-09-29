@@ -144,6 +144,9 @@ pub struct ChunkPlan {
     /// observed during the counting pass (beyond one scale unit per axis).
     /// The CLI surfaces this as a user-visible warning.
     pub header_mismatch: Option<HeaderBoundsMismatch>,
+    /// Actual extents of the counted points (world coordinates), or `None`
+    /// when there were none.
+    pub actual_bounds: Option<crate::octree::Bounds>,
 }
 
 /// Per-axis differences between the LAS header bounds and the actual
@@ -332,6 +335,14 @@ pub(crate) fn compute_chunk_plan(
     );
 
     let header_mismatch = detect_header_mismatch(builder, &actual);
+    let actual_bounds = (actual.min_x <= actual.max_x).then_some(crate::octree::Bounds {
+        min_x: actual.min_x,
+        min_y: actual.min_y,
+        min_z: actual.min_z,
+        max_x: actual.max_x,
+        max_y: actual.max_y,
+        max_z: actual.max_z,
+    });
 
     // ----- Merge sparse cells -----
     let chunks = merge_sparse_cells(&grid, grid_size, grid_depth, chunk_target);
@@ -343,6 +354,7 @@ pub(crate) fn compute_chunk_plan(
         total_points,
         chunks,
         header_mismatch,
+        actual_bounds,
     })
 }
 
@@ -385,8 +397,9 @@ fn detect_header_mismatch(
     result.any().then_some(result)
 }
 
-/// Per-axis actual bounds observed during the counting pass. Used to warn
-/// users when the LAS header bounds disagree with the real point data.
+/// Per-axis actual bounds (world coordinates) observed during the counting
+/// pass. Distribute uses them to fit the output frame and header bounds, and
+/// to warn when the LAS header bounds disagree with the real point data.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActualBounds {
     pub min_x: f64,
@@ -515,28 +528,17 @@ fn count_points(
                         let wx = ix as f64 * builder.scale_x + builder.offset_x;
                         let wy = iy as f64 * builder.scale_y + builder.offset_y;
                         let wz = iz as f64 * builder.scale_z + builder.offset_z;
-                        // Track actual bounds of round-tripped coordinates so
-                        // we can warn when the header bounds disagree with
-                        // the real data (e.g. after a tool rewrote headers
-                        // with coarser precision than the point data).
-                        if wx < local_bounds.min_x {
-                            local_bounds.min_x = wx;
-                        }
-                        if wy < local_bounds.min_y {
-                            local_bounds.min_y = wy;
-                        }
-                        if wz < local_bounds.min_z {
-                            local_bounds.min_z = wz;
-                        }
-                        if wx > local_bounds.max_x {
-                            local_bounds.max_x = wx;
-                        }
-                        if wy > local_bounds.max_y {
-                            local_bounds.max_y = wy;
-                        }
-                        if wz > local_bounds.max_z {
-                            local_bounds.max_z = wz;
-                        }
+                        // Track the actual extents in world coordinates, not
+                        // the round-tripped ones: if the headers understate
+                        // the data, the frame derived from them may not even
+                        // encode these points (the i32 casts above saturate),
+                        // and distribute rebuilds the frame from these.
+                        local_bounds.min_x = local_bounds.min_x.min(x);
+                        local_bounds.min_y = local_bounds.min_y.min(y);
+                        local_bounds.min_z = local_bounds.min_z.min(z);
+                        local_bounds.max_x = local_bounds.max_x.max(x);
+                        local_bounds.max_y = local_bounds.max_y.max(y);
+                        local_bounds.max_z = local_bounds.max_z.max(z);
                         let key = point_to_key(
                             wx,
                             wy,

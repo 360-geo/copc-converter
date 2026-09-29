@@ -143,25 +143,22 @@ pub fn write_copc(
         actual_total_points, builder.total_points
     );
 
-    // Snap the bounding box to the scale+offset grid so that the header
-    // min/max values are exactly representable as (offset + n*scale).
-    // Input files may use different offsets, so their reported bounds can
-    // be non-integer multiples of our scale — lasinfo warns about this.
-    let snap_floor = |v: f64, scale: f64, offset: f64| -> f64 {
-        ((v - offset) / scale).floor() * scale + offset
+    // The header records the points' actual extents (LAS 1.4). Distribute
+    // measured them in world coordinates; encode them exactly as the extreme
+    // points are encoded, so the header matches the stored values.
+    let to_grid = |v: f64, scale: f64, offset: f64| -> f64 {
+        ((v - offset) / scale).round() * scale + offset
     };
-    let snap_ceil =
-        |v: f64, scale: f64, offset: f64| -> f64 { ((v - offset) / scale).ceil() * scale + offset };
     let b = &builder.bounds;
     let (min_x, min_y, min_z) = (
-        snap_floor(b.min_x, scale_x, offset_x),
-        snap_floor(b.min_y, scale_y, offset_y),
-        snap_floor(b.min_z, scale_z, offset_z),
+        to_grid(b.min_x, scale_x, offset_x),
+        to_grid(b.min_y, scale_y, offset_y),
+        to_grid(b.min_z, scale_z, offset_z),
     );
     let (max_x, max_y, max_z) = (
-        snap_ceil(b.max_x, scale_x, offset_x),
-        snap_ceil(b.max_y, scale_y, offset_y),
-        snap_ceil(b.max_z, scale_z, offset_z),
+        to_grid(b.max_x, scale_x, offset_x),
+        to_grid(b.max_y, scale_y, offset_y),
+        to_grid(b.max_z, scale_z, offset_z),
     );
 
     // -----------------------------------------------------------------------

@@ -49,6 +49,26 @@ struct Entry {
     point_count: i32,
 }
 
+/// A node's bounds as copc.js (the reference reader, behind copc-validator)
+/// computes them: from the cube `center ± halfsize`, split at
+/// `min + (max − min) / 2` once per level along the key's path.
+fn node_bounds(center: [f64; 3], halfsize: f64, key: Key) -> ([f64; 3], [f64; 3]) {
+    let mut min = center.map(|c| c - halfsize);
+    let mut max = center.map(|c| c + halfsize);
+    let coords = [key.x, key.y, key.z];
+    for level in (0..key.level).rev() {
+        for a in 0..3 {
+            let mid = min[a] + (max[a] - min[a]) / 2.0;
+            if (coords[a] >> level) & 1 == 1 {
+                min[a] = mid;
+            } else {
+                max[a] = mid;
+            }
+        }
+    }
+    (min, max)
+}
+
 fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(b)
         .trim_end_matches('\0')
@@ -464,12 +484,7 @@ fn check(data: &[u8], issues: &mut Vec<String>) -> std::io::Result<()> {
             issues.push(format!("cannot set up decoder for {:?}: {err}", e.key));
             return Ok(());
         }
-        let side = 2.0 * halfsize / (1u64 << e.key.level) as f64;
-        let node_min = [
-            center[0] - halfsize + e.key.x as f64 * side,
-            center[1] - halfsize + e.key.y as f64 * side,
-            center[2] - halfsize + e.key.z as f64 * side,
-        ];
+        let (node_min, node_max) = node_bounds(center, halfsize, e.key);
         let mut last_gps = f64::MIN;
         for _ in 0..e.point_count {
             if let Err(err) = decompressor.decompress_next(&mut record) {
@@ -498,13 +513,12 @@ fn check(data: &[u8], issues: &mut Vec<String>) -> std::io::Result<()> {
                 let w = raw[a] as f64 * scale[a] + offset[a];
                 decoded_min[a] = decoded_min[a].min(w);
                 decoded_max[a] = decoded_max[a].max(w);
-                let node_max = node_min[a] + side;
-                if w < node_min[a] || w > node_max {
+                if w < node_min[a] || w > node_max[a] {
                     outside_node += 1;
                     first_outside.get_or_insert_with(|| {
                         format!(
-                            "{:?} axis {a}: {w} not in [{}, {node_max}]",
-                            e.key, node_min[a]
+                            "{:?} axis {a}: {w} not in [{}, {}]",
+                            e.key, node_min[a], node_max[a]
                         )
                     });
                 }
@@ -526,13 +540,16 @@ fn check(data: &[u8], issues: &mut Vec<String>) -> std::io::Result<()> {
     }
     if total_points > 0 {
         for a in 0..3 {
-            // Half a scale unit of slack: header bounds are snapped to the
-            // scale/offset grid.
-            let slack = scale[a] / 2.0;
-            if decoded_min[a] < hdr_min[a] - slack || decoded_max[a] > hdr_max[a] + slack {
+            // LAS 1.4: the header min/max are the actual extents. They are
+            // encoded like the points, so the extreme points match exactly;
+            // allow a hair of float slack in how either was computed.
+            let slack = scale[a] * 1e-6;
+            if (decoded_min[a] - hdr_min[a]).abs() > slack
+                || (decoded_max[a] - hdr_max[a]).abs() > slack
+            {
                 issues.push(format!(
-                    "points on axis {a} span [{}, {}], outside header bounds [{}, {}]",
-                    decoded_min[a], decoded_max[a], hdr_min[a], hdr_max[a]
+                    "header bounds on axis {a} are [{}, {}], but the points span [{}, {}]",
+                    hdr_min[a], hdr_max[a], decoded_min[a], decoded_max[a]
                 ));
             }
         }
