@@ -23,6 +23,9 @@ pub struct ValidatedInputs {
     pub num_extra_bytes: u16,
     /// COPC output point format (6, 7, or 8).
     pub point_format: u8,
+    /// Whether GPS times are adjusted standard GPS time (global encoding
+    /// bit 0), carried over from the inputs.
+    pub gps_time_standard: bool,
 }
 
 /// Returns true if the LAS point format includes GPS time.
@@ -180,6 +183,25 @@ pub fn validate(
         ));
     }
 
+    // GPS time type: week time can't be converted to standard time without
+    // the week number, so inputs must agree. Formats without GPS time write
+    // zeros, for which the type is moot; keep the standard-time default.
+    let gps_time_standard = if format_has_gps_time(first_format) {
+        let reference = results[0].gps_time_standard;
+        if let Some(i) = results
+            .iter()
+            .position(|r| r.gps_time_standard != reference)
+        {
+            return Err(Error::GpsTimeTypeMismatch {
+                file_a: input_files[0].clone(),
+                file_b: input_files[i].clone(),
+            });
+        }
+        reference
+    } else {
+        true
+    };
+
     if let Some(temporal_stride) = temporal_index {
         if temporal_stride == 0 {
             return Err(Error::InvalidTemporalStride {
@@ -224,6 +246,7 @@ pub fn validate(
         extra_bytes_vlr,
         num_extra_bytes: reference_num_extras,
         point_format,
+        gps_time_standard,
     })
 }
 
@@ -323,6 +346,7 @@ mod tests {
             extra_bytes_schema_hash: None,
             num_extra_bytes: 0,
             point_format_id: fmt,
+            gps_time_standard: true,
         }
     }
 
@@ -347,6 +371,7 @@ mod tests {
             extra_bytes_schema_hash: Some(schema_hash),
             num_extra_bytes: num_extra,
             point_format_id: fmt,
+            gps_time_standard: true,
         }
     }
 

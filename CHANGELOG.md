@@ -17,6 +17,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth then showed only the sparse ancestor levels for that region, and too
   many points ended up in the root. The merge now happens only when every
   child is a leaf. Affects files written by 0.11.0 through 0.15.0.
+- The output header's GPS Time Type (global encoding bit 0) is now taken
+  from the inputs instead of always claiming adjusted standard GPS time, so
+  GPS week-time data is no longer mislabelled.
+- The legacy point count fields are zero again, as LAS 1.4 R15 requires for
+  point formats 6 and above. 0.15.0 had started populating them.
+- Empty input (zero points) now produces a readable COPC with a zero-point
+  root node. Before, readers such as PDAL rejected it ("Root hierarchy page
+  missing root entry"). An empty file whose header bounds are ±infinity
+  (as las-rs writes them) previously hung the converter.
+- An empty tile in a multi-file input no longer stretches the octree cube
+  towards the coordinate origin. Zero-point files' header bounds are now
+  ignored.
+- Writing now fails with a clear error, instead of producing a corrupt
+  file, when a VLR payload exceeds 65,535 bytes, a node exceeds the COPC
+  hierarchy's i32 byte-size or point-count limit, or the LAZ chunk table
+  doesn't match the written nodes.
+- Log messages (including warnings, which print by default) now go to
+  stderr instead of stdout, so stdout carries only progress output and
+  `--progress json` stays valid NDJSON. They are also no longer wrapped in
+  ANSI colour codes when stderr isn't a terminal (pod logs, redirected
+  files).
+
+### Changed
+
+- Faster build stage: chunks are now sized to fit one build slot's memory
+  share. Before, most full-size chunks exceeded it and took the much slower
+  spill path whenever more than one chunk was built at a time. This also
+  lowers peak memory.
+- Inputs that mix GPS week time and adjusted standard GPS time are now
+  rejected. Week time can't be converted without the GPS week number, so
+  merging them silently produced inconsistent timestamps.
 
 ## [0.15.0] - 2026-09-15
 

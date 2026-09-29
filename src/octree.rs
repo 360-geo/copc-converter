@@ -424,7 +424,8 @@ const MAX_LEAF_POINTS: u64 = 100_000;
 /// outputs (~56 B/pt), plus HashMap growth and allocator fragmentation;
 /// 600 B/pt leaves genuine headroom over the raw ~160 B/pt sum. Used both
 /// to size build batches and to decide when a chunk must take the spilled
-/// (sub-divided) build path. Mirrors `chunking::PER_CHUNK_PEAK_BYTES_PER_POINT`.
+/// (sub-divided) build path, and (via [`max_in_memory_chunk_points`]) by the
+/// chunk planner to cap chunk size.
 const PER_CHUNK_BYTES_PER_POINT_BUILD: u64 = 600;
 
 /// Fraction of the memory budget that phase 1's live build working set may
@@ -499,6 +500,14 @@ fn build_concurrency_and_budget(memory_budget: u64, cores: usize) -> (usize, u64
     let min_per_chunk = MAX_LEAF_POINTS.saturating_mul(PER_CHUNK_BYTES_PER_POINT_BUILD);
     let per_chunk = (pool / concurrency as u64).max(min_per_chunk);
     (concurrency, per_chunk)
+}
+
+/// Largest chunk, in points, that a single build slot builds in memory
+/// without spilling — the same threshold `build_chunk_in_memory` applies.
+/// The chunk planner caps its target here.
+pub(crate) fn max_in_memory_chunk_points(memory_budget: u64, cores: usize) -> u64 {
+    let (_, per_chunk) = build_concurrency_and_budget(memory_budget, cores);
+    per_chunk / PER_CHUNK_BYTES_PER_POINT_BUILD
 }
 
 /// Grid cells per axis for LOD thinning. Matches untwine's CellCount = 128.
@@ -1116,6 +1125,9 @@ pub struct ScanResult {
     /// Must match across all files (enforced in validate).
     pub num_extra_bytes: u16,
     pub point_format_id: u8,
+    /// Global encoding bit 0: GPS times are adjusted standard GPS time
+    /// (`true`) rather than GPS week time (`false`).
+    pub gps_time_standard: bool,
 }
 
 /// Per-file CRS identity: small enough to hold once per `ScanResult` even
@@ -1246,6 +1258,8 @@ pub struct OctreeBuilder {
     pub num_extra_bytes: u16,
     /// COPC output point format (6, 7, or 8), derived from input files.
     pub point_format: u8,
+    /// GPS time type for the output header's global encoding bit 0.
+    pub gps_time_standard: bool,
     /// Chunk plan computed by `distribute` and consumed by `build_node_map`.
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
     /// Exact per-chunk point counts tallied while distribute appended
@@ -1340,6 +1354,7 @@ impl OctreeBuilder {
                         extra_bytes_schema_hash,
                         num_extra_bytes,
                         point_format_id: header.point_format().to_u8().unwrap_or(0),
+                        gps_time_standard: header.gps_time_type().is_standard(),
                     },
                     wkt_bytes,
                     extra_bytes_vlr,
@@ -1380,7 +1395,12 @@ impl OctreeBuilder {
         let mut bounds = Bounds::empty();
         let mut total_points = 0u64;
         for r in scan_results {
-            bounds.merge(&r.bounds);
+            // A file without points has meaningless header bounds (writers
+            // leave them at 0 or ±inf), so it must not shape the cube — a
+            // 0,0,0 box would stretch it to the coordinate origin.
+            if r.point_count > 0 {
+                bounds.merge(&r.bounds);
+            }
             total_points += r.point_count;
         }
 
@@ -1388,6 +1408,32 @@ impl OctreeBuilder {
         let (mut scale_x, mut scale_y, mut scale_z) = (first.scale_x, first.scale_y, first.scale_z);
         let (mut offset_x, mut offset_y, mut offset_z) =
             (first.offset_x, first.offset_y, first.offset_z);
+
+        if total_points == 0 {
+            // No points at all: anchor a minimal cube at the first file's
+            // offset so the (empty) output still has a valid frame.
+            bounds = Bounds {
+                min_x: offset_x,
+                min_y: offset_y,
+                min_z: offset_z,
+                max_x: offset_x,
+                max_y: offset_y,
+                max_z: offset_z,
+            };
+        }
+        let finite = [
+            bounds.min_x,
+            bounds.min_y,
+            bounds.min_z,
+            bounds.max_x,
+            bounds.max_y,
+            bounds.max_z,
+        ]
+        .iter()
+        .all(|v| v.is_finite());
+        if !finite {
+            anyhow::bail!("input header bounds are not finite: {bounds:?}");
+        }
 
         // Points are encoded as `i32 = round((world - offset) / scale)`. The
         // first input's offset/scale are sized for that file's bounds; when
@@ -1469,6 +1515,7 @@ impl OctreeBuilder {
             extra_bytes_vlr: validated.extra_bytes_vlr.clone(),
             num_extra_bytes,
             point_format: validated.point_format,
+            gps_time_standard: validated.gps_time_standard,
             chunked_plan: None,
             chunk_actual_counts: None,
             temp_compression: config.temp_compression,

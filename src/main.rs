@@ -403,7 +403,7 @@ impl ProgressObserver for BarProgress {
 }
 
 // ---------------------------------------------------------------------------
-// Plain progress (log-friendly text lines on stderr)
+// Plain progress (log-friendly text lines on stdout)
 // ---------------------------------------------------------------------------
 
 struct PlainProgress {
@@ -588,7 +588,12 @@ impl ProgressObserver for JsonProgress {
 }
 
 fn main() -> Result<()> {
+    // Diagnostics go to stderr so stdout carries only progress output —
+    // `--progress json` consumers parse every stdout line as JSON. Colour
+    // only when a human is watching, not in pod logs or redirected files.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),

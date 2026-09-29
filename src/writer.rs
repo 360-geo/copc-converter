@@ -29,7 +29,7 @@ use laz::{LazVlrBuilder, ParLasZipCompressor};
 use rayon::prelude::*;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 // ---------------------------------------------------------------------------
 // Point record sizes: format 6 = 30, format 7 = 36, format 8 = 38
@@ -181,6 +181,19 @@ pub fn write_copc(
             .then(a.0.y.cmp(&b.0.y))
             .then(a.0.z.cmp(&b.0.z))
     });
+    // Readers start traversal at the root entry, so an empty input still
+    // needs one (as a zero-point node) for the file to be readable.
+    if ordered.is_empty() {
+        ordered.push((
+            VoxelKey {
+                level: 0,
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            0,
+        ));
+    }
 
     debug!(
         "Writing {} nodes, {} points",
@@ -202,7 +215,10 @@ pub fn write_copc(
 
     w.write_all(b"LASF")?;
     w.write_u16::<LittleEndian>(0)?;
-    w.write_u16::<LittleEndian>(0x0001 | 0x0010)?; // GPS standard + WKT
+    // Global encoding: bit 0 = GPS time type (carried over from the inputs),
+    // bit 4 = CRS is WKT (required for point formats 6+).
+    let gps_time_bit: u16 = if builder.gps_time_standard { 0x0001 } else { 0 };
+    w.write_u16::<LittleEndian>(gps_time_bit | 0x0010)?;
     w.write_all(&[0u8; 16])?; // project ID (GUID)
     w.write_u8(1)?; // version major
     w.write_u8(4)?; // version minor
@@ -226,7 +242,10 @@ pub fn write_copc(
     w.write_u32::<LittleEndian>(num_vlrs)?; // number of VLRs
     w.write_u8(128 | point_format)?; // LAZ compressed point format
     w.write_u16::<LittleEndian>(point_record_len)?;
-    w.write_u32::<LittleEndian>(0)?; // legacy point count
+    // Legacy point count + 5 legacy by-return counts. LAS 1.4 R15 requires
+    // these to be zero for point data record formats 6 and above, which is
+    // all COPC can hold; the real counts go in the 1.4 fields below.
+    w.write_u32::<LittleEndian>(0)?;
     for _ in 0..5 {
         w.write_u32::<LittleEndian>(0)?;
     }
@@ -496,8 +515,8 @@ pub fn write_copc(
     // -----------------------------------------------------------------------
     let evlr_start = end_pos;
     if chunk_table.len() != data_keys.len() {
-        error!(
-            "Chunk table has {} entries but we compressed {} chunks!",
+        anyhow::bail!(
+            "chunk table has {} entries but {} chunks were compressed",
             chunk_table.len(),
             data_keys.len()
         );
@@ -516,8 +535,15 @@ pub fn write_copc(
             // Empty ancestor: present in hierarchy for tree traversal but has no chunk.
             chunk_info.push((*key, 0, 0, 0));
         } else {
+            // Hierarchy entries store byte size and point count as i32.
             let byte_size = chunk_table[chunk_index].byte_count;
-            chunk_info.push((*key, current_offset, byte_size as i32, *pc as i32));
+            let entry_bytes = i32::try_from(byte_size).map_err(|_| {
+                anyhow::anyhow!("node {key:?} is {byte_size} bytes, exceeding the COPC i32 limit")
+            })?;
+            let entry_points = i32::try_from(*pc).map_err(|_| {
+                anyhow::anyhow!("node {key:?} has {pc} points, exceeding the COPC i32 limit")
+            })?;
+            chunk_info.push((*key, current_offset, entry_bytes, entry_points));
             current_offset += byte_size;
             chunk_index += 1;
         }
@@ -596,16 +622,6 @@ pub fn write_copc(
         file.write_all(&count.to_le_bytes())?;
     }
 
-    // Patch the legacy (LAS 1.0–1.3) point counts at header offset 107:
-    // u32 total + 5 × u32 by return. Populated only when they fit, as
-    // untwine and PDAL do, so pre-1.4 readers still see the counts.
-    let (legacy_total, legacy_returns) = legacy_point_counts(actual_total_points, &return_counts);
-    file.seek(SeekFrom::Start(107))?;
-    file.write_all(&legacy_total.to_le_bytes())?;
-    for &count in &legacy_returns {
-        file.write_all(&count.to_le_bytes())?;
-    }
-
     info!("COPC file written: {:?}", output_path);
     Ok(())
 }
@@ -643,22 +659,6 @@ fn civil_date_from_unix_days(days: i64) -> (u16, u16) {
         doy += 1;
     }
     (doy as u16, year as u16)
-}
-
-/// Legacy `u32` point counts for the LAS 1.4 header (offset 107). The spec
-/// requires zeros whenever the true counts do not fit in `u32`; a return
-/// number above 5 also has no legacy slot, so the whole block is zeroed
-/// rather than published as an inconsistent partial sum.
-fn legacy_point_counts(total: u64, by_return: &[u64; 15]) -> (u32, [u32; 5]) {
-    let fits = total <= u32::MAX as u64 && by_return[5..].iter().all(|&c| c == 0);
-    if !fits {
-        return (0, [0; 5]);
-    }
-    let mut legacy = [0u32; 5];
-    for (dst, &src) in legacy.iter_mut().zip(&by_return[..5]) {
-        *dst = src as u32;
-    }
-    (total as u32, legacy)
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,32 +1594,5 @@ mod tests {
         assert_eq!(civil_date_from_unix_days(20_148), (60, 2025));
         // 2024-03-01 = 19_783 days since epoch, day 61 in a leap year
         assert_eq!(civil_date_from_unix_days(19_783), (61, 2024));
-    }
-
-    #[test]
-    fn legacy_counts_populated_when_they_fit() {
-        let mut by_return = [0u64; 15];
-        by_return[0] = 10;
-        by_return[1] = 5;
-        by_return[4] = 1;
-        assert_eq!(legacy_point_counts(16, &by_return), (16, [10, 5, 0, 0, 1]));
-    }
-
-    #[test]
-    fn legacy_counts_zeroed_when_total_overflows_u32() {
-        let mut by_return = [0u64; 15];
-        by_return[0] = u32::MAX as u64 + 1;
-        assert_eq!(
-            legacy_point_counts(u32::MAX as u64 + 1, &by_return),
-            (0, [0; 5])
-        );
-    }
-
-    #[test]
-    fn legacy_counts_zeroed_when_returns_above_five_exist() {
-        let mut by_return = [0u64; 15];
-        by_return[0] = 3;
-        by_return[6] = 1;
-        assert_eq!(legacy_point_counts(4, &by_return), (0, [0; 5]));
     }
 }
