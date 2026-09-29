@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sequentially instead of loading a whole chunk per reader.
   - Build spills of widely spread data, where the split-depth search could
     allocate an entry per occupied cell.
+- Inputs whose LAS header bounds understate the data no longer produce
+  points outside their octree nodes (and, when far off, outside the cube).
+  The octree frame is now fitted to the actual point extents measured while
+  counting; only inputs with inaccurate headers pay for a second counting
+  pass. Overstated header bounds no longer inflate the cube either.
+- The output header's min/max are now the points' actual extents, as
+  LAS 1.4 requires. Before, they were the input headers' bounds rounded
+  outward.
+- Points lying exactly on a node boundary are now assigned with the same
+  floating-point steps that copc.js (the reference reader, behind
+  copc-validator) uses to compute node bounds. Before, such a point could
+  land about 1e-14 m outside its node's bounds.
 
 ### Changed
 
