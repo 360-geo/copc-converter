@@ -66,3 +66,51 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run cargo test
         run: cargo test --workspace --features tools
+
+  external-validators:
+    name: External COPC Validators
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v6
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Install PDAL
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pdal
+      - name: Build release binary
+        run: cargo build --release
+      - name: Check converted fixtures with PDAL and copc-validator
+        run: scripts/ci/external-validators.sh
+
+  memory-limits:
+    name: Memory Limits
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      # Shared by both steps so the synthetic inputs are generated once.
+      WORK: ${{ runner.temp }}/memtest
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v6
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Install PDAL
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pdal
+      - name: Build release binary
+        run: cargo build --release
+      - name: Stay within container memory limits
+        run: scripts/ci/memory-limits.sh gating
+      - name: Known memory issues (report only)
+        run: scripts/ci/memory-limits.sh known-issues

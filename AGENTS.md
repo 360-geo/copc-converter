@@ -68,6 +68,16 @@ cargo test           # run tests
 
 CI runs all three on every push to `master` and on PRs. All must pass.
 
+Every integration-test conversion goes through `tests/common` (`assert_valid_copc`), which decodes each chunk and checks the output against COPC 1.0 / LAS 1.4 R15. The `validator_catches_*` tests keep it honest. CI also runs two jobs that need external tools:
+
+```sh
+scripts/ci/external-validators.sh          # PDAL (full decode) + copc-validator --deep on converted fixtures; needs pdal, jq, npx
+scripts/ci/memory-limits.sh gating         # converts synthetic inputs in 1 GB / 4-CPU Docker containers; any OOM kill fails
+scripts/ci/memory-limits.sh known-issues   # inputs known to exceed the limit today; reported, never fails
+```
+
+`memory-limits.sh` needs a Linux binary (`BIN=`) plus Docker and PDAL. On macOS, build one with `docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target/linux-docker -e RUSTFLAGS="" rust:1 cargo build --release`. Once a memory fix lands, move its case from `known-issues` to `gating`.
+
 ## Releasing
 
 1. Move `## [Unreleased]` entries in `CHANGELOG.md` into a new `## [X.Y.Z] - YYYY-MM-DD` section and update the link references at the bottom. Leave an empty `## [Unreleased]` heading at the top for the next cycle.

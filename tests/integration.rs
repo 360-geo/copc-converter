@@ -8,6 +8,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Parsed COPC structures (read-only, for test assertions)
 // ---------------------------------------------------------------------------
@@ -331,6 +333,8 @@ fn run_converter_with_args(input: &Path, output: &Path, extra_args: &[&str]) {
         .status()
         .expect("failed to run copc_converter");
     assert!(status.success(), "converter exited with error");
+    // Every conversion in the suite must produce a spec-valid file.
+    common::assert_valid_copc(output);
 }
 
 fn read_file(path: &Path) -> Vec<u8> {
@@ -648,6 +652,7 @@ fn json_progress_stdout_is_pure_ndjson() {
         !stderr.contains('\u{1b}'),
         "no ANSI colour codes when stderr is not a terminal"
     );
+    common::assert_valid_copc(output);
     let _ = std::fs::remove_file(output);
 }
 
@@ -1890,4 +1895,115 @@ fn extra_bytes_schema_mismatch_reports_all_differences() {
         canonical_idx.unwrap() < mismatched_idx.unwrap(),
         "canonical file must be named first (as the reference), got:\n{combined}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Validator self-tests: the COPC validator must reject corrupted files,
+// otherwise its passing verdict on every conversion means nothing.
+// ---------------------------------------------------------------------------
+
+/// Apply `corrupt` to a fresh valid conversion and assert the validator
+/// reports an issue containing `expected`.
+fn assert_validator_catches(label: &str, expected: &str, corrupt: impl FnOnce(&mut Vec<u8>)) {
+    let output = std::path::PathBuf::from(format!("tests/data/test_validator_{label}.copc.laz"));
+    run_converter(Path::new("tests/data/input.laz"), &output);
+    let mut data = read_file(&output);
+    let _ = std::fs::remove_file(&output);
+    corrupt(&mut data);
+    let issues = common::validate_copc_bytes(&data);
+    assert!(
+        issues.iter().any(|i| i.contains(expected)),
+        "{label}: expected an issue containing {expected:?}, got {issues:?}"
+    );
+}
+
+/// Byte position of the root hierarchy page, from the copc info VLR.
+fn root_page_offset(data: &[u8]) -> usize {
+    u64::from_le_bytes(data[429 + 40..429 + 48].try_into().unwrap()) as usize
+}
+
+#[test]
+fn validator_catches_nonzero_legacy_counts() {
+    assert_validator_catches("legacy", "legacy point counts", |d| {
+        d[107..111].copy_from_slice(&1u32.to_le_bytes());
+    });
+}
+
+#[test]
+fn validator_catches_missing_wkt_bit() {
+    assert_validator_catches("wkt_bit", "WKT bit", |d| d[6] &= !0x10);
+}
+
+#[test]
+fn validator_catches_points_outside_their_node() {
+    // Shrinking the cube leaves points outside the nodes they're stored in.
+    assert_validator_catches("halfsize", "outside their node", |d| {
+        let pos = 429 + 24;
+        let halfsize = f64::from_le_bytes(d[pos..pos + 8].try_into().unwrap());
+        d[pos..pos + 8].copy_from_slice(&(halfsize * 0.9).to_le_bytes());
+    });
+}
+
+#[test]
+fn validator_catches_hierarchy_count_mismatch() {
+    // Root entry's point count (bytes 28..32 of the first 32-byte entry).
+    assert_validator_catches("point_count", "chunk table says", |d| {
+        let pos = root_page_offset(d) + 28;
+        let count = i32::from_le_bytes(d[pos..pos + 4].try_into().unwrap());
+        d[pos..pos + 4].copy_from_slice(&(count + 1).to_le_bytes());
+    });
+}
+
+#[test]
+fn validator_catches_missing_root_entry() {
+    // Retag the root entry as level 1: its children lose their ancestor.
+    assert_validator_catches("root_key", "no root entry", |d| {
+        let pos = root_page_offset(d);
+        d[pos..pos + 4].copy_from_slice(&1i32.to_le_bytes());
+    });
+}
+
+#[test]
+fn validator_catches_wrong_gps_range() {
+    assert_validator_catches("gps", "GPS range", |d| {
+        let pos = 429 + 56;
+        d[pos..pos + 8].copy_from_slice(&(-1.0f64).to_le_bytes());
+    });
+}
+
+#[test]
+#[ignore = "known issue: the octree cube is built from input header bounds, so a \
+            header that understates the data puts points outside their nodes"]
+fn understated_header_bounds_still_produce_valid_copc() {
+    use las::point::Format;
+    use las::{Builder, Point, Writer};
+
+    let input = Path::new("tests/data/test_understated_bounds.las");
+    let output = Path::new("tests/data/test_understated_bounds.copc.laz");
+    let mut builder = Builder::from((1, 4));
+    builder.point_format = Format::new(6).unwrap();
+    let mut writer = Writer::from_path(input, builder.into_header().unwrap()).unwrap();
+    for i in 0..50_000u32 {
+        writer
+            .write_point(Point {
+                x: 1000.0 + f64::from(i % 250) * 0.4,
+                y: 2000.0 + f64::from(i / 250) * 0.5,
+                z: f64::from(i % 7),
+                return_number: 1,
+                number_of_returns: 1,
+                gps_time: Some(f64::from(i)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+    // Understate max_x (header offset 179) by half the true x extent.
+    let mut bytes = std::fs::read(input).unwrap();
+    bytes[179..187].copy_from_slice(&1050.0f64.to_le_bytes());
+    std::fs::write(input, bytes).unwrap();
+
+    // run_converter validates the output.
+    run_converter(input, output);
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
 }
