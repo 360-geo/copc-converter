@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-29
+
 ### Fixed
 
 - Level of detail no longer renders as patchy, grid-like low-density
@@ -94,6 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inputs that mix GPS week time and adjusted standard GPS time are now
   rejected. Week time can't be converted without the GPS week number, so
   merging them silently produced inconsistent timestamps.
+- Output is no longer byte-identical to 0.15.0 for the same input. The
+  LOD fix, smaller build chunks and exact-boundary assignment change which
+  points land in which node, and the header now carries the actual extents,
+  zero legacy counts and the input's GPS Time Type. Point data and counts
+  are unchanged.
 
 ## [0.15.0] - 2026-09-15
 
@@ -315,7 +322,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validation enforces an identical VLR and uniform `num_extra_bytes` across
   inputs.
 
-[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/360-geo/copc-converter/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/360-geo/copc-converter/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/360-geo/copc-converter/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/360-geo/copc-converter/compare/v0.12.0...v0.13.0
