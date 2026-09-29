@@ -50,6 +50,33 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --workspace --features tools -- -D warnings
 
+  # Release binaries are also built for macOS and Windows, whose
+  # platform-specific code (e.g. memory detection) Linux never compiles.
+  # Lint it here rather than discovering breakage at release time. Default
+  # features only, as release builds use.
+  clippy-release-platforms:
+    name: Run Clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v6
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: Run cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   test:
     name: Run Tests
     runs-on: ubuntu-latest
