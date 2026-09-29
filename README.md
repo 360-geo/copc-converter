@@ -10,10 +10,12 @@ A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [CO
 - Produces spec-compliant COPC 1.0 files (LAS 1.4, point format 6, 7, or 8 — automatically chosen from input)
 - Merges multiple input files into a single COPC output
 - Out-of-core processing with a configurable memory budget — handles datasets larger than RAM
+- Stays within its memory limit even on adversarial input (millions of coincident points, volumetric data, very large Extra Bytes, LAZ files written as one huge chunk); in a container the limit is detected from its cgroup
 - Parallel reading, octree construction, and LAZ compression via rayon
 - Preserves WKT and GeoTIFF CRS from input files (GeoTIFF EPSG codes are translated to WKT for the output)
 - Preserves LAS Extra Bytes (per-point user-defined attributes such as classification probabilities, intensity ratios, or producer-specific labels) end-to-end, with per-file min/max stats merged honestly into the output VLR
 - Optional temporal index for GPS-time-based filtering ([spec](https://github.com/360-geo/copc/blob/master/copc-temporal/docs/temporal-index-spec.md))
+- Output checked in CI: every test conversion is decoded and validated against the COPC 1.0 / LAS 1.4 specs, and also read by PDAL and [copc-validator](https://github.com/hobuinc/copc-validator)
 
 ## Installation
 
@@ -39,7 +41,11 @@ This installs the `copc_converter` binary to `~/.cargo/bin/`, which should be on
 
 Download pre-built binaries from the [GitHub releases](https://github.com/360-geo/copc-converter/releases) page. These are built for broad compatibility and run on any machine.
 
-For best performance, prefer installing from source via `cargo install` — this automatically compiles with `target-cpu=native`, optimizing for your specific CPU's instruction set (AVX2, NEON, etc.).
+For best performance, compile for your own CPU's instruction set (AVX2, NEON, etc.). Installing from a clone with `cargo install --path .` does this automatically: the repository's `.cargo/config.toml` sets `target-cpu=native`. `cargo install copc_converter` from crates.io ignores that file, so set the flag yourself:
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo install copc_converter
+```
 
 ## Usage
 
@@ -55,9 +61,9 @@ copc_converter ./tiles/ merged.copc.laz
 
 | Flag | Description | Default |
 |---|---|---|
-| `--memory-limit` | Max memory budget (`16G`, `16Gi`, `4096M`, `512Mi`, etc.; binary units) | tightest cgroup limit (`memory.max`/`memory.high`, v1 `memory.limit_in_bytes`), capped at system RAM |
+| `--memory-limit` | Memory limit to stay within (`16G`, `16Gi`, `4096M`, `512Mi`, etc.; binary units). The converter budgets 75% of it, leaving headroom | tightest cgroup limit (`memory.max`/`memory.high`, v1 `memory.limit_in_bytes`), capped at system RAM |
 | `--threads` | Max parallel threads | all cores |
-| `--temp-dir` | Directory for intermediate files | system temp |
+| `--temp-dir` | Directory for intermediate files. Use disk-backed storage: on a RAM-backed filesystem (tmpfs, a Kubernetes `emptyDir` with `medium: Memory`) scratch files count against the memory limit, and the converter warns | system temp |
 | `--temporal-index` | Set the sampling stride for writing a temporal index EVLR for time-based queries (every n-th point). Good value (depending on density): 1000 | off |
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
 | `--temp-compression` | Compress scratch temp files: `none` or `lz4` | `none` |
@@ -70,32 +76,35 @@ shape the temp directory's footprint:
 
 - **`--temp-compression`** controls the on-disk encoding of each batch of
   `RawPoint` records. `none` (default) writes raw bytes; `lz4` wraps each
-  batch in a self-contained LZ4 frame. LZ4 compresses at >1 GB/s per core
-  so CPU cost is modest, and on network filesystems (EFS/NFS) it often
-  reduces wall time because the bottleneck shifts from I/O to compute.
+  batch in a self-contained LZ4 frame. On fast local disks it costs wall
+  time (see below); on network filesystems (EFS/NFS) it can pay for itself
+  because the bottleneck shifts from I/O to compute.
 - **`--node-storage`** controls the filesystem layout of per-node point
   data during build. `files` (default) writes a separate file per octree
   node; on very large inputs node counts reach the hundred-thousands,
   which can exhaust inode budgets on shared scratch filesystems.
   `packed` writes all node data into a handful of append-only pack files
   (one per worker thread) with an in-memory key→offset index,
-  independent of node count.
+  independent of node count. The distribute stage's per-chunk scratch
+  files (one per chunk; ~1,400 in the measurement below) remain either way.
 
 Both flags can be combined freely.
 
-**Measured on a 168M-point / 701 MB LAZ input, 32 GB budget:**
+**Measured on a 750M-point / 5.0 GB LAZ input** (three overlapping mobile-mapping
+recordings, point format 7), 32 GB limit (24 GB budget), 10-core Apple M1 Pro with local NVMe:
 
-| `--node-storage` | `--temp-compression` | wall  | peak inodes | peak temp bytes | output   |
-|------------------|----------------------|-------|-------------|-----------------|----------|
-| files            | none                 | 61.7s | 6 716       | 12 161 MB       | 1028 MB  |
-| files            | lz4                  | 71.3s | 6 716       |  5 848 MB       | 1028 MB  |
-| packed           | none                 | 66.7s | 76          | 11 894 MB       | 1028 MB  |
-| packed           | lz4                  | 73.8s | 76          |  5 849 MB       | 1028 MB  |
+| `--node-storage` | `--temp-compression` | wall   | peak inodes | peak temp bytes | output   |
+|------------------|----------------------|--------|-------------|-----------------|----------|
+| files            | none                 | 196.8s | 31 715      | 28 358 MB       | 5174 MB  |
+| files            | lz4                  | 246.7s | 31 715      | 15 299 MB       | 5174 MB  |
+| packed           | none                 | 197.8s | 1 430       | 29 701 MB       | 5174 MB  |
+| packed           | lz4                  | 244.6s | 1 428       | 15 700 MB       | 5174 MB  |
 
-LZ4 cuts peak temp bytes by ~52% regardless of storage mode; packed cuts
-peak inodes by ~99% regardless of compression. Output is byte-identical
-across all four combinations (within hash-order noise of a few KB). Dead
-space from pack-file overwrites was not observable on this workload.
+LZ4 cuts peak temp bytes by ~46% regardless of storage mode, at ~25% more
+wall time on this local disk; packed cuts peak inodes by ~95% regardless
+of compression (what remains are the per-chunk scratch files). Output is
+byte-identical across all four combinations. Pack-file overwrites leave
+~5% dead space on this workload.
 
 Use `packed` when the scratch filesystem has an inode limit, `lz4` when
 it is space-constrained, and both together for the most disk-friendly
@@ -172,12 +181,12 @@ Prints chunk count, target size, grid resolution, and per-chunk size distributio
 
 ## How it works
 
-1. **Scan** — reads headers from all input files in parallel to determine bounds, point count, point format, CRS (WKT or GeoTIFF), and any LAS Extra Bytes schema.
-2. **Validate** — checks that all input files share the same CRS, point format, and Extra Bytes schema, and selects the appropriate COPC output format (6, 7, or 8). Per-file Extra Bytes min/max stats are merged into a single canonical VLR at this stage.
-3. **Count** — first full pass over the input: populates an occupancy grid used by the chunk planner to carve the dataset into thousands of roughly equal-sized chunks via counting sort.
+1. **Scan** — reads headers from all input files in parallel to determine point count, point format, CRS (WKT or GeoTIFF), GPS time type, any LAS Extra Bytes schema, and provisional bounds.
+2. **Validate** — checks that all input files share the same CRS, point format, GPS time type, and Extra Bytes schema, and selects the appropriate COPC output format (6, 7, or 8). Per-file Extra Bytes min/max stats are merged into a single canonical VLR at this stage.
+3. **Count** — first full pass over the input: populates an occupancy grid used by the chunk planner to carve the dataset into chunks sized to be built in memory, and measures the points' actual extents. If the input headers turn out to be inaccurate, the octree is refitted to the actual extents and the pass is repeated.
 4. **Distribute** — second full pass over the input: streams every point (including any trailing Extra Bytes) into its chunk's scratch file on disk, bounded by the configured memory budget.
-5. **Build** — each chunk's sub-octree is built independently in memory in parallel, then merged at coarse levels up to a single global root, thinning points at each level to produce multi-resolution LODs.
-6. **Write** — encodes and compresses nodes in parallel into a single COPC file with a hierarchy EVLR for spatial indexing.
+5. **Build** — each chunk's sub-octree is built in parallel, then merged at coarse levels up to a single global root, thinning points at each level to produce multi-resolution LODs. Data too dense to split within the budget (e.g. coincident points) is streamed rather than loaded, and the merge samples one child node at a time.
+6. **Write** — sorts each node's points by GPS time, compresses nodes in parallel in batches sized to the memory budget, and writes a single COPC file with a paged hierarchy EVLR for spatial indexing. The header records the points' actual extents.
 
 ## Acknowledgments
 
