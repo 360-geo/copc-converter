@@ -8,6 +8,11 @@
 //! Usage:
 //!   preview_chunking <input_file_or_dir> [--memory-limit 16G] [--chunk-target 5M]
 
+// Shared with the main binary; this tool doesn't use every function.
+#[allow(dead_code)]
+#[path = "../memory_limit.rs"]
+mod memory_limit;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use copc_converter::{
@@ -53,45 +58,6 @@ struct Args {
     threads: Option<usize>,
 }
 
-/// Detect available memory from cgroup limits (v2 then v1) or system RAM.
-fn detect_available_memory() -> u64 {
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        let s = s.trim();
-        if s != "max"
-            && let Ok(v) = s.parse::<u64>()
-        {
-            return v;
-        }
-    }
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        && let Ok(v) = s.trim().parse::<u64>()
-        && v < 0x7FFF_FFFF_FFFF_F000
-    {
-        return v;
-    }
-    #[cfg(target_os = "linux")]
-    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:")
-                && let Ok(kb) = rest.trim().trim_end_matches(" kB").trim().parse::<u64>()
-            {
-                return kb * 1024;
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-        if let Ok(output) = Command::new("sysctl").arg("-n").arg("hw.memsize").output()
-            && let Ok(s) = std::str::from_utf8(&output.stdout)
-            && let Ok(v) = s.trim().parse::<u64>()
-        {
-            return v;
-        }
-    }
-    16 * 1024 * 1024 * 1024
-}
-
 /// Parse "10M", "1G", "500K", or a plain integer.
 fn parse_count(s: &str) -> Result<u64> {
     let s = s.trim();
@@ -107,24 +73,6 @@ fn parse_count(s: &str) -> Result<u64> {
     let value: f64 = num_part
         .parse()
         .with_context(|| format!("Invalid count: {s:?}"))?;
-    Ok((value * multiplier as f64) as u64)
-}
-
-/// Parse a human-readable memory size into bytes.
-fn parse_memory_limit(s: &str) -> Result<u64> {
-    let s = s.trim();
-    let (num_part, multiplier) = if let Some(n) = s.strip_suffix(['G', 'g']) {
-        (n.trim(), 1024u64 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix(['M', 'm']) {
-        (n.trim(), 1024u64 * 1024)
-    } else if let Some(n) = s.strip_suffix(['K', 'k']) {
-        (n.trim(), 1024u64)
-    } else {
-        (s, 1u64)
-    };
-    let value: f64 = num_part
-        .parse()
-        .with_context(|| format!("Invalid memory limit: {s:?}"))?;
     Ok((value * multiplier as f64) as u64)
 }
 
@@ -377,20 +325,21 @@ fn main() -> Result<()> {
     let input_files = collect_input_files(args.input)?;
     eprintln!("Found {} input file(s)", input_files.len());
 
-    let raw_limit = match &args.memory_limit {
-        Some(s) => parse_memory_limit(s)?,
-        None => detect_available_memory(),
+    let (raw_limit, limit_source) = match &args.memory_limit {
+        Some(s) => (memory_limit::parse_size(s)?, "user-specified".to_string()),
+        None => {
+            let detected = memory_limit::detect();
+            (
+                detected.bytes,
+                format!("auto-detected: {}", detected.source),
+            )
+        }
     };
     let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
     eprintln!(
-        "Memory: {} limit, {} budget ({})",
+        "Memory: {} limit, {} budget ({limit_source})",
         human_bytes(raw_limit),
         human_bytes(memory_budget),
-        if args.memory_limit.is_some() {
-            "user-specified"
-        } else {
-            "auto-detected"
-        },
     );
 
     let chunk_target_override = match &args.chunk_target {

@@ -55,7 +55,7 @@ copc_converter ./tiles/ merged.copc.laz
 
 | Flag | Description | Default |
 |---|---|---|
-| `--memory-limit` | Max memory budget (`16G`, `4096M`, etc.) | auto-detected |
+| `--memory-limit` | Max memory budget (`16G`, `16Gi`, `4096M`, `512Mi`, etc.; binary units) | tightest cgroup limit (`memory.max`/`memory.high`, v1 `memory.limit_in_bytes`), capped at system RAM |
 | `--threads` | Max parallel threads | all cores |
 | `--temp-dir` | Directory for intermediate files | system temp |
 | `--temporal-index` | Set the sampling stride for writing a temporal index EVLR for time-based queries (every n-th point). Good value (depending on density): 1000 | off |
