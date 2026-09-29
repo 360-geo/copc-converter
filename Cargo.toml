@@ -71,5 +71,14 @@ libc = "0.2"
 lto = "thin"
 codegen-units = 1
 
+# LAZ (de)compression dominates the debug binary the integration tests run
+# and the test suite's own COPC validation; optimising just these crates
+# keeps `cargo test` fast without slowing incremental builds of our code.
+[profile.dev.package.laz]
+opt-level = 3
+
+[profile.dev.package.las]
+opt-level = 3
+
 [dev-dependencies]
 byteorder = "1.5"
