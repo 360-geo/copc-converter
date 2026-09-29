@@ -1,4 +1,5 @@
 use crate::PipelineConfig;
+use crate::TempCompression;
 /// Write a COPC 1.0 file.
 ///
 /// Layout
@@ -14,18 +15,19 @@ use crate::PipelineConfig;
 ///  [LAZ chunk table]          variable (appended after data, referenced by the i64 above)
 ///  [copc hierarchy EVLR]      60 + n*32 bytes
 ///
-/// Uses ParLasZipCompressor for parallel chunk compression via rayon.
-/// Nodes are read from temp files and encoded in parallel batches, then
-/// compressed in parallel via compress_chunks(). The chunk table is read
-/// back from the file to recover per-chunk byte sizes for the hierarchy.
+/// Nodes are read from temp files, then encoded and LAZ-compressed in
+/// parallel windows sized to the memory budget; a node too large for a
+/// window is sorted externally and streamed into its chunk.
 use crate::copc_types::{
     CopcInfo, EVLR_HEADER_SIZE, HierarchyEntry, TEMPORAL_HEADER_SIZE, TemporalIndexEntry,
     TemporalIndexHeader, TemporalPagePointer, VoxelKey, write_evlr, write_vlr,
 };
-use crate::octree::{GRID_CELLS_PER_AXIS, OctreeBuilder, RawPoint};
+use crate::octree::{GRID_CELLS_PER_AXIS, OctreeBuilder, RawPoint, write_temp_batch};
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
-use laz::{LazVlrBuilder, ParLasZipCompressor};
+use laz::laszip::{ChunkTable, ChunkTableEntry};
+use laz::record::{LayeredPointRecordCompressor, RecordCompressor};
+use laz::{LazVlr, LazVlrBuilder};
 use rayon::prelude::*;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -78,9 +80,8 @@ fn encode_point(rp: &RawPoint, fmt: u8, buf: &mut Vec<u8>) {
 
 /// Write a complete COPC file to `output_path`.
 ///
-/// Reads nodes from temp files and compresses them in parallel using
-/// ParLasZipCompressor::compress_chunks(). Encoding and compression
-/// happen across all available cores.
+/// Reads nodes from temp files and compresses them in parallel windows
+/// across all available cores.
 pub fn write_copc(
     output_path: &Path,
     builder: &OctreeBuilder,
@@ -320,207 +321,156 @@ pub fn write_copc(
     w.flush()?;
 
     // -----------------------------------------------------------------------
-    // Parallel compression via ParLasZipCompressor
+    // Point data: one LAZ chunk per node
+    //
+    // Chunks are compressed here rather than through laz's
+    // ParLasZipCompressor so each node can take the path its size needs:
+    // nodes that fit the window are encoded and compressed in parallel, and
+    // a node larger than the window is GPS-sorted externally and streamed
+    // into the compressor (see `write_oversized_node` for the one limit the
+    // LAZ format imposes there).
     // -----------------------------------------------------------------------
-    let laz_vlr_for_compressor = LazVlrBuilder::default()
-        .with_point_format(point_format, num_extra_bytes)
-        .context("LazVlrBuilder (compressor)")?
-        .with_variable_chunk_size()
-        .build();
 
-    let mut compressor = ParLasZipCompressor::new(w, laz_vlr_for_compressor)
-        .map_err(|e| anyhow::anyhow!("ParLasZipCompressor::new: {e}"))?;
-
-    compressor
-        .reserve_offset_to_chunk_table()
-        .context("reserve_offset_to_chunk_table")?;
+    // LAZ convention: point data opens with the byte offset of the chunk
+    // table, patched in once the table's position is known.
+    w.write_i64::<LittleEndian>(-1)?;
 
     // Only encode nodes that have actual points (empty ancestor nodes are
     // included in the hierarchy EVLR with offset=0/byte_size=0 but not compressed).
     let data_keys: Vec<(VoxelKey, usize)> =
         ordered.iter().filter(|(_, c)| *c > 0).copied().collect();
 
-    // Writer memory model.
-    //
-    // Nodes must be compressed in `data_keys` order (the chunk table records
-    // each chunk's byte size in order, which the hierarchy then references), so
-    // the work is sequential at the window level. Within a window we encode in
-    // parallel, then hand the window to laz in order.
-    //
-    // Peak memory is bounded by a *fixed* window size in points — NOT by the
-    // memory budget. Sizing the window to the budget would let the window's
-    // encoded `Vec<Vec<u8>>` alone reach a large fraction of the budget and,
-    // together with the parallel encoders' transient read buffers and laz's
-    // compressor working set, exceed it. A fixed window makes the writer's
-    // peak a small constant (a few hundred MB) regardless of budget or node
-    // sizes, so the writer can never be the thing that OOMs.
-    //
-    // Per window the resident set is the window's transient `Vec<RawPoint>`
-    // read buffers (freed inside each encode closure) + the window's encoded
-    // bytes (`window_points × point_record_len`) + laz's in/out working set
-    // during `compress_chunks`. With the cap below that is on the order of a
-    // few hundred MB. The window holds many nodes, so the parallel encode still
-    // saturates all cores.
-    const WRITER_WINDOW_POINTS: u64 = 4_000_000;
-
+    let window_points =
+        writer_window_points(config.memory_budget, point_record_len, num_extra_bytes);
     debug!(
         "Encoding {} data nodes ({} empty ancestors), window {} points",
         data_keys.len(),
         ordered.len() - data_keys.len(),
-        WRITER_WINDOW_POINTS,
+        window_points,
     );
 
-    let mut return_counts = [0u64; 15];
-    let mut gpstime_min = f64::MAX;
-    let mut gpstime_max = f64::MIN;
-    let mut temporal_entries: Vec<TemporalIndexEntry> = Vec::new();
     let temporal_index = config.temporal_index.map(|ts| ts as usize);
+    let mut totals = NodeStats::new();
+    let mut temporal_entries: Vec<TemporalIndexEntry> = Vec::new();
+    let mut chunk_table = ChunkTable::with_capacity(data_keys.len());
 
     let mut win_start = 0;
     while win_start < data_keys.len() {
-        // Pack a window up to the fixed point cap (always ≥ 1 node so a single
-        // oversized node still makes progress).
+        let (first_key, first_count) = data_keys[win_start];
+        if first_count as u64 > window_points {
+            // A node too large to hold: external sort, streamed compression.
+            let start = w.stream_position()?;
+            let stats = write_oversized_node(
+                &mut w,
+                builder,
+                &first_key,
+                first_count,
+                window_points as usize,
+                ((config.memory_budget as f64 * WRITER_BUDGET_FRACTION) as u64)
+                    .max(MIN_OVERSIZED_CHUNK_BYTES),
+                point_format,
+                &laz_vlr,
+                temporal_index,
+            )?;
+            let byte_count = w.stream_position()? - start;
+            chunk_table.push(ChunkTableEntry {
+                point_count: first_count as u64,
+                byte_count,
+            });
+            totals.merge(&stats);
+            if temporal_index.is_some() {
+                temporal_entries.push(TemporalIndexEntry {
+                    key: first_key,
+                    samples: stats.samples,
+                });
+            }
+            win_start += 1;
+            config.report(crate::ProgressEvent::StageProgress {
+                done: win_start as u64,
+            });
+            continue;
+        }
+
+        // Pack consecutive nodes that fit into one window.
         let mut win_points: u64 = 0;
         let mut win_end = win_start;
         while win_end < data_keys.len() {
             let node_points = data_keys[win_end].1 as u64;
-            if win_end > win_start && win_points + node_points > WRITER_WINDOW_POINTS {
+            if node_points > window_points
+                || (win_end > win_start && win_points + node_points > window_points)
+            {
                 break;
             }
             win_points += node_points;
             win_end += 1;
         }
-
         let window = &data_keys[win_start..win_end];
 
-        // Encode the window's nodes in parallel. Each closure reads a node's
-        // points, sorts by GPS time, accumulates per-node stats, and produces
-        // the encoded byte buffer. The `Vec<RawPoint>` read buffer is dropped
-        // at the end of each closure, so what survives into `results` is just
-        // the encoded `Vec<u8>` per node plus tiny stat tuples.
-        type NodeResult = (Vec<u8>, [u64; 15], f64, f64, Vec<f64>);
-        let results: Vec<NodeResult> = window
+        // Encode and compress the window's nodes in parallel. Each closure's
+        // point and raw-byte buffers are freed before it returns, so what
+        // the window holds at once is its compressed chunks.
+        let results: Vec<(Vec<u8>, NodeStats)> = window
             .par_iter()
-            .map(|(key, _)| -> Result<NodeResult> {
-                let mut pts = builder.read_node(key)?;
-                pts.sort_unstable_by(|a, b| {
-                    a.gps_time
-                        .partial_cmp(&b.gps_time)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut local_returns = [0u64; 15];
-                let mut local_gps_min = f64::MAX;
-                let mut local_gps_max = f64::MIN;
-                let mut samples = Vec::new();
+            .map(|(key, count)| -> Result<(Vec<u8>, NodeStats)> {
+                // Sized up front: a growing Vec can briefly hold twice this.
+                let mut pts = Vec::with_capacity(*count);
+                builder.stream_node(key, |p| {
+                    pts.push(p);
+                    Ok(())
+                })?;
+                // total_cmp: a total order even with NaN GPS times, matching
+                // the oversized-node path.
+                pts.sort_unstable_by(|a, b| a.gps_time.total_cmp(&b.gps_time));
+                let mut stats = NodeStats::new();
                 let mut raw_bytes = Vec::with_capacity(point_record_len as usize * pts.len());
                 for (i, rp) in pts.iter().enumerate() {
-                    let rn = rp.return_number as usize;
-                    if (1..=15).contains(&rn) {
-                        local_returns[rn - 1] += 1;
-                    }
-                    if rp.gps_time < local_gps_min {
-                        local_gps_min = rp.gps_time;
-                    }
-                    if rp.gps_time > local_gps_max {
-                        local_gps_max = rp.gps_time;
-                    }
-                    if let Some(stride) = temporal_index
-                        && (i % stride == 0 || i == pts.len() - 1)
-                    {
-                        samples.push(rp.gps_time);
-                    }
+                    stats.add(rp, i, pts.len(), temporal_index);
                     encode_point(rp, point_format, &mut raw_bytes);
                 }
-                Ok((
-                    raw_bytes,
-                    local_returns,
-                    local_gps_min,
-                    local_gps_max,
-                    samples,
-                ))
+                drop(pts);
+                Ok((compress_chunk(&raw_bytes, &laz_vlr)?, stats))
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Fold per-node stats into the running aggregates and collect the
-        // window's encoded bytes (in order) for the compressor.
-        let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(results.len());
-        for (i, (bytes, local_returns, local_min, local_max, samples)) in
-            results.into_iter().enumerate()
-        {
-            for j in 0..15 {
-                return_counts[j] += local_returns[j];
-            }
-            if local_min < gpstime_min {
-                gpstime_min = local_min;
-            }
-            if local_max > gpstime_max {
-                gpstime_max = local_max;
-            }
+        for ((key, count), (bytes, stats)) in window.iter().zip(results) {
+            w.write_all(&bytes)?;
+            chunk_table.push(ChunkTableEntry {
+                point_count: *count as u64,
+                byte_count: bytes.len() as u64,
+            });
+            totals.merge(&stats);
             if temporal_index.is_some() {
                 temporal_entries.push(TemporalIndexEntry {
-                    key: window[i].0,
-                    samples,
+                    key: *key,
+                    samples: stats.samples,
                 });
             }
-            encoded.push(bytes);
         }
-
-        // Compress the window in order, then advance. `encoded` and laz's
-        // working set are freed before the next window is read, so peak memory
-        // stays bounded by the window size.
-        compressor
-            .compress_chunks(encoded)
-            .context("compress_chunks")?;
-
         config.report(crate::ProgressEvent::StageProgress {
             done: win_end as u64,
         });
         win_start = win_end;
     }
 
-    // If no points were processed, reset GPS time to 0.
-    if gpstime_min > gpstime_max {
-        gpstime_min = 0.0;
-        gpstime_max = 0.0;
-    }
+    let return_counts = totals.returns;
+    // If no points were processed, report a zero GPS range.
+    let (gpstime_min, gpstime_max) = if totals.gps_min > totals.gps_max {
+        (0.0, 0.0)
+    } else {
+        (totals.gps_min, totals.gps_max)
+    };
 
-    compressor.done().context("compressor done")?;
-
-    let mut w = compressor.into_inner();
+    // Chunk table after the last chunk; then point the offset at the start
+    // of the point data to it.
+    let chunk_table_pos = w.stream_position()?;
+    chunk_table.write_to(&mut w, &laz_vlr)?;
+    let evlr_start = w.stream_position()?;
+    w.seek(SeekFrom::Start(offset_to_point_data as u64))?;
+    w.write_i64::<LittleEndian>(chunk_table_pos as i64)?;
     w.flush()?;
-    // After done(), the stream position may be at the patched offset location.
-    // Get file size by seeking to the end.
-    let end_pos = w.seek(SeekFrom::End(0))?;
-
-    // Unwrap the BufWriter to get the underlying File for seek+read
     let mut file = w
         .into_inner()
         .map_err(|e| anyhow::anyhow!("BufWriter flush: {}", e.error()))?;
-
-    // -----------------------------------------------------------------------
-    // Read the chunk table back from the file to get per-chunk byte sizes
-    // -----------------------------------------------------------------------
-    let read_vlr = LazVlrBuilder::default()
-        .with_point_format(point_format, num_extra_bytes)
-        .context("LazVlrBuilder (read)")?
-        .with_variable_chunk_size()
-        .build();
-
-    file.seek(SeekFrom::Start(offset_to_point_data as u64))?;
-    let chunk_table = laz::laszip::ChunkTable::read_from(&mut file, &read_vlr)
-        .map_err(|e| anyhow::anyhow!("Failed to read chunk table: {e}"))?;
-
-    // -----------------------------------------------------------------------
-    // Verify chunk table
-    // -----------------------------------------------------------------------
-    let evlr_start = end_pos;
-    if chunk_table.len() != data_keys.len() {
-        anyhow::bail!(
-            "chunk table has {} entries but {} chunks were compressed",
-            chunk_table.len(),
-            data_keys.len()
-        );
-    }
 
     // -----------------------------------------------------------------------
     // Build chunk_info for the hierarchy EVLR
@@ -624,6 +574,356 @@ pub fn write_copc(
 
     info!("COPC file written: {:?}", output_path);
     Ok(())
+}
+
+/// Fraction of the memory budget the writer's window may occupy. Nothing
+/// else of size is resident while writing: the build's working set is gone.
+const WRITER_BUDGET_FRACTION: f64 = 0.5;
+
+/// Upper cap on the window, in points. Past this, larger windows only add
+/// memory: a few million points already keep every core busy.
+const MAX_WINDOW_POINTS: u64 = 4_000_000;
+
+/// Lower bound on the window, in points, so tiny budgets still make
+/// progress in reasonably sized steps.
+const MIN_WINDOW_POINTS: u64 = 100_000;
+
+/// Smallest compressed-chunk allowance for an oversized node, like the
+/// window floor above: an artificially tiny `--memory-limit` shouldn't
+/// reject nodes that compress to a few MB.
+const MIN_OVERSIZED_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Points per writer window: the most whose transient state fits the
+/// writer's share of the budget. Per point that is the decoded `RawPoint`
+/// plus its extra bytes, the encoded record, and the compressed output
+/// (bounded by the record size, even for incompressible data).
+fn writer_window_points(memory_budget: u64, record_len: u16, num_extra_bytes: u16) -> u64 {
+    let per_point =
+        (std::mem::size_of::<RawPoint>() + num_extra_bytes as usize) as u64 + 2 * record_len as u64;
+    ((memory_budget as f64 * WRITER_BUDGET_FRACTION) as u64 / per_point)
+        .clamp(MIN_WINDOW_POINTS, MAX_WINDOW_POINTS)
+}
+
+/// LAZ-compress one node's encoded point records as a single chunk.
+fn compress_chunk(raw: &[u8], vlr: &LazVlr) -> Result<Vec<u8>> {
+    let mut compressor = LayeredPointRecordCompressor::new(Vec::new());
+    compressor.set_fields_from(vlr.items())?;
+    compressor.compress_many(raw)?;
+    compressor.done()?;
+    Ok(compressor.into_inner())
+}
+
+/// Per-node statistics folded into the header, COPC info and temporal index.
+struct NodeStats {
+    returns: [u64; 15],
+    gps_min: f64,
+    gps_max: f64,
+    samples: Vec<f64>,
+}
+
+impl NodeStats {
+    fn new() -> Self {
+        Self {
+            returns: [0; 15],
+            gps_min: f64::MAX,
+            gps_max: f64::MIN,
+            samples: Vec::new(),
+        }
+    }
+
+    /// Account for point `i` of a GPS-sorted node of `n` points.
+    fn add(&mut self, rp: &RawPoint, i: usize, n: usize, temporal_stride: Option<usize>) {
+        let rn = rp.return_number as usize;
+        if (1..=15).contains(&rn) {
+            self.returns[rn - 1] += 1;
+        }
+        self.gps_min = self.gps_min.min(rp.gps_time);
+        self.gps_max = self.gps_max.max(rp.gps_time);
+        if let Some(stride) = temporal_stride
+            && (i.is_multiple_of(stride) || i == n - 1)
+        {
+            self.samples.push(rp.gps_time);
+        }
+    }
+
+    /// Fold another node's totals in (samples stay per node).
+    fn merge(&mut self, other: &NodeStats) {
+        for (a, b) in self.returns.iter_mut().zip(&other.returns) {
+            *a += b;
+        }
+        self.gps_min = self.gps_min.min(other.gps_min);
+        self.gps_max = self.gps_max.max(other.gps_max);
+    }
+}
+
+/// Write one node that is too large to hold in memory as a single LAZ
+/// chunk, GPS-sorted like every other node: sort it in runs of
+/// `run_points`, spill each run to a temp file, merge runs (at most
+/// `MAX_MERGE_FANIN` open at once) and stream the final merge into the
+/// compressor. Point memory is one run plus a read buffer per open run.
+///
+/// The LAZ format itself sets the floor: point formats 6–8 compress each
+/// field into its own layer, and a chunk's layers are all buffered until the
+/// chunk is finished. So the node's *compressed* size must fit
+/// `max_chunk_bytes`. It is estimated from the first sorted run before any
+/// merging, so a node that can't fit fails early with an actionable error
+/// rather than getting the process OOM-killed.
+#[allow(clippy::too_many_arguments)]
+fn write_oversized_node<W: Write>(
+    out: &mut W,
+    builder: &OctreeBuilder,
+    key: &VoxelKey,
+    count: usize,
+    run_points: usize,
+    max_chunk_bytes: u64,
+    point_format: u8,
+    vlr: &LazVlr,
+    temporal_stride: Option<usize>,
+) -> Result<NodeStats> {
+    let run_dir = builder
+        .tmp_dir
+        .join(format!("sort_{}_{}_{}_{}", key.level, key.x, key.y, key.z));
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {run_dir:?}"))?;
+    let result = sort_and_compress_node(
+        out,
+        builder,
+        key,
+        count,
+        run_points,
+        max_chunk_bytes,
+        point_format,
+        vlr,
+        temporal_stride,
+        &run_dir,
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sort_and_compress_node<W: Write>(
+    out: &mut W,
+    builder: &OctreeBuilder,
+    key: &VoxelKey,
+    count: usize,
+    run_points: usize,
+    max_chunk_bytes: u64,
+    point_format: u8,
+    vlr: &LazVlr,
+    temporal_stride: Option<usize>,
+    run_dir: &Path,
+) -> Result<NodeStats> {
+    let nxb = builder.num_extra_bytes;
+    let record_len = point_record_length(point_format, nxb) as usize;
+
+    // Pass 1: sorted runs. The first one also measures how well this node
+    // compresses, to check the finished chunk will fit before merging.
+    let mut runs: Vec<std::path::PathBuf> = Vec::new();
+    let mut buf: Vec<RawPoint> = Vec::with_capacity(run_points);
+    let mut spill = |buf: &mut Vec<RawPoint>| -> Result<()> {
+        buf.sort_unstable_by(|a, b| a.gps_time.total_cmp(&b.gps_time));
+        if runs.is_empty() {
+            let mut raw = Vec::with_capacity(buf.len() * record_len);
+            for p in buf.iter() {
+                encode_point(p, point_format, &mut raw);
+            }
+            let bytes_per_point = compress_chunk(&raw, vlr)?.len() as f64 / buf.len() as f64;
+            // ×2: the layer buffers grow by doubling.
+            let estimate = (bytes_per_point * count as f64 * 2.0) as u64;
+            if estimate > max_chunk_bytes || estimate / 2 > i32::MAX as u64 {
+                anyhow::bail!(
+                    "node {key:?} holds {count} points too close together to split \
+                     (e.g. duplicates of one location); compressing it as one LAZ chunk \
+                     needs about {} MB, over the {} MB this memory budget allows \
+                     (and COPC caps a chunk at 2 GiB). Raise --memory-limit or \
+                     thin the duplicate points.",
+                    estimate / 1_048_576,
+                    max_chunk_bytes / 1_048_576,
+                );
+            }
+        }
+        let path = run_dir.join(format!("run_{}", runs.len()));
+        write_run(&path, buf, nxb)?;
+        runs.push(path);
+        buf.clear();
+        Ok(())
+    };
+    builder.stream_node(key, |p| {
+        buf.push(p);
+        if buf.len() == run_points {
+            spill(&mut buf)?;
+        }
+        Ok(())
+    })?;
+    if !buf.is_empty() {
+        spill(&mut buf)?;
+    }
+    drop(buf);
+
+    // Pass 2: merge, streamed into the compressor.
+    debug!(
+        "Oversized node {key:?}: {count} points in {} runs",
+        runs.len()
+    );
+    let mut compressor = LayeredPointRecordCompressor::new(&mut *out);
+    compressor.set_fields_from(vlr.items())?;
+    let mut raw = Vec::with_capacity(ENCODE_BATCH_POINTS * record_len);
+    let mut stats = NodeStats::new();
+    let mut i = 0;
+    merge_runs_bounded(runs, run_dir, nxb, MAX_MERGE_FANIN, |p| {
+        stats.add(&p, i, count, temporal_stride);
+        encode_point(&p, point_format, &mut raw);
+        i += 1;
+        if raw.len() >= ENCODE_BATCH_POINTS * record_len {
+            compressor.compress_many(&raw)?;
+            raw.clear();
+        }
+        Ok(())
+    })?;
+    compressor.compress_many(&raw)?;
+    compressor.done()?;
+    anyhow::ensure!(i == count, "node {key:?}: merged {i} of {count} points");
+    Ok(stats)
+}
+
+/// Most sorted runs open at once while merging an oversized node; more are
+/// first merged in groups. Keeps file descriptors and read buffers bounded.
+const MAX_MERGE_FANIN: usize = 64;
+
+/// Write one sorted run as an uncompressed temp batch. Runs stay
+/// uncompressed so `RunReader` can pull points one at a time.
+fn write_run(path: &Path, points: &[RawPoint], num_extra_bytes: u16) -> Result<()> {
+    let mut f = BufWriter::new(std::fs::File::create(path)?);
+    write_temp_batch(&mut f, points, num_extra_bytes, TempCompression::None)?;
+    f.flush()?;
+    Ok(())
+}
+
+/// Merge GPS-sorted runs, calling `emit` with every point in GPS order,
+/// with at most `fanin` runs open at once: while there are more, groups of
+/// `fanin` are first merged into new runs in `dir`.
+fn merge_runs_bounded(
+    mut runs: Vec<std::path::PathBuf>,
+    dir: &Path,
+    num_extra_bytes: u16,
+    fanin: usize,
+    emit: impl FnMut(RawPoint) -> Result<()>,
+) -> Result<()> {
+    let fanin = fanin.max(2);
+    let mut generation = 0;
+    while runs.len() > fanin {
+        generation += 1;
+        let mut merged = Vec::with_capacity(runs.len().div_ceil(fanin));
+        for (i, group) in runs.chunks(fanin).enumerate() {
+            let path = dir.join(format!("merge_{generation}_{i}"));
+            let mut w = BufWriter::new(std::fs::File::create(&path)?);
+            let mut batch = Vec::with_capacity(ENCODE_BATCH_POINTS);
+            merge_runs(group, num_extra_bytes, |p| {
+                batch.push(p);
+                if batch.len() == ENCODE_BATCH_POINTS {
+                    write_temp_batch(&mut w, &batch, num_extra_bytes, TempCompression::None)?;
+                    batch.clear();
+                }
+                Ok(())
+            })?;
+            write_temp_batch(&mut w, &batch, num_extra_bytes, TempCompression::None)?;
+            w.flush()?;
+            for p in group {
+                let _ = std::fs::remove_file(p);
+            }
+            merged.push(path);
+        }
+        runs = merged;
+    }
+    merge_runs(&runs, num_extra_bytes, emit)
+}
+
+/// K-way merge of GPS-sorted runs, calling `emit` with points in GPS order.
+fn merge_runs(
+    runs: &[std::path::PathBuf],
+    num_extra_bytes: u16,
+    mut emit: impl FnMut(RawPoint) -> Result<()>,
+) -> Result<()> {
+    let mut readers = runs
+        .iter()
+        .map(|p| RunReader::open(p, num_extra_bytes))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = std::collections::BinaryHeap::new();
+    for (i, r) in readers.iter_mut().enumerate() {
+        if let Some(p) = r.next()? {
+            heap.push(std::cmp::Reverse(HeapItem(p, i)));
+        }
+    }
+    while let Some(std::cmp::Reverse(HeapItem(p, run))) = heap.pop() {
+        emit(p)?;
+        if let Some(next) = readers[run].next()? {
+            heap.push(std::cmp::Reverse(HeapItem(next, run)));
+        }
+    }
+    Ok(())
+}
+
+/// Points encoded per `compress_many` call when streaming a chunk.
+const ENCODE_BATCH_POINTS: usize = 65_536;
+
+/// A run's current point, ordered by GPS time (ties by run index).
+struct HeapItem(RawPoint, usize);
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for HeapItem {}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .gps_time
+            .total_cmp(&other.0.gps_time)
+            .then(self.1.cmp(&other.1))
+    }
+}
+
+/// Pulls points one at a time from a sorted run written by
+/// `write_oversized_node` (uncompressed temp batches).
+struct RunReader {
+    r: std::io::BufReader<std::fs::File>,
+    remaining: u32,
+    record: Vec<u8>,
+    num_extra_bytes: u16,
+}
+
+impl RunReader {
+    fn open(path: &Path, num_extra_bytes: u16) -> Result<Self> {
+        Ok(Self {
+            r: std::io::BufReader::new(std::fs::File::open(path)?),
+            remaining: 0,
+            record: vec![0; RawPoint::record_size(num_extra_bytes)],
+            num_extra_bytes,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<RawPoint>> {
+        use byteorder::ReadBytesExt;
+        while self.remaining == 0 {
+            match self.r.read_u32::<LittleEndian>() {
+                Ok(n) => self.remaining = n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        std::io::Read::read_exact(&mut self.r, &mut self.record)?;
+        self.remaining -= 1;
+        Ok(Some(RawPoint::from_record(
+            &self.record,
+            self.num_extra_bytes,
+        )))
+    }
 }
 
 /// Today's date as `(day_of_year, year)` for the LAS header's File Creation
@@ -1594,5 +1894,38 @@ mod tests {
         assert_eq!(civil_date_from_unix_days(20_148), (60, 2025));
         // 2024-03-01 = 19_783 days since epoch, day 61 in a leap year
         assert_eq!(civil_date_from_unix_days(19_783), (61, 2024));
+    }
+
+    #[test]
+    fn bounded_run_merge_sorts_across_passes() {
+        // 50 runs with fan-in 4 forces three intermediate merge passes.
+        let dir = std::env::temp_dir().join(format!("copc_test_runs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut runs = Vec::new();
+        let mut expected = Vec::new();
+        for r in 0..50u32 {
+            let mut pts: Vec<RawPoint> = (0..37u32)
+                .map(|i| {
+                    let mut p = sample_point();
+                    p.gps_time = f64::from((i * 50 + r).wrapping_mul(2_654_435_761) % 10_007);
+                    p
+                })
+                .collect();
+            pts.sort_unstable_by(|a, b| a.gps_time.total_cmp(&b.gps_time));
+            expected.extend(pts.iter().map(|p| p.gps_time));
+            let path = dir.join(format!("run_{r}"));
+            write_run(&path, &pts, 0).unwrap();
+            runs.push(path);
+        }
+        expected.sort_unstable_by(f64::total_cmp);
+
+        let mut got = Vec::new();
+        merge_runs_bounded(runs, &dir, 0, 4, |p| {
+            got.push(p.gps_time);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, expected);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

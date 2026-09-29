@@ -28,7 +28,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -448,15 +448,6 @@ const MIN_BUILD_SLOT_BYTES: u64 = 512 * 1024 * 1024;
 /// get large per-slot budgets; they just don't fan out beyond this width.
 const MAX_BUILD_CONCURRENCY: usize = 16;
 
-/// A merge parent must be grid-sampled fully in memory (there is no spill for
-/// the merge step), so it is only rejected as "too large" when its children's
-/// combined points exceed `max(memory_budget, this floor)`. The floor lets the
-/// merge proceed for parents that are trivially holdable even when the
-/// configured budget is artificially tiny — merge parents hold LOD-thinned
-/// node data, which is inherently small, so anything under a couple of GB is
-/// always safe to grid-sample regardless of `--memory-limit`.
-const MERGE_PARENT_OOM_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
 /// Aggregate counters for the spill path, accumulated across all chunks during
 /// phase 1 and logged once afterwards. Avoids per-chunk / per-sub-octant log
 /// lines (which flood at scale) while still surfacing whether — and how hard —
@@ -524,6 +515,107 @@ pub(crate) const GRID_CELLS_PER_AXIS: i64 = 128;
 fn grid_cell_axis(offset: i64, int_size: i64) -> i64 {
     let g = GRID_CELLS_PER_AXIS;
     ((offset.max(0) * g) / int_size).clamp(0, g - 1)
+}
+
+/// A parent voxel's LOD sampling grid (`GRID_CELLS_PER_AXIS`³ cells) in
+/// integer coordinate space.
+struct SampleGrid {
+    origin: [i64; 3],
+    int_size: i64,
+}
+
+impl SampleGrid {
+    const CELLS: usize = (GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS * GRID_CELLS_PER_AXIS) as usize;
+
+    fn new(b: &OctreeBuilder, parent: &VoxelKey) -> Self {
+        let voxel_size_world = 2.0 * b.halfsize / (1u64 << parent.level) as f64;
+        let origin = |center: f64, v: i32, offset: f64, scale: f64| -> i64 {
+            ((center - b.halfsize + v as f64 * voxel_size_world - offset) / scale).round() as i64
+        };
+        SampleGrid {
+            origin: [
+                origin(b.cx, parent.x, b.offset_x, b.scale_x),
+                origin(b.cy, parent.y, b.offset_y, b.scale_y),
+                origin(b.cz, parent.z, b.offset_z, b.scale_z),
+            ],
+            // Voxel extent in integer coordinates, floored at the grid size
+            // so every cell spans ≥1 integer unit.
+            int_size: (voxel_size_world / b.scale_x.min(b.scale_y).min(b.scale_z))
+                .round()
+                .max(GRID_CELLS_PER_AXIS as f64) as i64,
+        }
+    }
+
+    /// Morton code of the point relative to the parent's origin.
+    #[inline]
+    fn morton(&self, p: &RawPoint) -> u64 {
+        let d = |v: i32, o: i64| (v as i64 - o).max(0) as u32;
+        morton3(
+            d(p.x, self.origin[0]),
+            d(p.y, self.origin[1]),
+            d(p.z, self.origin[2]),
+        )
+    }
+
+    /// Index of the sampling cell the point falls in.
+    #[inline]
+    fn cell(&self, p: &RawPoint) -> usize {
+        let g = GRID_CELLS_PER_AXIS;
+        let gx = grid_cell_axis(p.x as i64 - self.origin[0], self.int_size);
+        let gy = grid_cell_axis(p.y as i64 - self.origin[1], self.int_size);
+        let gz = grid_cell_axis(p.z as i64 - self.origin[2], self.int_size);
+        (gx + gy * g + gz * g * g) as usize
+    }
+}
+
+/// Points buffered per batch when streaming a node through a
+/// [`crate::node_store::NodeWriter`].
+const NODE_WRITE_BATCH_POINTS: usize = 65_536;
+
+/// Buffers points and appends them to a node writer in fixed-size batches.
+struct BatchedNodeWriter<'a> {
+    inner: Box<dyn crate::node_store::NodeWriter + 'a>,
+    batch: Vec<RawPoint>,
+    written: u64,
+}
+
+impl<'a> BatchedNodeWriter<'a> {
+    fn new(inner: Box<dyn crate::node_store::NodeWriter + 'a>) -> Self {
+        Self {
+            inner,
+            batch: Vec::new(),
+            written: 0,
+        }
+    }
+
+    fn push(&mut self, p: RawPoint) -> Result<()> {
+        self.batch.push(p);
+        if self.batch.len() >= NODE_WRITE_BATCH_POINTS {
+            self.inner.append(&self.batch)?;
+            self.written += self.batch.len() as u64;
+            self.batch.clear();
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.written == 0 && self.batch.is_empty()
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.inner.append(&self.batch)?;
+        self.inner.finish()
+    }
+}
+
+/// Mark `cell` occupied in the bitmap; true if it was free (the point is
+/// accepted into the parent).
+#[inline]
+fn claim_cell(occupied: &mut [u64], cell: usize) -> bool {
+    let (word, mask) = (cell >> 6, 1u64 << (cell & 63));
+    let free = occupied[word] & mask == 0;
+    occupied[word] |= mask;
+    free
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +692,7 @@ impl RawPoint {
     /// `record_size(num_extra_bytes)` bytes (offsets mirror
     /// [`Self::write_base_into`]). The only allocation is the extras
     /// `Box<[u8]>`, and only when `num_extra_bytes > 0`.
-    fn from_record(rec: &[u8], num_extra_bytes: u16) -> Self {
+    pub(crate) fn from_record(rec: &[u8], num_extra_bytes: u16) -> Self {
         debug_assert_eq!(rec.len(), Self::record_size(num_extra_bytes));
         let i32le = |o: usize| i32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
         let u16le = |o: usize| u16::from_le_bytes(rec[o..o + 2].try_into().unwrap());
@@ -827,7 +919,7 @@ fn for_each_point_in_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>
 
 /// Streaming counterpart to `read_temp_batches`. Invokes `f` on every
 /// decoded `RawPoint` without ever materialising the full Vec.
-fn stream_temp_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
+pub(crate) fn stream_temp_batches<R: std::io::Read, F: FnMut(RawPoint) -> Result<()>>(
     r: R,
     num_extra_bytes: u16,
     codec: TempCompression,
@@ -1128,6 +1220,10 @@ pub struct ScanResult {
     /// Global encoding bit 0: GPS times are adjusted standard GPS time
     /// (`true`) rather than GPS week time (`false`).
     pub gps_time_standard: bool,
+    /// Points in the file's largest LAZ chunk (0 for uncompressed LAS or
+    /// when the chunk table can't be read). Decides whether the file can be
+    /// decoded in parallel within the memory budget.
+    pub max_laz_chunk_points: u64,
 }
 
 /// Per-file CRS identity: small enough to hold once per `ScanResult` even
@@ -1157,6 +1253,30 @@ pub struct ScanOutput {
 /// so digests are identical across files in the same process. With 64
 /// bits and typically a single VLR per kind per run, collision risk is
 /// negligible. Used for both WKT CRS and Extra Bytes VLR identity.
+/// Points in the largest LAZ chunk of `path`, from its LAZ VLR (fixed-size
+/// chunks) or chunk table (variable-size chunks). 0 for uncompressed LAS or
+/// when the table can't be read.
+fn max_laz_chunk_points(path: &Path, header: &las::Header) -> u64 {
+    let Some(vlr) = header
+        .all_vlrs()
+        .find(|v| v.user_id.trim_end_matches('\0') == "laszip encoded" && v.record_id == 22204)
+        .and_then(|v| laz::LazVlr::read_from(v.data.as_slice()).ok())
+    else {
+        return 0;
+    };
+    if !vlr.uses_variable_size_chunks() {
+        return vlr.chunk_size() as u64;
+    }
+    let read_table = || -> Option<u64> {
+        let offset = header.clone().into_raw().ok()?.offset_to_point_data;
+        let mut f = File::open(path).ok()?;
+        f.seek(SeekFrom::Start(offset as u64)).ok()?;
+        let table = laz::laszip::ChunkTable::read_from(BufReader::new(f), &vlr).ok()?;
+        table.as_ref().iter().map(|e| e.point_count).max()
+    };
+    read_table().unwrap_or(0)
+}
+
 pub(crate) fn bytes_hash(bytes: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
@@ -1260,6 +1380,8 @@ pub struct OctreeBuilder {
     pub point_format: u8,
     /// GPS time type for the output header's global encoding bit 0.
     pub gps_time_standard: bool,
+    /// Largest LAZ chunk (in points) per input file, in input order.
+    pub(crate) input_max_laz_chunk_points: Vec<u64>,
     /// Chunk plan computed by `distribute` and consumed by `build_node_map`.
     pub(crate) chunked_plan: Option<crate::chunking::ChunkPlan>,
     /// Exact per-chunk point counts tallied while distribute appended
@@ -1355,6 +1477,7 @@ impl OctreeBuilder {
                         num_extra_bytes,
                         point_format_id: header.point_format().to_u8().unwrap_or(0),
                         gps_time_standard: header.gps_time_type().is_standard(),
+                        max_laz_chunk_points: max_laz_chunk_points(path, header),
                     },
                     wkt_bytes,
                     extra_bytes_vlr,
@@ -1516,6 +1639,10 @@ impl OctreeBuilder {
             num_extra_bytes,
             point_format: validated.point_format,
             gps_time_standard: validated.gps_time_standard,
+            input_max_laz_chunk_points: scan_results
+                .iter()
+                .map(|r| r.max_laz_chunk_points)
+                .collect(),
             chunked_plan: None,
             chunk_actual_counts: None,
             temp_compression: config.temp_compression,
@@ -1598,12 +1725,6 @@ impl OctreeBuilder {
         }
     }
 
-    /// Read all raw points for a given node key from the active node store.
-    /// Returns an empty Vec when the key has never been written.
-    pub fn read_node(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
-        self.node_store.read(key)
-    }
-
     /// Whether any of `key`'s eight child nodes holds points in the node store.
     ///
     /// Interior nodes always keep at least one point (see `grid_sample`), so a
@@ -1622,6 +1743,45 @@ impl OctreeBuilder {
             }
         }
         Ok(false)
+    }
+
+    /// Visit every point of a node without holding them all in memory.
+    pub(crate) fn stream_node<F: FnMut(RawPoint) -> Result<()>>(
+        &self,
+        key: &VoxelKey,
+        mut f: F,
+    ) -> Result<()> {
+        self.node_store.stream(key, &mut f)
+    }
+
+    /// Open input file `index` for reading within `per_reader_budget`.
+    ///
+    /// The parallel LAZ decoder holds whole chunks in memory, which is fine
+    /// for the usual 50k-point chunks but not for a file written as a few
+    /// huge ones. Such files are decoded sequentially, point by point.
+    pub(crate) fn open_input(
+        &self,
+        index: usize,
+        path: &Path,
+        per_reader_budget: u64,
+    ) -> Result<las::Reader> {
+        let chunk_points = self
+            .input_max_laz_chunk_points
+            .get(index)
+            .copied()
+            .unwrap_or(0);
+        // Decoded record plus its compressed form, generously.
+        let chunk_bytes =
+            chunk_points.saturating_mul(2 * RawPoint::record_size(self.num_extra_bytes) as u64);
+        let reader = if chunk_bytes > per_reader_budget / 4 {
+            debug!("{path:?}: {chunk_points}-point LAZ chunks, decoding sequentially");
+            let options =
+                las::ReaderOptions::default().with_laz_parallelism(las::LazParallelism::No);
+            las::Reader::with_options(BufReader::new(File::open(path)?), options)
+        } else {
+            las::Reader::from_path(path)
+        };
+        reader.with_context(|| format!("Cannot open {:?}", path))
     }
 
     /// Write points for the given node key (overwrites any prior content).
@@ -1775,38 +1935,14 @@ impl OctreeBuilder {
             return (parent_pts, vec![vec![]; n_children]);
         }
 
-        // Parent voxel geometry in integer coordinate space.
-        let voxel_size_world = 2.0 * self.halfsize / (1u64 << parent.level) as f64;
-        let origin_x = ((self.cx - self.halfsize + parent.x as f64 * voxel_size_world
-            - self.offset_x)
-            / self.scale_x)
-            .round() as i64;
-        let origin_y = ((self.cy - self.halfsize + parent.y as f64 * voxel_size_world
-            - self.offset_y)
-            / self.scale_y)
-            .round() as i64;
-        let origin_z = ((self.cz - self.halfsize + parent.z as f64 * voxel_size_world
-            - self.offset_z)
-            / self.scale_z)
-            .round() as i64;
-        // Voxel extent in integer coordinates, floored at the grid size so
-        // every cell spans ≥1 integer unit.
-        let int_size = (voxel_size_world / self.scale_x.min(self.scale_y).min(self.scale_z))
-            .round()
-            .max(GRID_CELLS_PER_AXIS as f64) as i64;
-
         // Sort by Morton code within the parent voxel for spatially coherent
         // traversal. `sort_by_cached_key` computes one Morton code per point
         // (instead of two per comparison with `sort_unstable_by_key`) and
         // moves the 64-byte elements once in a final permutation pass rather
         // than swapping them throughout the sort. The transient key+index
         // table costs ~16 B/pt, well inside the build's 600 B/pt estimate.
-        pts.sort_by_cached_key(|(_, p)| {
-            let dx = (p.x as i64 - origin_x).max(0) as u32;
-            let dy = (p.y as i64 - origin_y).max(0) as u32;
-            let dz = (p.z as i64 - origin_z).max(0) as u32;
-            morton3(dx, dy, dz)
-        });
+        let grid = SampleGrid::new(self, parent);
+        pts.sort_by_cached_key(|(_, p)| grid.morton(p));
 
         // Track which children actually have points so we can protect them.
         let mut child_has_pts = vec![false; n_children];
@@ -1816,15 +1952,8 @@ impl OctreeBuilder {
 
         // Occupancy bitmap over the fixed 128³ sampling grid (256 KiB): one
         // load+OR per point marks the cell that point falls in.
-        let g = GRID_CELLS_PER_AXIS;
-        let n_cells = (g * g * g) as usize;
+        let n_cells = SampleGrid::CELLS;
         let mut occupied = vec![0u64; n_cells / 64];
-        let grid_idx = |p: &RawPoint| -> usize {
-            let gx = grid_cell_axis(p.x as i64 - origin_x, int_size);
-            let gy = grid_cell_axis(p.y as i64 - origin_y, int_size);
-            let gz = grid_cell_axis(p.z as i64 - origin_z, int_size);
-            (gx + gy * g + gz * g * g) as usize
-        };
 
         // Partition: accepted for parent vs remaining for children. No
         // cloning. Accepted points are structurally capped at one per grid
@@ -1834,10 +1963,7 @@ impl OctreeBuilder {
         let mut remaining: Vec<Vec<RawPoint>> = vec![Vec::new(); n_children];
 
         for (ci, p) in pts {
-            let idx = grid_idx(&p);
-            let (word, mask) = (idx >> 6, 1u64 << (idx & 63));
-            if occupied[word] & mask == 0 {
-                occupied[word] |= mask;
+            if claim_cell(&mut occupied, grid.cell(&p)) {
                 parent_pts.push((ci, p));
             } else {
                 remaining[ci].push(p);
@@ -1992,9 +2118,8 @@ impl OctreeBuilder {
                 // stays bounded by the working set, not by all-time peak.
                 let mut groups: FxHashMap<u32, Vec<RawPoint>> = FxHashMap::default();
 
-                for path in &input_files[start..end] {
-                    let mut reader = las::Reader::from_path(path)
-                        .with_context(|| format!("Cannot open {:?}", path))?;
+                for (index, path) in input_files.iter().enumerate().take(end).skip(start) {
+                    let mut reader = self.open_input(index, path, per_worker_budget)?;
                     // Per-file byte slab: `fill_points` reuses the buffer
                     // across batches but only re-checks the *format* on
                     // reuse, while the coordinate transforms (scale/offset)
@@ -2367,17 +2492,18 @@ impl OctreeBuilder {
     /// peak memory regardless of the in-chunk distribution:
     ///
     /// 1. Choose a `split_level` whose densest sub-octant fits
-    ///    `chunk_mem_budget` ([`Self::choose_split_level`], one streaming
-    ///    count pass — no per-level re-reads).
+    ///    `chunk_mem_budget` ([`Self::choose_split_level`], one to four
+    ///    counting passes with bounded memory).
     /// 2. Stream the chunk file **once**, routing every point into a temp file
     ///    for its `split_level` sub-octant via a bounded append-writer cache.
-    /// 3. Build each sub-octant subtree from its own (budget-sized) temp file
-    ///    and merge the sub-octant roots up to the chunk root.
+    /// 3. Build each sub-octant subtree from its own (budget-sized) temp file,
+    ///    or stream it into a single leaf if its points can't be separated,
+    ///    then merge the sub-octant roots up to the chunk root.
     ///
-    /// The chunk file is read exactly twice — once to choose the split level,
-    /// once to route — and each sub-octant build then reads only its own small
-    /// spill file. So the whole operation is `O(chunk_size)` regardless of how
-    /// deep the split goes or how many sub-octants result.
+    /// The chunk file is read a small fixed number of times (the counting
+    /// passes plus one routing pass), and each sub-octant build then reads
+    /// only its own spill file. So the whole operation is `O(chunk_size)`
+    /// regardless of how deep the split goes or how many sub-octants result.
     fn build_chunk_spilled(
         &self,
         chunk: &crate::chunking::PlannedChunk,
@@ -2393,18 +2519,15 @@ impl OctreeBuilder {
             z: chunk.gz,
         };
 
-        // Step 1: in ONE streaming pass, find the shallowest split depth at
-        // which the densest sub-octant fits budget. `choose_split_level`
-        // counts occupancy at the deepest candidate level and rolls the counts
-        // up to every shallower level in memory, so the chunk file is read
-        // exactly once regardless of how deep the data forces the split.
+        // Step 1: find the shallowest split depth at which the densest
+        // sub-octant fits budget (see `choose_split_level`).
         let max_points_in_budget = (chunk_mem_budget / PER_CHUNK_BYTES_PER_POINT_BUILD).max(1);
         let (split_level, _densest) =
             self.choose_split_level(chunk_idx, chunk_root, max_points_in_budget)?;
         // Track the deepest extra split any chunk needed (aggregate; logged
         // once after phase 1). `densest > budget` only at the depth cap with
-        // pathological coincident-point density — finish_subtree's leaf-depth
-        // cap absorbs the residual, so no separate warning per chunk.
+        // pathological coincident-point density; step 3 streams such
+        // sub-octants into a leaf, so no separate warning per chunk.
         spill_stats
             .max_split_extra
             .fetch_max((split_level - chunk.level) as u64, Ordering::Relaxed);
@@ -2424,6 +2547,7 @@ impl OctreeBuilder {
 
         let mut sub_index: FxHashMap<VoxelKey, u32> = FxHashMap::default();
         let mut sub_roots: Vec<VoxelKey> = Vec::new();
+        let mut sub_counts: Vec<u64> = Vec::new();
         // Up to MAX_BUILD_CONCURRENCY chunks can be spilling concurrently,
         // each with its own routing cache — share the global open-file
         // budget between them instead of letting every spill claim all of
@@ -2464,9 +2588,11 @@ impl OctreeBuilder {
                     let i = sub_roots.len() as u32;
                     sub_index.insert(sub, i);
                     sub_roots.push(sub);
+                    sub_counts.push(0);
                     i
                 }
             };
+            sub_counts[idx as usize] += 1;
             pending.entry(idx).or_default().push(raw);
             pending_points += 1;
             if pending_points >= flush_threshold {
@@ -2508,6 +2634,17 @@ impl OctreeBuilder {
                     }
                     Err(e) => return Err(e.into()),
                 };
+                let count = sub_counts[idx];
+                if count.saturating_mul(PER_CHUNK_BYTES_PER_POINT_BUILD) > chunk_mem_budget {
+                    // Still over budget at the split cap: the points are too
+                    // close together to separate (e.g. coincident). Stream
+                    // them into one leaf rather than loading them; the merge
+                    // and writer both handle nodes larger than memory.
+                    let mut out = BatchedNodeWriter::new(self.node_store.writer(sub_root)?);
+                    stream_temp_batches(f, nxb, codec, |p| out.push(p))?;
+                    out.finish()?;
+                    return Ok(vec![(*sub_root, count as usize)]);
+                }
                 let points = read_temp_batches(f, nxb, codec)?;
                 self.build_subtree_from_points(*sub_root, points, config)
             })
@@ -2556,99 +2693,141 @@ impl OctreeBuilder {
     }
 
     /// Choose the shallowest sub-octant split level whose densest sub-octant
-    /// holds at most `max_points` points, in a SINGLE streaming pass over the
-    /// chunk file.
+    /// holds at most `max_points` points.
     ///
-    /// Returns `(split_level, densest_count_at_that_level)`. The chunk file is
-    /// read exactly once: every point is classified at the deepest candidate
-    /// level (`chunk_root.level + SPILL_DEPTH_CAP`) and accumulated into a
-    /// counting map. Because `point_to_key` is a strict refinement and
-    /// `VoxelKey::parent` is coordinate-halving, the per-sub-octant count at
-    /// any shallower level is recovered by right-shifting the deep coordinates
-    /// — so the densest count at every candidate depth is computed in memory
-    /// from that one map, with no extra file reads.
+    /// Returns `(split_level, densest_count_at_that_level)`. Each pass over
+    /// the chunk file counts points three levels below the cells still over
+    /// the limit ("hot" cells); because `point_to_key` is a strict refinement
+    /// and `VoxelKey::parent` is coordinate-halving, those counts also give
+    /// every level in between. Memory is 512 counters per hot cell.
     ///
     /// Picks the shallowest level whose densest sub-octant fits `max_points`;
     /// if even the deepest level doesn't (pathological coincident-point
-    /// density), returns the deepest level and lets the caller proceed (the
-    /// per-subtree leaf-depth cap absorbs the residual).
+    /// density), returns the deepest level, and the caller streams the
+    /// over-limit sub-octants into leaves.
     fn choose_split_level(
         &self,
         chunk_idx: u32,
         chunk_root: VoxelKey,
         max_points: u64,
     ) -> Result<(u32, u64)> {
-        // Cap the extra depth below the chunk root. 8^cap is the maximum
-        // sub-octant fan-out; the deep counting map is bounded by the number
-        // of populated cells at this depth (≤ point count, and far smaller for
-        // any real surface data, which clusters).
+        // Cap the extra depth below the chunk root; 8^cap is the maximum
+        // sub-octant fan-out.
         const SPILL_DEPTH_CAP: u32 = 12;
-        let deepest = chunk_root.level as u32 + SPILL_DEPTH_CAP;
+        // Levels refined per pass over the chunk file: 8^3 = 512 counters
+        // per "hot" cell.
+        const STEP: u32 = 3;
 
-        // Count occupancy at the deepest candidate level in one pass.
-        let mut deep_counts: FxHashMap<VoxelKey, u64> = FxHashMap::default();
-        self.stream_chunk_file(chunk_idx, |raw| {
-            let wx = raw.x as f64 * self.scale_x + self.offset_x;
-            let wy = raw.y as f64 * self.scale_y + self.offset_y;
-            let wz = raw.z as f64 * self.scale_z + self.offset_z;
-            let key = point_to_key(
-                wx,
-                wy,
-                wz,
-                self.cx,
-                self.cy,
-                self.cz,
-                self.halfsize,
-                deepest,
-            );
-            *deep_counts.entry(key).or_insert(0) += 1;
-            Ok(())
-        })?;
-
-        if deep_counts.is_empty() {
-            // Empty chunk — nothing to split; one level deep is harmless.
-            return Ok((chunk_root.level as u32 + 1, 0));
-        }
-
-        // Roll the deep counts up to each shallower level and find, for each,
-        // the densest sub-octant. A key at `deepest` maps to its ancestor at
-        // level `L = chunk_root.level + s` by right-shifting each coordinate by
-        // `deepest - L`. Walk shallow→deep and stop at the first level that
-        // fits `max_points`.
+        // Refine only where it matters: a cell holding ≤ max_points can't
+        // have a descendant over the limit, so each pass counts one STEP
+        // deeper beneath just the cells still over it. Memory is 512
+        // counters per hot cell, and there are at most points / max_points
+        // hot cells — unlike a map keyed by every occupied cell at the cap,
+        // which grows with the number of distinct cells. The trade-off is up
+        // to SPILL_DEPTH_CAP / STEP passes over the file, only on this rare
+        // path.
         let root_level = chunk_root.level as u32;
-        let mut best: Option<(u32, u64)> = None;
-        for s in 1..=SPILL_DEPTH_CAP {
-            let level = root_level + s;
-            let shift = deepest - level;
-            let mut level_counts: FxHashMap<VoxelKey, u64> = FxHashMap::default();
-            for (k, c) in &deep_counts {
+        let deepest = root_level + SPILL_DEPTH_CAP;
+        let mut hot: Vec<VoxelKey> = vec![chunk_root];
+        let mut level = root_level;
+        let mut densest = 0u64;
+        while level < deepest {
+            let step = STEP.min(deepest - level);
+            let deep = level + step;
+            let cells = 1usize << (3 * step);
+            let mask = (1i32 << step) - 1;
+            let hot_index: FxHashMap<VoxelKey, usize> =
+                hot.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+            let mut counts = vec![0u64; hot.len() * cells];
+            let mut seen = 0u64;
+            self.stream_chunk_file(chunk_idx, |raw| {
+                let key = point_to_key(
+                    raw.x as f64 * self.scale_x + self.offset_x,
+                    raw.y as f64 * self.scale_y + self.offset_y,
+                    raw.z as f64 * self.scale_z + self.offset_z,
+                    self.cx,
+                    self.cy,
+                    self.cz,
+                    self.halfsize,
+                    deep,
+                );
                 let anc = VoxelKey {
                     level: level as i32,
-                    x: k.x >> shift,
-                    y: k.y >> shift,
-                    z: k.z >> shift,
+                    x: key.x >> step,
+                    y: key.y >> step,
+                    z: key.z >> step,
                 };
-                *level_counts.entry(anc).or_insert(0) += c;
+                if let Some(&i) = hot_index.get(&anc) {
+                    let local = ((key.x & mask)
+                        | (key.y & mask) << step
+                        | (key.z & mask) << (2 * step)) as usize;
+                    counts[i * cells + local] += 1;
+                }
+                seen += 1;
+                Ok(())
+            })?;
+            if seen == 0 {
+                // Empty chunk — nothing to split; one level deep is harmless.
+                return Ok((root_level + 1, 0));
             }
-            let densest = level_counts.values().copied().max().unwrap_or(0);
-            best = Some((level, densest));
-            if densest <= max_points {
-                return Ok((level, densest));
+
+            // Densest descendant of the hot cells at each level this pass
+            // resolved; shallowest level that fits wins.
+            for s in 1..=step {
+                let shift = step - s;
+                let side = 1usize << s;
+                densest = 0;
+                for block in counts.chunks_exact(cells) {
+                    let mut agg = vec![0u64; side * side * side];
+                    for (local, &c) in block.iter().enumerate() {
+                        let m = (1usize << step) - 1;
+                        let (x, y, z) = (local & m, (local >> step) & m, local >> (2 * step));
+                        agg[(x >> shift) | (y >> shift) << s | (z >> shift) << (2 * s)] += c;
+                    }
+                    densest = densest.max(agg.into_iter().max().unwrap_or(0));
+                }
+                if densest <= max_points {
+                    return Ok((level + s, densest));
+                }
             }
+
+            // Cells at `deep` still over the limit are refined next pass.
+            hot = hot
+                .iter()
+                .zip(counts.chunks_exact(cells))
+                .flat_map(|(anc, block)| {
+                    block
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| **c > max_points)
+                        .map(move |(local, _)| {
+                            let m = (1i32 << step) - 1;
+                            let local = local as i32;
+                            VoxelKey {
+                                level: deep as i32,
+                                x: (anc.x << step) | (local & m),
+                                y: (anc.y << step) | ((local >> step) & m),
+                                z: (anc.z << step) | (local >> (2 * step)),
+                            }
+                        })
+                })
+                .collect();
+            level = deep;
         }
-        // None fit; return the deepest level probed.
-        Ok(best.expect("loop ran at least once"))
+        // Nothing fit (coincident points can't be split): the deepest level,
+        // whose over-limit sub-octants the caller streams instead of building.
+        Ok((deepest, densest))
     }
 
     /// Merge a set of root keys upward, level by level, down to `stop_level`.
     ///
     /// Starting from `root_keys` (nodes at varying levels), we walk levels in
     /// reverse and at each level group nodes by their parent and run
-    /// `grid_sample` to produce the parent, reading children from disk and
-    /// writing parents + per-child remainders back to disk. Nothing is held
-    /// resident beyond one bounded batch of parents at a time, so peak memory
-    /// is `≈ build_concurrency × per_parent_budget` regardless of how many
-    /// roots there are.
+    /// `merge_parent` to produce the parent, reading children from disk and
+    /// writing parents + per-child remainders back to disk. At most
+    /// `build_concurrency` parents are in flight, each within
+    /// `per_parent_budget`, so peak memory is `≈ build_concurrency ×
+    /// per_parent_budget` regardless of how many roots there are.
     ///
     /// **Variable-level roots are handled naturally**: when level `d`'s
     /// children are processed, the set may include both original roots that
@@ -2669,7 +2848,7 @@ impl OctreeBuilder {
         stop_level: i32,
         build_concurrency: usize,
         per_parent_budget: u64,
-        // When true, suppress the per-level / per-batch debug lines. Set for
+        // When true, suppress the per-level debug lines. Set for
         // the spill's local sub-octant merge, which runs once per spilled chunk
         // and would otherwise flood the log; the single global merge logs.
         quiet: bool,
@@ -2679,12 +2858,13 @@ impl OctreeBuilder {
             return Ok(Vec::new());
         }
 
-        // Bound merge memory the same way phase 1 does: at most
-        // `build_concurrency` parents merge concurrently, each holding its
-        // children's (LOD-thinned) points — capped at `per_parent_budget`. A
-        // bounded pool enforces the concurrency regardless of core count. For
-        // concurrency 1 (e.g. the spill's local merge, already running inside
-        // one outer build slot) skip the pool and run merges inline.
+        // At most `build_concurrency` parents merge at once, each held to
+        // `per_parent_budget` by `merge_parent`, which samples one child at a
+        // time and streams any child too large to hold. Concurrency 1 runs
+        // sequentially on the calling thread: `par_iter` there would fan out
+        // over the caller's pool, and `install`ing a one-thread pool from a
+        // build-pool worker would let that worker steal another chunk build
+        // while it waits.
         let merge_pool = if build_concurrency > 1 {
             Some(
                 rayon::ThreadPoolBuilder::new()
@@ -2714,18 +2894,6 @@ impl OctreeBuilder {
             );
         }
 
-        // Reuse the same per-point cost estimate as bottom_up_on_disk's
-        // small-parent batching: input vec + per-child remaining. The
-        // `2 * num_extra_bytes` term accounts for the heap-allocated
-        // extras payloads (`Box<[u8]>`) — `size_of::<RawPoint>` only
-        // counts the box header, not the bytes it points at, so without
-        // this term the budget gate under-reports by
-        // `num_extra_bytes` × points for each of the two `RawPoint`
-        // instances per point.
-        let mem_per_point: u64 = (std::mem::size_of::<(usize, RawPoint)>()
-            + std::mem::size_of::<RawPoint>()) as u64
-            + 2 * self.num_extra_bytes as u64;
-
         let mut all_new_parents: Vec<VoxelKey> = Vec::new();
 
         // Walk from the deepest level down to `stop_level`. d is the parent
@@ -2750,139 +2918,28 @@ impl OctreeBuilder {
             if parent_children.is_empty() {
                 continue;
             }
-
-            // Estimate per-parent memory cost from the children's file sizes
-            // and split into "small" (fit in budget) vs "large" (don't).
-            // For chunked merge, large parents shouldn't happen because
-            // chunks are sized to fit, but be defensive.
-            let mut small_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
-            let mut large_parents: Vec<(VoxelKey, Vec<VoxelKey>, u64)> = Vec::new();
-
-            // A merge parent has no spill path — it must be grid-sampled in
-            // memory — so it is only "too large" when its children exceed what
-            // is physically safe to hold: max(budget, floor). The floor keeps
-            // trivially-small merges (LOD-thinned node data) working even under
-            // an artificially tiny `--memory-limit`.
-            let oom_threshold = config.memory_budget.max(MERGE_PARENT_OOM_FLOOR_BYTES);
-            for (parent, children) in parent_children {
-                let est_points: u64 = children
-                    .iter()
-                    .map(|ck| self.count_node(ck).unwrap_or(0))
-                    .sum();
-                let est_mem = est_points.saturating_mul(mem_per_point);
-                if est_mem > oom_threshold {
-                    large_parents.push((parent, children, est_mem));
-                } else {
-                    small_parents.push((parent, children, est_mem));
-                }
-            }
-
             if !quiet {
                 debug!(
-                    "Merge level {}→{}: {} parents ({} small, {} large), per-parent budget={} MB, concurrency={}",
+                    "Merge level {}→{}: {} parents, per-parent budget={} MB, concurrency={}",
                     child_level,
                     d,
-                    small_parents.len() + large_parents.len(),
-                    small_parents.len(),
-                    large_parents.len(),
+                    parent_children.len(),
                     per_parent_budget / 1_048_576,
                     build_concurrency,
                 );
             }
 
-            if let Some((parent, children, est_mem)) = large_parents.first() {
-                // A parent whose combined children exceed what is physically
-                // safe to hold can't be grid-sampled in memory at all — it
-                // signals either a pathological chunk plan or a budget set too
-                // low for the input. Bail out with a message the user can act on.
-                return Err(anyhow::anyhow!(
-                    "merge parent {:?} has {} children with combined estimate {} MB, \
-                     exceeding the {} MB in-memory merge limit. Raise --memory-limit \
-                     or investigate the chunk plan.",
-                    parent,
-                    children.len(),
-                    est_mem / 1_048_576,
-                    oom_threshold / 1_048_576,
-                ));
+            let parents: Vec<(VoxelKey, Vec<VoxelKey>)> = parent_children.into_iter().collect();
+            let merge = |(parent, children): &(VoxelKey, Vec<VoxelKey>)| {
+                self.merge_parent(parent, children, per_parent_budget)
+            };
+            match &merge_pool {
+                Some(pool) => pool.install(|| parents.par_iter().try_for_each(merge))?,
+                None => parents.iter().try_for_each(merge)?,
             }
-
-            // Sort small parents by descending estimated memory so the
-            // batching greedy stays balanced.
-            small_parents.sort_by_key(|p| std::cmp::Reverse(p.2));
-
-            // Cap each batch's combined working set at
-            // `build_concurrency × per_parent_budget` so that, with the merge
-            // pool capping concurrency, peak resident merge memory stays under
-            // `BUILD_PEAK_FRACTION × memory_budget` — the same invariant as
-            // phase 1.
-            let batch_cap = (build_concurrency as u64).saturating_mul(per_parent_budget);
-            let mut batch_start = 0;
-            while batch_start < small_parents.len() {
-                let mut batch_mem: u64 = 0;
-                let mut batch_end = batch_start;
-                while batch_end < small_parents.len() {
-                    if batch_end > batch_start && batch_mem + small_parents[batch_end].2 > batch_cap
-                    {
-                        break;
-                    }
-                    batch_mem += small_parents[batch_end].2;
-                    batch_end += 1;
-                }
-
-                let batch = &small_parents[batch_start..batch_end];
-                if !quiet {
-                    debug!(
-                        "  Merge batch: {} parents, est {} MB",
-                        batch.len(),
-                        batch_mem / 1_048_576,
-                    );
-                }
-                let process_batch = || -> Result<Vec<()>> {
-                    batch
-                        .par_iter()
-                        .map(|(parent, children, _)| -> Result<()> {
-                            let mut all_pts: Vec<(usize, RawPoint)> = Vec::new();
-                            for (ci, ck) in children.iter().enumerate() {
-                                for p in self.read_node(ck)? {
-                                    all_pts.push((ci, p));
-                                }
-                            }
-                            if all_pts.is_empty() {
-                                return Ok(());
-                            }
-                            // Children here are chunk (or sub-octant) roots,
-                            // which usually carry subtrees; only collapse when
-                            // none of them does.
-                            let mut allow_collapse = true;
-                            for ck in children {
-                                if self.has_child_nodes(ck)? {
-                                    allow_collapse = false;
-                                    break;
-                                }
-                            }
-                            let (parent_pts, per_child) =
-                                self.grid_sample(parent, all_pts, children.len(), allow_collapse);
-                            // Rewrite each child with its remaining points.
-                            for (ci, ck) in children.iter().enumerate() {
-                                self.write_node_to_temp(ck, &per_child[ci])?;
-                            }
-                            if !parent_pts.is_empty() {
-                                self.write_node_to_temp(parent, &parent_pts)?;
-                            }
-                            Ok(())
-                        })
-                        .collect::<Result<Vec<_>>>()
-                };
-                match &merge_pool {
-                    Some(pool) => pool.install(process_batch)?,
-                    None => process_batch()?,
-                };
-
-                for (parent, _, _) in &small_parents[batch_start..batch_end] {
-                    all_new_parents.push(*parent);
-                    keys_by_level.entry(d).or_default().insert(*parent);
-                }
-                batch_start = batch_end;
+            for (parent, _) in &parents {
+                all_new_parents.push(*parent);
+                keys_by_level.entry(d).or_default().insert(*parent);
             }
 
             // Report progress: one tick per merged level. Quiet (spill-local)
@@ -2897,6 +2954,168 @@ impl OctreeBuilder {
         }
 
         Ok(all_new_parents)
+    }
+
+    /// Grid-sample `parent` from its on-disk `children` in bounded memory.
+    ///
+    /// Children are sampled one at a time into a shared occupancy grid (each
+    /// child covers its own octant of the parent's cells). A child that fits
+    /// `per_parent_budget` is read and Morton-sorted for spatially coherent
+    /// picks; a larger one is streamed in file order. Parent and child
+    /// remainders are written back in batches, so peak memory is one
+    /// in-memory child plus a few batches — never all eight children, which
+    /// for volumetric data could total ~16.8M points (8 × 128³).
+    fn merge_parent(
+        &self,
+        parent: &VoxelKey,
+        children: &[VoxelKey],
+        per_parent_budget: u64,
+    ) -> Result<()> {
+        // Visit children in octant (Morton) order: the first point to reach
+        // a cell wins it, so a fixed order keeps output deterministic.
+        let mut children = children.to_vec();
+        children.sort_unstable_by_key(|k| (k.x & 1) | (k.y & 1) << 1 | (k.z & 1) << 2);
+        let counts: Vec<u64> = children
+            .iter()
+            .map(|ck| self.count_node(ck))
+            .collect::<Result<_>>()?;
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return Ok(());
+        }
+
+        // Children here are chunk (or sub-octant) roots, which usually carry
+        // subtrees; collapse only when none of them does (see grid_sample).
+        let mut allow_collapse = true;
+        for ck in &children {
+            if self.has_child_nodes(ck)? {
+                allow_collapse = false;
+                break;
+            }
+        }
+        if allow_collapse && total <= MAX_LEAF_POINTS {
+            let mut all = Vec::with_capacity(total as usize);
+            for ck in &children {
+                self.node_store.stream(ck, &mut |p| {
+                    all.push(p);
+                    Ok(())
+                })?;
+                self.write_node_to_temp(ck, &[])?;
+            }
+            return self.write_node_to_temp(parent, &all);
+        }
+
+        // Held in memory for the sort: the point, its cached Morton key and
+        // index, and its extra bytes.
+        let mem_per_point =
+            (std::mem::size_of::<RawPoint>() + 16) as u64 + self.num_extra_bytes as u64;
+        let max_in_memory = (per_parent_budget / mem_per_point).max(1);
+
+        let grid = SampleGrid::new(self, parent);
+        let mut occupied = vec![0u64; SampleGrid::CELLS / 64];
+        let mut parent_out = BatchedNodeWriter::new(self.node_store.writer(parent)?);
+        // The most recently accepted point is held back, so a child whose
+        // points were all accepted can take its last one back and never be
+        // left as an empty interior node.
+        let mut held_back: Option<RawPoint> = None;
+
+        for (ck, &count) in children.iter().zip(&counts) {
+            if count == 0 {
+                continue;
+            }
+            let mut child_out = BatchedNodeWriter::new(self.node_store.writer(ck)?);
+            let mut accepted_any = false;
+            let mut sample = |p: RawPoint| -> Result<()> {
+                if claim_cell(&mut occupied, grid.cell(&p)) {
+                    if let Some(prev) = held_back.replace(p) {
+                        parent_out.push(prev)?;
+                    }
+                    accepted_any = true;
+                } else {
+                    child_out.push(p)?;
+                }
+                Ok(())
+            };
+            if count <= max_in_memory {
+                let mut pts = Vec::with_capacity(count as usize);
+                self.node_store.stream(ck, &mut |p| {
+                    pts.push(p);
+                    Ok(())
+                })?;
+                pts.sort_by_cached_key(|p| grid.morton(p));
+                for p in pts {
+                    sample(p)?;
+                }
+            } else {
+                self.node_store.stream(ck, &mut sample)?;
+            }
+            if accepted_any && child_out.is_empty() {
+                // Every point of this child went to the parent. Refill it
+                // from its own subtree if it has a point to spare, so both
+                // keep one; otherwise hand the last accepted point back.
+                // Refilling matters for chains of single-cell nodes (data too
+                // concentrated to split): handing back would empty the
+                // parent, and every ancestor above it in turn.
+                // Take one point per level left above this child, so later
+                // refills along the same chain come from this small node
+                // instead of re-streaming a large one each time.
+                let refill = self.take_points_from_subtree(ck, (ck.level as usize).max(1))?;
+                if refill.is_empty() {
+                    child_out.push(held_back.take().expect("an accepted point is held back"))?;
+                }
+                for p in refill {
+                    child_out.push(p)?;
+                }
+            }
+            child_out.finish()?;
+        }
+        if let Some(p) = held_back {
+            parent_out.push(p)?;
+        }
+        parent_out.finish()
+    }
+
+    /// Remove and return up to `want` points from `key`'s subtree, taken
+    /// from the most populated descendant that can spare them while keeping
+    /// at least one point. Follows the most populated child downward past
+    /// single-point nodes. Empty when no descendant can spare a point.
+    fn take_points_from_subtree(&self, key: &VoxelKey, want: usize) -> Result<Vec<RawPoint>> {
+        let mut node = *key;
+        loop {
+            let mut best: Option<(VoxelKey, u64)> = None;
+            for i in 0..8 {
+                let child = VoxelKey {
+                    level: node.level + 1,
+                    x: node.x * 2 + (i & 1),
+                    y: node.y * 2 + ((i >> 1) & 1),
+                    z: node.z * 2 + ((i >> 2) & 1),
+                };
+                let n = self.count_node(&child)?;
+                if n > 0 && best.is_none_or(|(_, b)| n > b) {
+                    best = Some((child, n));
+                }
+            }
+            match best {
+                None => return Ok(Vec::new()),
+                Some((child, n)) if n >= 2 => {
+                    // Stream the node back without its first `take` points.
+                    let take = want.min(n as usize - 1);
+                    let mut taken = Vec::with_capacity(take);
+                    let mut out = BatchedNodeWriter::new(self.node_store.writer(&child)?);
+                    self.node_store.stream(&child, &mut |p| {
+                        if taken.len() < take {
+                            taken.push(p);
+                            Ok(())
+                        } else {
+                            out.push(p)
+                        }
+                    })?;
+                    out.finish()?;
+                    return Ok(taken);
+                }
+                Some((child, _)) => node = child,
+            }
+        }
     }
 
     /// Build the node map: per-chunk in-memory build, then merge across

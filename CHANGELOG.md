@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--progress json` stays valid NDJSON. They are also no longer wrapped in
   ANSI colour codes when stderr isn't a terminal (pod logs, redirected
   files).
+- Memory now stays within `--memory-limit` (or the detected container
+  limit) for inputs that previously got the process OOM-killed. Each case
+  below used to exceed a 1 GB container:
+  - Points too concentrated to split, such as many coincident points. The
+    oversized node is now streamed through the build, merge and writer
+    instead of being loaded whole.
+  - Volumetric data, where merging eight children could need several GB.
+    Children are now merged one at a time, streaming any that don't fit,
+    and the 2 GiB allowance above the budget is gone.
+  - Large Extra Bytes. The writer's batch size now follows the memory budget
+    and record size instead of a fixed 4M points.
+  - LAZ inputs written as a few huge chunks. These are now decoded
+    sequentially instead of loading a whole chunk per reader.
+  - Build spills of widely spread data, where the split-depth search could
+    allocate an entry per occupied cell.
 
 ### Changed
 

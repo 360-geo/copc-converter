@@ -117,8 +117,8 @@ jobs:
           create-args: pdal
           init-shell: bash
           cache-environment: true
-      - name: Build release binary
-        run: cargo build --release
+      - name: Build release binary and test-data tools
+        run: cargo build --release --bins --examples
       # Both steps share WORK so the synthetic inputs are generated once.
       # (`runner` isn't available in job-level env, only in steps.)
       - name: Stay within container memory limits

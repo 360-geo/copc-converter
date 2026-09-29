@@ -8,7 +8,9 @@
 #   gating        cases that must stay within the limit; any OOM fails (default)
 #   known-issues  inputs known to exceed the limit today; reported, never
 #                 fails. Move a case to gating once its fix lands.
-# Env:   BIN   Linux converter binary (default target/release/copc_converter)
+# Env:   BIN      Linux converter binary (default target/release/copc_converter)
+#        RECHUNK  rechunk_laz example binary for the host
+#                 (default target/release/examples/rechunk_laz)
 #        CPUS  container CPU limit (default 4, a GitHub runner's core count);
 #              memory use scales with the thread count derived from it
 #        WORK  scratch dir for inputs and outputs (default: fresh temp dir);
@@ -18,6 +20,7 @@ set -euo pipefail
 MODE=${1:-gating}
 CPUS=${CPUS:-4}
 BIN=$(realpath "${BIN:-target/release/copc_converter}")
+RECHUNK=${RECHUNK:-target/release/examples/rechunk_laz}
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(realpath "$WORK")
@@ -61,6 +64,24 @@ faux() {
   "offset_x":"auto","offset_y":"auto","offset_z":"auto"}
 ]}
 EOF
+}
+
+# one_chunk NAME COUNT: a LAZ file written as a single LAZ chunk, which the
+# parallel LAZ decoder would hold whole in memory.
+one_chunk() {
+  local name=$1 count=$2
+  local path="$WORK/in/$name.laz" las="$WORK/in/$name.las"
+  [[ -f "$path" ]] && return
+  pdal pipeline --stdin 2> >(grep -v "Auto offset" >&2) <<EOF
+{"pipeline":[
+ {"type":"readers.faux","mode":"random","count":$count,"bounds":"([0,2000],[0,2000],[0,50])"},
+ {"type":"filters.assign","value":["GpsTime = X*0.001 + Y","ReturnNumber = 1","NumberOfReturns = 1"]},
+ {"type":"writers.las","filename":"$las","compression":false,"minor_version":4,"dataformat_id":6,
+  "scale_x":0.001,"scale_y":0.001,"scale_z":0.001,"offset_x":"auto","offset_y":"auto","offset_z":"auto"}
+]}
+EOF
+  "$RECHUNK" "$las" "$path" "$count"
+  rm -f "$las"
 }
 
 # tiles NAME COUNT_PER_TILE GRID: a GRID x GRID set of adjacent 100 m tiles.
@@ -123,20 +144,25 @@ case "$MODE" in
   gating)
     faux uniform-20m 20000000 random "([0,2000],[0,2000],[0,50])"
     tiles tiles-10m 250000 6
-    run_case uniform-20m-auto 1g uniform-20m.laz
-    run_case uniform-20m-explicit 1g uniform-20m.laz --memory-limit 1G
-    run_case tiles-10m-auto 1g tiles-10m
-    ;;
-  known-issues)
-    # All three exceed 1 GB today (memory audit): coincident points pile
-    # into one node past the depth cap; a volumetric cube's merge parents
-    # exceed the budget; the writer window ignores Extra Bytes size.
+    # Adversarial shapes from the memory audit, each of which used to be
+    # OOM-killed under 1 GB: coincident points (one node past the depth
+    # cap), a volumetric cube (merge parents), 192 B of Extra Bytes per
+    # point (writer window) and a single 20M-point LAZ chunk (decoder).
     faux coincident-20m 20000000 constant "([100,100],[200,200],[5,5])"
     faux cube-20m 20000000 random "([0,1000],[0,1000],[0,1000])"
     faux extra-bytes-10m 10000000 random "([0,2000],[0,2000],[0,50])" 24
+    one_chunk one-chunk-20m 20000000
+    run_case uniform-20m-auto 1g uniform-20m.laz
+    run_case uniform-20m-explicit 1g uniform-20m.laz --memory-limit 1G
+    run_case tiles-10m-auto 1g tiles-10m
     run_case coincident-20m 1g coincident-20m.laz
     run_case cube-20m 1g cube-20m.laz
     run_case extra-bytes-10m 1g extra-bytes-10m.laz
+    run_case one-chunk-20m 1g one-chunk-20m.laz
+    ;;
+  known-issues)
+    # None open. Add inputs that exceed their limit here, with the reason,
+    # until a fix moves them to gating.
     ;;
   *)
     echo "unknown mode: $MODE (expected gating or known-issues)" >&2

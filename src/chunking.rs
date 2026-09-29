@@ -462,10 +462,14 @@ fn count_points(
     // holds points in on-disk layout (≤ ~67 B + extras per record); 120 is
     // a conservative ceiling that also covers the LAZ decoder's own
     // buffers. Match distribute: take 1/8 of the per-worker budget.
-    const BYTES_PER_POINT_TRANSIENT: u64 = 120;
+    // Decoded slab bytes per point, plus the extra bytes both in the slab
+    // and in flight (matching distribute's estimate).
+    const BASE_BYTES_PER_POINT_TRANSIENT: u64 = 120;
+    let bytes_per_point_transient =
+        BASE_BYTES_PER_POINT_TRANSIENT + 2 * builder.num_extra_bytes as u64;
     let per_worker_budget = config.memory_budget / num_workers as u64;
     let read_chunk_size =
-        ((per_worker_budget / 8) / BYTES_PER_POINT_TRANSIENT).clamp(50_000, 2_000_000) as usize;
+        ((per_worker_budget / 8) / bytes_per_point_transient).clamp(50_000, 2_000_000) as usize;
 
     debug!(
         "Counting with {} workers, {} files per worker, read_chunk_size={}",
@@ -482,9 +486,8 @@ fn count_points(
                 return Ok(local_bounds);
             }
 
-            for path in &input_files[start..end] {
-                let mut reader = las::Reader::from_path(path)
-                    .with_context(|| format!("Cannot open {:?}", path))?;
+            for (index, path) in input_files.iter().enumerate().take(end).skip(start) {
+                let mut reader = builder.open_input(index, path, per_worker_budget)?;
                 // Per-file byte slab: `fill_points` reuses the buffer across
                 // batches but only re-checks the *format* on reuse, while the
                 // coordinate transforms (scale/offset) can legitimately differ
