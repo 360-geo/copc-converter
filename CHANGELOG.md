@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Level of detail no longer renders as patchy, grid-like low-density
+  rectangles in viewers such as QGIS
+  ([#21](https://github.com/360-geo/copc-converter/issues/21)). Merging small
+  subtrees into a single leaf could move a subdivided node's LOD points up
+  into its parent, leaving an empty interior node. Viewers reaching that
+  depth then showed only the sparse ancestor levels for that region, and too
+  many points ended up in the root. The merge now happens only when every
+  child is a leaf. Affects files written by 0.11.0 through 0.15.0.
+
 ## [0.15.0] - 2026-09-15
 
 ### Fixed
