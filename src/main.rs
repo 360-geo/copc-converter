@@ -1,3 +1,5 @@
+mod memory_limit;
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use copc_converter::{
@@ -27,8 +29,10 @@ struct Args {
     /// Output COPC file path
     output: PathBuf,
 
-    /// Maximum memory budget (e.g. "16G", "8G", "4096M", "512M").
-    /// If not specified, auto-detects from cgroup limits (K8s) or system RAM.
+    /// Maximum memory budget (e.g. "16G", "16Gi", "4096M", "512Mi"; units are
+    /// binary). If not specified, auto-detects the tightest cgroup limit on
+    /// this process (Kubernetes: memory.max / memory.high, or cgroup v1),
+    /// capped at system RAM.
     #[arg(long)]
     memory_limit: Option<String>,
 
@@ -115,97 +119,6 @@ enum ProgressMode {
     Plain,
     /// NDJSON — one JSON object per line
     Json,
-}
-
-/// Detect available memory from cgroup limits (v2 then v1) or system RAM.
-fn detect_available_memory() -> u64 {
-    // Try cgroup v2
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        let s = s.trim();
-        if s != "max"
-            && let Ok(v) = s.parse::<u64>()
-        {
-            return v;
-        }
-    }
-    // Try cgroup v1
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        && let Ok(v) = s.trim().parse::<u64>()
-    {
-        // v1 returns a huge sentinel value when unlimited
-        if v < 0x7FFF_FFFF_FFFF_F000 {
-            return v;
-        }
-    }
-    // Fallback: read /proc/meminfo (Linux) or use sysctl (macOS)
-    #[cfg(target_os = "linux")]
-    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb_str = rest.trim().trim_end_matches(" kB").trim();
-                if let Ok(kb) = kb_str.parse::<u64>() {
-                    return kb * 1024;
-                }
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-        if let Ok(output) = Command::new("sysctl").arg("-n").arg("hw.memsize").output()
-            && let Ok(s) = std::str::from_utf8(&output.stdout)
-            && let Ok(v) = s.trim().parse::<u64>()
-        {
-            return v;
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::mem::MaybeUninit;
-        // SAFETY: GlobalMemoryStatusEx is a well-defined Windows API call.
-        unsafe {
-            #[repr(C)]
-            struct MemoryStatusEx {
-                length: u32,
-                memory_load: u32,
-                total_phys: u64,
-                avail_phys: u64,
-                total_page_file: u64,
-                avail_page_file: u64,
-                total_virtual: u64,
-                avail_virtual: u64,
-                avail_extended_virtual: u64,
-            }
-            unsafe extern "system" {
-                fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
-            }
-            let mut status = MaybeUninit::<MemoryStatusEx>::zeroed().assume_init();
-            status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
-            if GlobalMemoryStatusEx(&mut status) != 0 {
-                return status.total_phys;
-            }
-        }
-    }
-    // Last resort: 16 GB
-    16 * 1024 * 1024 * 1024
-}
-
-/// Parse a human-readable size string into bytes.
-fn parse_memory_limit(s: &str) -> Result<u64> {
-    let s = s.trim();
-    let (num_part, multiplier) = if let Some(n) = s.strip_suffix(['G', 'g']) {
-        (n.trim(), 1024u64 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix(['M', 'm']) {
-        (n.trim(), 1024u64 * 1024)
-    } else if let Some(n) = s.strip_suffix(['K', 'k']) {
-        (n.trim(), 1024u64)
-    } else {
-        (s, 1u64)
-    };
-    let value: f64 = num_part
-        .parse()
-        .with_context(|| format!("Invalid memory limit: {s:?}"))?;
-    Ok((value * multiplier as f64) as u64)
 }
 
 /// Total pipeline stages: Scanning + Counting + Distributing + Building + Writing.
@@ -620,9 +533,15 @@ fn main() -> Result<()> {
         args.output
     };
 
-    let raw_limit = match &args.memory_limit {
-        Some(s) => parse_memory_limit(s)?,
-        None => detect_available_memory(),
+    let (raw_limit, limit_source) = match &args.memory_limit {
+        Some(s) => (memory_limit::parse_size(s)?, "user-specified".to_string()),
+        None => {
+            let detected = memory_limit::detect();
+            (
+                detected.bytes,
+                format!("auto-detected: {}", detected.source),
+            )
+        }
     };
     let memory_budget = (raw_limit as f64 * MEMORY_SAFETY_FACTOR) as u64;
     let human_bytes = |b: u64| -> String {
@@ -633,15 +552,19 @@ fn main() -> Result<()> {
         }
     };
     eprintln!(
-        "Memory: {} limit, {} budget ({})",
+        "Memory: {} limit, {} budget ({limit_source})",
         human_bytes(raw_limit),
         human_bytes(memory_budget),
-        if args.memory_limit.is_some() {
-            "user-specified"
-        } else {
-            "auto-detected"
-        },
     );
+    let temp_root = args.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+    if memory_limit::is_ram_backed(&temp_root) {
+        eprintln!(
+            "Warning: temp dir {temp_root:?} is on a RAM-backed filesystem (tmpfs). \
+             Scratch files, roughly the size of the uncompressed input, will use \
+             memory, and in a container they count against its memory limit. \
+             Point --temp-dir at disk-backed storage."
+        );
+    }
 
     let progress: std::sync::Arc<dyn ProgressObserver> = match args.progress {
         ProgressMode::Bar => std::sync::Arc::new(BarProgress::new(TOTAL_STEPS)),

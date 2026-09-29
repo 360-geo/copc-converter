@@ -65,6 +65,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   floating-point steps that copc.js (the reference reader, behind
   copc-validator) uses to compute node bounds. Before, such a point could
   land about 1e-14 m outside its node's bounds.
+- Auto-detection of the memory limit now finds the process's own cgroup
+  from `/proc/self/cgroup` and takes the tightest limit on it and its
+  ancestors, including cgroup v2 `memory.high`. It is capped at physical
+  RAM. Before, it read only the cgroup at the mount root. In a container
+  without its own cgroup namespace, that meant the node's entire RAM was
+  treated as the budget.
+- The header's Generating Software field now records the converter's
+  version (e.g. `copc_converter 0.16.0`) instead of a fixed
+  `copc_converter 0.1`.
+
+### Added
+
+- `--memory-limit` accepts Kubernetes-style units (`16Gi`, `512Mi`,
+  `1Ti`) as well as `GB`/`GiB`; all are binary units, as `G` already was.
+- A warning when the temp directory is on a RAM-backed filesystem (tmpfs,
+  such as a Kubernetes `emptyDir` with `medium: Memory`). Scratch files
+  there use memory and count against a container's limit.
+- The memory-limit log line says where the limit came from, e.g.
+  `auto-detected: cgroup /sys/fs/cgroup/memory.max`.
 
 ### Changed
 

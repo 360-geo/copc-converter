@@ -226,12 +226,7 @@ pub fn write_copc(
         .enumerate()
         .for_each(|(i, &c)| sysid[i] = c);
     w.write_all(&sysid)?;
-    let mut gensoft = [0u8; 32];
-    b"copc_converter 0.1"
-        .iter()
-        .enumerate()
-        .for_each(|(i, &c)| gensoft[i] = c);
-    w.write_all(&gensoft)?;
+    w.write_all(&generating_software())?;
     let (creation_doy, creation_year) = file_creation_date();
     w.write_u16::<LittleEndian>(creation_doy)?;
     w.write_u16::<LittleEndian>(creation_year)?;
@@ -921,6 +916,18 @@ impl RunReader {
             self.num_extra_bytes,
         )))
     }
+}
+
+/// The header's Generating Software field: `copc_converter <version>`,
+/// null-padded (or truncated) to 32 bytes. Release builds get their version
+/// from the git tag (CI sets it in Cargo.toml before building); local builds
+/// report `0.0.0-dev`.
+fn generating_software() -> [u8; 32] {
+    let name = concat!("copc_converter ", env!("CARGO_PKG_VERSION"));
+    let mut field = [0u8; 32];
+    let len = name.len().min(field.len());
+    field[..len].copy_from_slice(&name.as_bytes()[..len]);
+    field
 }
 
 /// Today's date as `(day_of_year, year)` for the LAS header's File Creation

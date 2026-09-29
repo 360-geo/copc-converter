@@ -2129,3 +2129,17 @@ fn validate_file_from_env() {
     let path = std::env::var("COPC_VALIDATE").expect("set COPC_VALIDATE to a COPC file path");
     common::assert_valid_copc(Path::new(&path));
 }
+
+#[test]
+fn header_names_the_converter_version() {
+    // Generating Software (header bytes 58..90) identifies the release that
+    // wrote a file, e.g. to tell which files a later fix applies to.
+    let output = Path::new("tests/data/test_generating_software.copc.laz");
+    run_converter(Path::new("tests/data/input.laz"), output);
+    let data = read_file(output);
+    let field = String::from_utf8_lossy(&data[58..90])
+        .trim_end_matches('\0')
+        .to_string();
+    assert_eq!(field, concat!("copc_converter ", env!("CARGO_PKG_VERSION")));
+    let _ = std::fs::remove_file(output);
+}
