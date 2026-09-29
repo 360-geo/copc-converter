@@ -384,9 +384,10 @@ fn merge_chunk_shards(shards_root: &Path, chunks_root: &Path, n_chunks: u32) -> 
     Ok(())
 }
 
-/// Task fed into the parallel grid-sampling step: parent key, child keys, and
-/// indexed points (child-index, point).
-type SampleTask = (VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>);
+/// Task fed into the parallel grid-sampling step: parent key, child keys,
+/// indexed points (child-index, point), and whether the parent may collapse
+/// its children into a single leaf (see [`OctreeBuilder::grid_sample`]).
+type SampleTask = (VoxelKey, Vec<VoxelKey>, Vec<(usize, RawPoint)>, bool);
 
 /// Result coming back from parallel grid-sampling: parent key, child keys,
 /// promoted points, and per-child remaining points.
@@ -1556,6 +1557,26 @@ impl OctreeBuilder {
         self.node_store.read(key)
     }
 
+    /// Whether any of `key`'s eight child nodes holds points in the node store.
+    ///
+    /// Interior nodes always keep at least one point (see `grid_sample`), so a
+    /// node has descendants exactly when one of its direct children is
+    /// non-empty.
+    fn has_child_nodes(&self, key: &VoxelKey) -> Result<bool> {
+        for i in 0..8 {
+            let child = VoxelKey {
+                level: key.level + 1,
+                x: key.x * 2 + (i & 1),
+                y: key.y * 2 + ((i >> 1) & 1),
+                z: key.z * 2 + ((i >> 2) & 1),
+            };
+            if self.count_node(&child)? > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Write points for the given node key (overwrites any prior content).
     pub fn write_node_to_temp(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
         self.node_store.write(key, points)
@@ -1585,6 +1606,9 @@ impl OctreeBuilder {
         report_progress: bool,
         config: &crate::PipelineConfig,
     ) -> Result<Vec<(VoxelKey, usize)>> {
+        // Nodes that kept descendants after sampling. The incoming `nodes`
+        // are all leaves; a parent becomes interior when it did not collapse.
+        let mut interior: FxHashSet<VoxelKey> = FxHashSet::default();
         for d in (min_level..actual_max_depth).rev() {
             if report_progress {
                 config.report(crate::ProgressEvent::StageProgress {
@@ -1619,20 +1643,22 @@ impl OctreeBuilder {
                                 .map(move |p| (ci, p))
                         })
                         .collect();
-                    (parent, children, all_pts)
+                    let allow_collapse = !children.iter().any(|c| interior.contains(c));
+                    (parent, children, all_pts, allow_collapse)
                 })
                 .collect();
 
             // Grid-sample in parallel.
             let results: Vec<SampleResult> = tasks
                 .into_par_iter()
-                .map(|(parent, children, all_pts)| -> Result<_> {
+                .map(|(parent, children, all_pts, allow_collapse)| -> Result<_> {
                     if all_pts.is_empty() {
                         let n = children.len();
                         return Ok((parent, children, vec![], vec![vec![]; n]));
                     }
                     let n = children.len();
-                    let (parent_pts, remaining) = self.grid_sample(&parent, all_pts, n);
+                    let (parent_pts, remaining) =
+                        self.grid_sample(&parent, all_pts, n, allow_collapse);
                     Ok((parent, children, parent_pts, remaining))
                 })
                 .collect::<Result<_>>()?;
@@ -1642,6 +1668,7 @@ impl OctreeBuilder {
                 for (ck, rem) in children.into_iter().zip(remaining) {
                     if !rem.is_empty() {
                         nodes.insert(ck, rem);
+                        interior.insert(parent);
                     }
                 }
                 if !parent_pts.is_empty() {
@@ -1676,6 +1703,7 @@ impl OctreeBuilder {
         parent: &VoxelKey,
         mut pts: Vec<(usize, RawPoint)>, // takes ownership — no cloning
         n_children: usize,
+        allow_collapse: bool,
     ) -> (Vec<RawPoint>, Vec<Vec<RawPoint>>) {
         if pts.is_empty() {
             return (vec![], vec![vec![]; n_children]);
@@ -1687,11 +1715,15 @@ impl OctreeBuilder {
         // fits — so output node depth tracks point *density*, not the build's
         // (memory-driven) spill depth. Without this, a region the spill had to
         // split deep stays fragmented into many tiny deep nodes even though its
-        // points would comfortably fit one leaf. `pts` here is the full subtree
-        // total because collapse runs deepest-first: a collapsed child folds
-        // all its points into the parent, so the next level up sees the true
-        // total; a non-collapsed (oversized) child correctly stays subdivided.
-        if pts.len() as u64 <= MAX_LEAF_POINTS {
+        // points would comfortably fit one leaf.
+        //
+        // Only valid when every child is itself a leaf: then `pts` is the full
+        // subtree total. A child with descendants contributes just its thinned
+        // LOD sample, so collapsing would hollow it out into an empty interior
+        // node — viewers descending to that depth would find no points there
+        // and render the region at its ancestors' sparse density (issue #21).
+        // Callers pass `allow_collapse = false` in that case.
+        if allow_collapse && pts.len() as u64 <= MAX_LEAF_POINTS {
             let parent_pts = pts.into_iter().map(|(_, p)| p).collect();
             return (parent_pts, vec![vec![]; n_children]);
         }
@@ -2771,8 +2803,18 @@ impl OctreeBuilder {
                             if all_pts.is_empty() {
                                 return Ok(());
                             }
+                            // Children here are chunk (or sub-octant) roots,
+                            // which usually carry subtrees; only collapse when
+                            // none of them does.
+                            let mut allow_collapse = true;
+                            for ck in children {
+                                if self.has_child_nodes(ck)? {
+                                    allow_collapse = false;
+                                    break;
+                                }
+                            }
                             let (parent_pts, per_child) =
-                                self.grid_sample(parent, all_pts, children.len());
+                                self.grid_sample(parent, all_pts, children.len(), allow_collapse);
                             // Rewrite each child with its remaining points.
                             for (ci, ck) in children.iter().enumerate() {
                                 self.write_node_to_temp(ck, &per_child[ci])?;

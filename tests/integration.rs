@@ -702,6 +702,56 @@ fn hierarchy_structure_similar_to_reference() {
     let _ = std::fs::remove_file(output);
 }
 
+/// Every node that has data below it must hold points itself. An empty
+/// interior node makes viewers that pick a uniform octree depth (QGIS) render
+/// that region at its ancestors' sparse LOD, producing rectangular density
+/// patches (issue #21).
+fn assert_no_empty_interior_nodes(hier: &[HierarchyEntry], label: &str) {
+    let counts: HashMap<VoxelKey, i32> = hier
+        .iter()
+        .map(|e| (e.key.clone(), e.point_count))
+        .collect();
+    for e in hier.iter().filter(|e| e.point_count > 0) {
+        let mut k = e.key.clone();
+        while k.level > 0 {
+            k = VoxelKey {
+                level: k.level - 1,
+                x: k.x / 2,
+                y: k.y / 2,
+                z: k.z / 2,
+            };
+            let n = counts.get(&k).copied().unwrap_or(0);
+            assert!(
+                n > 0,
+                "[{label}] interior node {:?} has {} points but descendant {:?} has data",
+                k,
+                n,
+                e.key,
+            );
+        }
+    }
+}
+
+#[test]
+fn interior_nodes_are_never_empty() {
+    let cases: &[(&str, &[&str])] = &[
+        ("default", &[]),
+        // A tiny budget forces many chunks, exercising the cross-chunk merge.
+        ("chunked-merge", &["--memory-limit", "1M"]),
+        (
+            "chunked-merge-packed",
+            &["--memory-limit", "1M", "--node-storage", "packed"],
+        ),
+    ];
+    for (label, args) in cases {
+        let output = std::path::PathBuf::from(format!("tests/data/test_interior_{label}.copc.laz"));
+        run_converter_with_args(Path::new("tests/data/input.laz"), &output, args);
+        let data = read_file(&output);
+        assert_no_empty_interior_nodes(&read_hierarchy(&data), label);
+        let _ = std::fs::remove_file(&output);
+    }
+}
+
 #[test]
 fn deterministic_output() {
     // Two runs should produce equivalent output.
