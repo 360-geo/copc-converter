@@ -84,7 +84,10 @@ run_case() {
   shift 3
   local container="copc-memtest-$name-$$" status oom rss_kb rss verdict
   set +e
-  docker run --name "$container" --memory="$mem" --memory-swap="$mem" --cpus="$CPUS" \
+  # Run as the invoking user: files the converter leaves behind (e.g. temp
+  # files after an OOM kill) must be removable by this script on Linux,
+  # where a root container would own them.
+  docker run --name "$container" --user "$(id -u):$(id -g)" --memory="$mem" --memory-swap="$mem" --cpus="$CPUS" \
     -v "$BIN:/usr/local/bin/copc_converter:ro" -v "$WORK:/work" "$IMAGE" \
     /usr/bin/time -f '%M' -o "/work/out/$name.rss" \
     copc_converter "/work/in/$input" "/work/out/$name.copc.laz" \
