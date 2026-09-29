@@ -2007,3 +2007,93 @@ fn understated_header_bounds_still_produce_valid_copc() {
     let _ = std::fs::remove_file(input);
     let _ = std::fs::remove_file(output);
 }
+
+#[test]
+fn coincident_points_stay_within_tiny_budget_paths() {
+    // A million points on one coordinate can't be split by depth, so they
+    // end up in one node larger than a 1 MB budget allows in memory. This
+    // drives every bounded-memory path: the spill streams the unsplittable
+    // sub-octant into a leaf, the merge streams that child instead of
+    // loading it, and the writer externally sorts the node into its chunk
+    // (the validator checks it is GPS-sorted). Run for both node stores.
+    use las::point::Format;
+    use las::{Builder, Point, Writer};
+
+    let input = Path::new("tests/data/test_coincident_input.las");
+    let mut builder = Builder::from((1, 4));
+    builder.point_format = Format::new(6).unwrap();
+    let mut writer = Writer::from_path(input, builder.into_header().unwrap()).unwrap();
+    let n: u32 = 1_000_000;
+    for i in 0..n {
+        writer
+            .write_point(Point {
+                x: 100.0,
+                y: 200.0,
+                z: 5.0,
+                return_number: 1,
+                number_of_returns: 1,
+                // Scrambled so sorting the node has real work to do.
+                gps_time: Some(f64::from(i.wrapping_mul(2_654_435_761) % n)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+
+    for (label, extra) in [
+        ("file", &[][..]),
+        ("packed", &["--node-storage", "packed"][..]),
+    ] {
+        let output =
+            std::path::PathBuf::from(format!("tests/data/test_coincident_{label}.copc.laz"));
+        let mut args = vec!["--memory-limit", "1M"];
+        args.extend_from_slice(extra);
+        // run_converter validates the output.
+        run_converter_with_args(input, &output, &args);
+        let header = read_las_header(&read_file(&output));
+        assert_eq!(header.total_points, u64::from(n), "{label}");
+        let _ = std::fs::remove_file(&output);
+    }
+    let _ = std::fs::remove_file(input);
+}
+
+#[test]
+fn huge_laz_chunks_are_decoded_sequentially() {
+    // A LAZ file written as one 300k-point chunk: the parallel decoder
+    // would hold the whole chunk in memory, which a 1 MB budget can't
+    // afford, so the converter must switch to the sequential decoder.
+    let las_input = Path::new("tests/data/test_onechunk_input.las");
+    let laz_input = Path::new("tests/data/test_onechunk_input.laz");
+    let output = Path::new("tests/data/test_onechunk.copc.laz");
+    write_gps_las(las_input, las::GpsTimeType::Standard, 300_000);
+    common::rechunk::rechunk_las_to_laz(las_input, laz_input, 1_000_000).unwrap();
+
+    let result = Command::new(converter_bin())
+        .arg(laz_input)
+        .arg(output)
+        .args(["--progress", "plain", "--memory-limit", "1M"])
+        .env("RUST_LOG", "copc_converter=debug")
+        .output()
+        .expect("failed to run copc_converter");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "converter failed: {stderr}");
+    assert!(
+        stderr.contains("decoding sequentially"),
+        "expected the sequential LAZ decoder to be chosen"
+    );
+    common::assert_valid_copc(output);
+    assert_eq!(read_las_header(&read_file(output)).total_points, 300_000);
+    for p in [las_input, laz_input, output] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Validate any COPC file against the spec checks, e.g. a production
+/// output: `COPC_VALIDATE=out.copc.laz cargo test --release --test
+/// integration validate_file_from_env -- --ignored`.
+#[test]
+#[ignore = "validates the file named by COPC_VALIDATE"]
+fn validate_file_from_env() {
+    let path = std::env::var("COPC_VALIDATE").expect("set COPC_VALIDATE to a COPC file path");
+    common::assert_valid_copc(Path::new(&path));
+}

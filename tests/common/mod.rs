@@ -7,6 +7,8 @@
 //! issues rather than panicking, so tests can also assert that deliberately
 //! corrupted files are caught.
 
+pub mod rechunk;
+
 use byteorder::{LittleEndian as LE, ReadBytesExt};
 use laz::LazVlr;
 use laz::record::{LayeredPointRecordDecompressor, RecordDecompressor};
@@ -454,6 +456,7 @@ fn check(data: &[u8], issues: &mut Vec<String>) -> std::io::Result<()> {
     let (mut decoded_gps_min, mut decoded_gps_max) = (f64::MAX, f64::MIN);
     let mut outside_node = 0u64;
     let mut first_outside: Option<String> = None;
+    let mut unsorted_nodes: Vec<Key> = Vec::new();
     for e in &data_nodes {
         let chunk = &data[e.offset as usize..(e.offset + e.byte_size as u64) as usize];
         let mut decompressor = LayeredPointRecordDecompressor::new(Cursor::new(chunk));
@@ -467,6 +470,7 @@ fn check(data: &[u8], issues: &mut Vec<String>) -> std::io::Result<()> {
             center[1] - halfsize + e.key.y as f64 * side,
             center[2] - halfsize + e.key.z as f64 * side,
         ];
+        let mut last_gps = f64::MIN;
         for _ in 0..e.point_count {
             if let Err(err) = decompressor.decompress_next(&mut record) {
                 issues.push(format!("chunk {:?} failed to decode: {err}", e.key));
@@ -482,6 +486,12 @@ fn check(data: &[u8], issues: &mut Vec<String>) -> std::io::Result<()> {
             if (1..=15).contains(&return_number) {
                 decoded_by_return[return_number as usize - 1] += 1;
             }
+            // Converter invariant (not spec): points within a node are
+            // sorted by GPS time, which the temporal index relies on.
+            if gps_time < last_gps && unsorted_nodes.last() != Some(&e.key) {
+                unsorted_nodes.push(e.key);
+            }
+            last_gps = gps_time;
             decoded_gps_min = decoded_gps_min.min(gps_time);
             decoded_gps_max = decoded_gps_max.max(gps_time);
             for a in 0..3 {
@@ -500,6 +510,13 @@ fn check(data: &[u8], issues: &mut Vec<String>) -> std::io::Result<()> {
                 }
             }
         }
+    }
+    if !unsorted_nodes.is_empty() {
+        issues.push(format!(
+            "{} nodes are not sorted by GPS time (first: {:?})",
+            unsorted_nodes.len(),
+            unsorted_nodes[0]
+        ));
     }
     if outside_node > 0 {
         issues.push(format!(

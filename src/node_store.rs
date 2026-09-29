@@ -15,7 +15,7 @@
 
 use crate::TempCompression;
 use crate::copc_types::VoxelKey;
-use crate::octree::{RawPoint, count_temp_file_points, read_temp_batches, write_temp_batch};
+use crate::octree::{RawPoint, count_temp_file_points, stream_temp_batches, write_temp_batch};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::fs::{File, OpenOptions};
@@ -25,13 +25,25 @@ use std::sync::Mutex;
 
 /// Storage backend for per-node point data during build.
 ///
-/// All methods are safe to call concurrently from rayon workers. `count`
-/// on a key that was never written returns `Ok(0)`; `read` returns
-/// `Ok(vec![])`. Writes overwrite any previous data for the key.
+/// All methods are safe to call concurrently from rayon workers. A key that
+/// was never written has `count` 0 and streams no points. Writes overwrite
+/// any previous data for the key.
 pub(crate) trait NodeStore: Send + Sync {
     fn write(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()>;
-    fn read(&self, key: &VoxelKey) -> Result<Vec<RawPoint>>;
     fn count(&self, key: &VoxelKey) -> Result<u64>;
+    /// Visit every point of a node without materialising them all, so a
+    /// node larger than memory can be processed in bounded space.
+    fn stream(&self, key: &VoxelKey, f: &mut dyn FnMut(RawPoint) -> Result<()>) -> Result<()>;
+    /// Start replacing a node's data batch by batch. The old data stays
+    /// readable (e.g. streamed by the caller) until `finish` swaps it in.
+    fn writer(&self, key: &VoxelKey) -> Result<Box<dyn NodeWriter + '_>>;
+}
+
+/// Incremental writer from [`NodeStore::writer`]. Dropping it without
+/// calling `finish` leaves the node's previous data in place.
+pub(crate) trait NodeWriter {
+    fn append(&mut self, points: &[RawPoint]) -> Result<()>;
+    fn finish(self: Box<Self>) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -69,18 +81,56 @@ impl NodeStore for FileNodeStore {
         Ok(())
     }
 
-    fn read(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
-        let path = self.node_path(key);
-        let f = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(e.into()),
-        };
-        read_temp_batches(f, self.num_extra_bytes, self.codec)
-    }
-
     fn count(&self, key: &VoxelKey) -> Result<u64> {
         count_temp_file_points(&self.node_path(key), self.num_extra_bytes, self.codec)
+    }
+
+    fn stream(&self, key: &VoxelKey, f: &mut dyn FnMut(RawPoint) -> Result<()>) -> Result<()> {
+        let file = match File::open(self.node_path(key)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        stream_temp_batches(file, self.num_extra_bytes, self.codec, f)
+    }
+
+    fn writer(&self, key: &VoxelKey) -> Result<Box<dyn NodeWriter + '_>> {
+        // Write beside the node and rename over it on finish, so the node's
+        // current file can still be streamed while its replacement is built.
+        let path = self.node_path(key);
+        let partial = path.with_extension("partial");
+        let file = File::create(&partial).with_context(|| format!("creating {partial:?}"))?;
+        Ok(Box::new(FileNodeWriter {
+            out: BufWriter::new(file),
+            partial,
+            path,
+            num_extra_bytes: self.num_extra_bytes,
+            codec: self.codec,
+        }))
+    }
+}
+
+struct FileNodeWriter {
+    out: BufWriter<File>,
+    partial: PathBuf,
+    path: PathBuf,
+    num_extra_bytes: u16,
+    codec: TempCompression,
+}
+
+impl NodeWriter for FileNodeWriter {
+    fn append(&mut self, points: &[RawPoint]) -> Result<()> {
+        if !points.is_empty() {
+            write_temp_batch(&mut self.out, points, self.num_extra_bytes, self.codec)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<()> {
+        self.out.flush().context("flush node temp file")?;
+        std::fs::rename(&self.partial, &self.path)
+            .with_context(|| format!("renaming {:?} into place", self.partial))?;
+        Ok(())
     }
 }
 
@@ -107,9 +157,11 @@ pub(crate) struct PackedNodeStore {
     /// writer so we can capture the offset before the write without having
     /// to consult the file system.
     pack_offsets: Vec<Mutex<u64>>,
-    /// `VoxelKey → NodeLocation`. Read-heavy during merge and writer phases;
-    /// `DashMap` gives us concurrent reads and writes without a global lock.
-    index: DashMap<VoxelKey, NodeLocation>,
+    /// `VoxelKey → segments`. A node written in one go has one segment; a
+    /// node streamed through [`NodeStore::writer`] has one per batch.
+    /// Read-heavy during merge and writer phases; `DashMap` gives us
+    /// concurrent reads and writes without a global lock.
+    index: DashMap<VoxelKey, Vec<NodeLocation>>,
 }
 
 impl PackedNodeStore {
@@ -158,8 +210,9 @@ impl PackedNodeStore {
     }
 }
 
-impl NodeStore for PackedNodeStore {
-    fn write(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
+impl PackedNodeStore {
+    /// Serialize one batch and append it to the current thread's pack.
+    fn append_segment(&self, points: &[RawPoint]) -> Result<NodeLocation> {
         // Serialize first so we know the exact byte length and the pack
         // Mutex is held for the shortest possible time.
         let mut buf = Vec::new();
@@ -181,25 +234,16 @@ impl NodeStore for PackedNodeStore {
             *cursor += byte_len as u64;
             offset
         };
-
-        self.index.insert(
-            *key,
-            NodeLocation {
-                pack_id: pack_id as u16,
-                offset,
-                byte_len,
-                point_count: points.len() as u32,
-            },
-        );
-        Ok(())
+        Ok(NodeLocation {
+            pack_id: pack_id as u16,
+            offset,
+            byte_len,
+            point_count: points.len() as u32,
+        })
     }
 
-    fn read(&self, key: &VoxelKey) -> Result<Vec<RawPoint>> {
-        let loc = match self.index.get(key) {
-            Some(loc) => *loc,
-            None => return Ok(vec![]),
-        };
-
+    /// Open a reader over one segment's bytes.
+    fn open_segment(&self, loc: &NodeLocation) -> Result<std::io::Take<File>> {
         // Flush the pack writer's buffer so the bytes we're about to read
         // from disk are actually there. We only flush, don't drop the writer,
         // so later writes keep appending through the same BufWriter.
@@ -209,21 +253,73 @@ impl NodeStore for PackedNodeStore {
                 .expect("pack writer mutex poisoned");
             writer.flush().context("flush pack before read")?;
         }
-
         let path = self.pack_path(loc.pack_id);
         let mut f = File::open(&path).with_context(|| format!("opening pack file {:?}", path))?;
         f.seek(SeekFrom::Start(loc.offset))
             .context("seek to node offset")?;
-        let mut limited = f.take(loc.byte_len as u64);
-        read_temp_batches(&mut limited, self.num_extra_bytes, self.codec)
+        Ok(f.take(loc.byte_len as u64))
+    }
+
+    fn segments(&self, key: &VoxelKey) -> Vec<NodeLocation> {
+        self.index.get(key).map(|s| s.clone()).unwrap_or_default()
+    }
+}
+
+impl NodeStore for PackedNodeStore {
+    fn write(&self, key: &VoxelKey, points: &[RawPoint]) -> Result<()> {
+        let loc = self.append_segment(points)?;
+        self.index.insert(*key, vec![loc]);
+        Ok(())
     }
 
     fn count(&self, key: &VoxelKey) -> Result<u64> {
         Ok(self
             .index
             .get(key)
-            .map(|loc| loc.point_count as u64)
+            .map(|segs| segs.iter().map(|l| l.point_count as u64).sum())
             .unwrap_or(0))
+    }
+
+    fn stream(&self, key: &VoxelKey, f: &mut dyn FnMut(RawPoint) -> Result<()>) -> Result<()> {
+        for loc in &self.segments(key) {
+            stream_temp_batches(
+                self.open_segment(loc)?,
+                self.num_extra_bytes,
+                self.codec,
+                &mut *f,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn writer(&self, key: &VoxelKey) -> Result<Box<dyn NodeWriter + '_>> {
+        Ok(Box::new(PackedNodeWriter {
+            store: self,
+            key: *key,
+            segments: Vec::new(),
+        }))
+    }
+}
+
+struct PackedNodeWriter<'a> {
+    store: &'a PackedNodeStore,
+    key: VoxelKey,
+    segments: Vec<NodeLocation>,
+}
+
+impl NodeWriter for PackedNodeWriter<'_> {
+    fn append(&mut self, points: &[RawPoint]) -> Result<()> {
+        if !points.is_empty() {
+            self.segments.push(self.store.append_segment(points)?);
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<()> {
+        // Replacing the index entry is the atomic swap; the old segments
+        // become dead space in the packs, as with any overwrite.
+        self.store.index.insert(self.key, self.segments);
+        Ok(())
     }
 }
 
@@ -231,6 +327,17 @@ impl NodeStore for PackedNodeStore {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn read_all(store: &dyn NodeStore, key: &VoxelKey) -> Vec<RawPoint> {
+        let mut out = Vec::new();
+        store
+            .stream(key, &mut |p| {
+                out.push(p);
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
 
     fn sample_point(x: i32) -> RawPoint {
         RawPoint {
@@ -269,7 +376,7 @@ mod tests {
         let pts = vec![sample_point(1), sample_point(2), sample_point(3)];
         store.write(&key, &pts).unwrap();
 
-        let got = store.read(&key).unwrap();
+        let got = read_all(&store, &key);
         assert_eq!(got.len(), pts.len());
         assert_eq!(got[0].x, 1);
         assert_eq!(got[2].z, 9);
@@ -295,7 +402,7 @@ mod tests {
             .write(&key, &[sample_point(20), sample_point(21)])
             .unwrap();
 
-        let got = store.read(&key).unwrap();
+        let got = read_all(&store, &key);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].x, 20);
         assert_eq!(got[1].x, 21);
@@ -317,7 +424,7 @@ mod tests {
             y: 0,
             z: 0,
         };
-        assert!(store.read(&key).unwrap().is_empty());
+        assert!(read_all(&store, &key).is_empty());
         assert_eq!(store.count(&key).unwrap(), 0);
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -358,12 +465,63 @@ mod tests {
                 y: 0,
                 z: 0,
             };
-            let got = store.read(&key).unwrap();
+            let got = read_all(&*store, &key);
             assert_eq!(got.len(), 5);
             assert_eq!(got[0].x, i * 10);
             assert_eq!(got[4].x, i * 10 + 4);
         }
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Replace a node through `writer` while streaming its old contents,
+    /// as the merge does: the old data must stay readable until `finish`.
+    fn check_streamed_rewrite(store: &dyn NodeStore) {
+        let key = VoxelKey {
+            level: 5,
+            x: 1,
+            y: 1,
+            z: 1,
+        };
+        store
+            .write(&key, &[sample_point(1), sample_point(2), sample_point(3)])
+            .unwrap();
+
+        let mut w = store.writer(&key).unwrap();
+        let mut seen = Vec::new();
+        store
+            .stream(&key, &mut |p| {
+                seen.push(p.x);
+                // Keep every point but the first, in two appends.
+                if p.x > 1 {
+                    w.append(&[p])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, vec![1, 2, 3]);
+        // Old data still visible until finish.
+        assert_eq!(store.count(&key).unwrap(), 3);
+        w.finish().unwrap();
+
+        let got: Vec<i32> = read_all(store, &key).iter().map(|p| p.x).collect();
+        assert_eq!(got, vec![2, 3]);
+        assert_eq!(store.count(&key).unwrap(), 2);
+    }
+
+    #[test]
+    fn file_store_streamed_rewrite() {
+        let tmp = std::env::temp_dir().join(format!("copc_test_file_rw_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        check_streamed_rewrite(&FileNodeStore::new(tmp.clone(), 0, TempCompression::None));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn packed_store_streamed_rewrite() {
+        let tmp = std::env::temp_dir().join(format!("copc_test_packed_rw_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        check_streamed_rewrite(&PackedNodeStore::new(&tmp, 0, TempCompression::Lz4, 2).unwrap());
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

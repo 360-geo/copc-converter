@@ -76,7 +76,7 @@ scripts/ci/memory-limits.sh gating         # converts synthetic inputs in 1 GB /
 scripts/ci/memory-limits.sh known-issues   # inputs known to exceed the limit today; reported, never fails
 ```
 
-`memory-limits.sh` needs a Linux binary (`BIN=`) plus Docker and PDAL. On macOS, build one with `docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target/linux-docker -e RUSTFLAGS="" rust:1 cargo build --release`. Once a memory fix lands, move its case from `known-issues` to `gating`.
+`memory-limits.sh` needs a Linux binary (`BIN=`), the host-built `examples/rechunk_laz` (`RECHUNK=`, writes LAZ files with one huge chunk), Docker and PDAL. On macOS, build one with `docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target/linux-docker -e RUSTFLAGS="" rust:1 cargo build --release`. Once a memory fix lands, move its case from `known-issues` to `gating`.
 
 ## Releasing
 

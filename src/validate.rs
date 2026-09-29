@@ -347,6 +347,7 @@ mod tests {
             num_extra_bytes: 0,
             point_format_id: fmt,
             gps_time_standard: true,
+            max_laz_chunk_points: 0,
         }
     }
 
@@ -372,6 +373,7 @@ mod tests {
             num_extra_bytes: num_extra,
             point_format_id: fmt,
             gps_time_standard: true,
+            max_laz_chunk_points: 0,
         }
     }
 
