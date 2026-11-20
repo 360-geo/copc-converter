@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-20
+
 ### Changed
 
 - The octree cube's minimum corner is now aligned with the data's minimum,
@@ -333,7 +335,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validation enforces an identical VLR and uniform `num_extra_bytes` across
   inputs.
 
-[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/360-geo/copc-converter/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/360-geo/copc-converter/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/360-geo/copc-converter/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/360-geo/copc-converter/compare/v0.13.0...v0.14.0
