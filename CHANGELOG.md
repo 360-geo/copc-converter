@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The octree cube's minimum corner is now aligned with the data's minimum,
+  as untwine/PDAL and PotreeConverter do, instead of the cube being centred
+  on the data ([#31](https://github.com/360-geo/copc-converter/issues/31)).
+  For flat datasets the centred cube's split planes cut through the data
+  at every coarse level, so a zoomed-out view loaded two or more nodes per
+  region instead of one. On a 208M-point mobile-mapping recording, levels
+  0–5 now take a third fewer nodes and ~35% fewer points and bytes; total
+  size and conversion time are unchanged.
+
 ## [0.16.0] - 2026-09-29
 
 ### Fixed

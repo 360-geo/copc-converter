@@ -1062,16 +1062,20 @@ impl Bounds {
         }
     }
 
-    /// Cube that contains this AABB, padded by one scale unit per axis.
+    /// Cube that contains this AABB, padded by one scale unit per axis, with
+    /// its minimum corner at the box's minimum (less the pad).
+    ///
+    /// Aligning the minimum corner, as untwine/PDAL and PotreeConverter do,
+    /// keeps an axis shorter than the cube (typically the vertical of flat
+    /// GIS data) from being cut in half by the first split planes: centred,
+    /// the data straddles them at every coarse level, so a zoomed-out view
+    /// needs two or more nodes per region instead of one (issue #31).
     ///
     /// Readers reconstruct node bounds with float arithmetic (e.g.
     /// `cx − halfsize + vx × side`), which can drift by an ulp or so. Padding
     /// halfsize by one scale unit keeps the cube's outer faces far enough
     /// from the extreme points that no reconstruction puts them outside.
     pub fn to_cube(&self, scale_x: f64, scale_y: f64, scale_z: f64) -> (f64, f64, f64, f64) {
-        let cx = (self.min_x + self.max_x) / 2.0;
-        let cy = (self.min_y + self.max_y) / 2.0;
-        let cz = (self.min_z + self.max_z) / 2.0;
         let scale_pad = scale_x.max(scale_y).max(scale_z);
         let half = ((self.max_x - self.min_x)
             .max(self.max_y - self.min_y)
@@ -1079,6 +1083,9 @@ impl Bounds {
             / 2.0
             + scale_pad;
         let half = half * 1.0001; // tiny relative epsilon on top
+        let cx = self.min_x - scale_pad + half;
+        let cy = self.min_y - scale_pad + half;
+        let cz = self.min_z - scale_pad + half;
         (cx, cy, cz, half)
     }
 }
@@ -3570,6 +3577,32 @@ mod tests {
             halfsize <= 50.05,
             "halfsize {halfsize} must stay close to half x-range"
         );
+    }
+
+    #[test]
+    fn to_cube_aligns_min_corner_and_contains_bounds() {
+        // Flat data: the cube's minimum corner sits just below the data's
+        // minimum on every axis, so the short vertical extent stays in the
+        // lowest octant instead of straddling the first split (issue #31).
+        let mut b = Bounds::empty();
+        b.expand_with(184000.0, 426417.72, -13.11);
+        b.expand_with(184100.0, 426450.0, -5.0);
+        let scale = 0.01;
+        let (cx, cy, cz, half) = b.to_cube(scale, scale, scale);
+        for (c, lo, hi) in [
+            (cx, b.min_x, b.max_x),
+            (cy, b.min_y, b.max_y),
+            (cz, b.min_z, b.max_z),
+        ] {
+            assert!(c - half < lo, "cube must contain min {lo}");
+            assert!(
+                lo - (c - half) <= 1.5 * scale,
+                "min corner must sit at min {lo}"
+            );
+            assert!(c + half > hi, "cube must contain max {hi}");
+        }
+        // The vertical extent fits below the level-1 split plane.
+        assert!(b.max_z < cz, "flat data must stay in the lower half");
     }
 
     #[test]
