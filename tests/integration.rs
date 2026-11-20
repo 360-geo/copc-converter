@@ -688,6 +688,19 @@ fn copc_info_matches_reference() {
         "octree must contain max_y"
     );
 
+    // Like untwine, the cube's minimum corner sits at the data's minimum,
+    // so the centre lands within a scale unit or so of the reference's.
+    for (axis, ours, theirs) in [
+        ("x", info_ours.center_x, info_ref.center_x),
+        ("y", info_ours.center_y, info_ref.center_y),
+        ("z", info_ours.center_z, info_ref.center_z),
+    ] {
+        assert!(
+            (ours - theirs).abs() < 0.05,
+            "center_{axis}: ours={ours} untwine={theirs}"
+        );
+    }
+
     // GPS time range should match
     let tol = 0.001;
     assert!(
@@ -2000,6 +2013,58 @@ fn write_grid_las(path: &Path, patch: Option<(usize, f64)>) {
         bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
         std::fs::write(path, bytes).unwrap();
     }
+}
+
+#[test]
+fn flat_data_is_not_split_vertically_at_coarse_levels() {
+    // Issue #31: with the cube centred on the data, the first split planes
+    // cut flat data in half vertically, doubling the nodes a zoomed-out
+    // view must load. With the minimum corner aligned, a 7 m-tall layer in
+    // a ~100 m cube stays in the bottom row of nodes until nodes get
+    // thinner than the layer (level 3 is 12.5 m tall).
+    use las::point::Format;
+    use las::{Builder, Point, Writer};
+
+    let input = Path::new("tests/data/test_flat_input.las");
+    let output = Path::new("tests/data/test_flat.copc.laz");
+    // A million points (enough to subdivide below level 1) on a
+    // 100 m x 100 m grid, z cycling through 0..=6 m.
+    let mut builder = Builder::from((1, 4));
+    builder.point_format = Format::new(6).unwrap();
+    let mut writer = Writer::from_path(input, builder.into_header().unwrap()).unwrap();
+    for i in 0..1_000_000u32 {
+        writer
+            .write_point(Point {
+                x: f64::from(i % 1000) * 0.1,
+                y: f64::from(i / 1000) * 0.1,
+                z: f64::from(i % 7),
+                return_number: 1,
+                number_of_returns: 1,
+                gps_time: Some(f64::from(i)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+    run_converter(input, output);
+    let deepest = read_hierarchy(&read_file(output))
+        .iter()
+        .map(|e| e.key.level)
+        .max()
+        .unwrap();
+    assert!(deepest >= 2, "test input must subdivide below level 1");
+    let hier = read_hierarchy(&read_file(output));
+    let stacked: Vec<_> = hier
+        .iter()
+        .filter(|e| (1..=3).contains(&e.key.level) && e.key.z != 0)
+        .map(|e| e.key.clone())
+        .collect();
+    assert!(
+        stacked.is_empty(),
+        "flat data was split vertically at coarse levels: {stacked:?}"
+    );
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
 }
 
 #[test]
