@@ -308,16 +308,10 @@ fn read_temporal_index(data: &[u8]) -> Option<(TemporalIndexHeader, Vec<Temporal
 // ---------------------------------------------------------------------------
 
 fn converter_bin() -> std::path::PathBuf {
-    // cargo test builds the binary in the same target dir
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    path.push("copc_converter");
-    path
+    // Cargo builds the binary for integration tests and passes its path in;
+    // the test executable's own location says nothing about where it is
+    // (Cargo 1.100 moved test executables into a separate build directory).
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_copc_converter"))
 }
 
 fn run_converter(input: &Path, output: &Path) {
