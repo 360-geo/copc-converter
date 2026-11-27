@@ -78,11 +78,12 @@ struct Args {
     #[arg(long, value_enum, default_value_t = NodeStorageArg::Files)]
     node_storage: NodeStorageArg,
 
-    /// Write the CRS in this WKT file into the output instead of the inputs'
-    /// own CRS records, which are then not compared. Coordinates are not
-    /// reprojected. For inputs that are all in one known CRS but whose
+    /// Write this CRS into the output instead of the inputs' own CRS
+    /// records, which are then not compared: `EPSG:<code>` (looked up in the
+    /// bundled EPSG registry, e.g. EPSG:28992) or a WKT file. Coordinates are
+    /// not reprojected. For inputs that are all in one known CRS but whose
     /// records disagree, are missing or are wrong.
-    #[arg(long, value_name = "WKT_FILE")]
+    #[arg(long, value_name = "EPSG:CODE|WKT_FILE")]
     assign_crs: Option<PathBuf>,
 }
 
@@ -90,6 +91,28 @@ struct Args {
 /// LAS VLR can hold, so a wrong path (say, a LAZ file) fails immediately
 /// instead of being read whole.
 const MAX_WKT_FILE_BYTES: u64 = 1 << 20;
+
+/// The WKT for `--assign-crs`: `EPSG:<code>` (any case) from the bundled
+/// EPSG registry, anything else as a WKT file. The pipeline validates and
+/// normalises the result.
+fn resolve_assign_crs(arg: &std::path::Path) -> Result<Vec<u8>> {
+    let epsg_code = arg.to_str().and_then(|s| {
+        s.get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("EPSG:"))
+            .map(|_| &s[5..])
+    });
+    let Some(code) = epsg_code else {
+        return read_wkt_file(arg);
+    };
+    let code: u16 = code
+        .trim()
+        .parse()
+        .with_context(|| format!("{arg:?} is not a valid EPSG code"))?;
+    let def = crs_definitions::from_code(code).with_context(|| {
+        format!("EPSG:{code} is not in the bundled EPSG registry; pass a WKT file instead")
+    })?;
+    Ok(def.wkt.as_bytes().to_vec())
+}
 
 /// The raw contents of a `--assign-crs` file; the pipeline validates and
 /// normalises the WKT.
@@ -551,7 +574,11 @@ fn main() -> Result<()> {
     }
 
     let input_files = collect_input_files(args.input)?;
-    let assign_wkt_crs = args.assign_crs.as_deref().map(read_wkt_file).transpose()?;
+    let assign_wkt_crs = args
+        .assign_crs
+        .as_deref()
+        .map(resolve_assign_crs)
+        .transpose()?;
 
     let output = if args.output.is_dir() {
         args.output.join("output.copc.laz")

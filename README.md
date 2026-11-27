@@ -68,7 +68,7 @@ copc_converter ./tiles/ merged.copc.laz
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
 | `--temp-compression` | Compress scratch temp files: `none` or `lz4` | `none` |
 | `--node-storage` | Per-node temp layout: `files` or `packed` | `files` |
-| `--assign-crs` | WKT file whose CRS the output carries instead of the inputs' own records, which are then not compared. Labels the coordinates; does not reproject them | inputs' CRS |
+| `--assign-crs` | CRS the output carries instead of the inputs' own records, which are then not compared: `EPSG:<code>` (e.g. `EPSG:28992`, looked up in a bundled registry of ~7,500 EPSG codes, compound ones included) or a WKT file. Labels the coordinates; does not reproject them | inputs' CRS |
 
 #### Temp file compression and node storage layout
 
