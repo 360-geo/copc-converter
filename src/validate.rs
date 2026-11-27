@@ -73,6 +73,42 @@ fn crs_kinds_compatible(a: CrsKind, b: CrsKind, canonical_wkt: Option<&[u8]>) ->
     }
 }
 
+/// Largest WKT the output can hold: a VLR payload's length is a u16.
+const MAX_WKT_BYTES: usize = u16::MAX as usize;
+
+/// Normalise a caller-assigned WKT CRS the way LAS 1.4 stores it: without
+/// a UTF-8 byte-order mark or surrounding whitespace/NULs, NUL-terminated.
+/// Rejected up front, before any point is read: empty or non-UTF-8 content,
+/// text that doesn't open with a WKT keyword (`PROJCRS[`, `COMPD_CS[`, …),
+/// and WKT too long for a VLR, which would otherwise only fail when the
+/// writer starts, at the end of the conversion.
+pub(crate) fn normalize_assigned_wkt(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("assigned CRS is not UTF-8 text"))?
+        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
+    anyhow::ensure!(!text.is_empty(), "assigned CRS is empty");
+    let keyword = text.split(['[', '(']).next().unwrap_or("");
+    anyhow::ensure!(
+        text.len() > keyword.len()
+            && !keyword.is_empty()
+            && keyword
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+        "assigned CRS is not WKT (expected e.g. PROJCRS[...]): {:?}",
+        text.chars().take(40).collect::<String>()
+    );
+    let mut wkt = Vec::with_capacity(text.len() + 1);
+    wkt.extend_from_slice(text.as_bytes());
+    wkt.push(0);
+    anyhow::ensure!(
+        wkt.len() <= MAX_WKT_BYTES,
+        "assigned CRS is {} bytes; a LAS VLR holds at most {MAX_WKT_BYTES}",
+        wkt.len()
+    );
+    Ok(wkt)
+}
+
 /// Check that all scanned files agree on CRS and point format,
 /// and derive the COPC output point format.
 ///
@@ -91,7 +127,7 @@ pub fn validate(
     // from the registry. The vertical component (if any) is discarded since
     // `crs-definitions` only covers horizontal codes.
     let canonical_wkt = match (assigned_wkt, canonical_wkt) {
-        (Some(assigned), _) => Some(assigned.to_vec()),
+        (Some(assigned), _) => Some(normalize_assigned_wkt(assigned)?),
         (None, Some(w)) => Some(w),
         (None, None) => results
             .iter()
@@ -500,7 +536,7 @@ mod tests {
             Some(EPSG3006_WKT),
         )
         .unwrap();
-        assert_eq!(v.wkt_crs.as_deref(), Some(EPSG3006_WKT));
+        assert_eq!(v.wkt_crs, Some([EPSG3006_WKT, b"\0"].concat()));
     }
 
     /// The assigned CRS replaces the one synthesized from GeoTIFF keys too.
@@ -509,7 +545,44 @@ mod tests {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7)];
         let v = validate(&files, &results, None, None, None, Some(WGS84_WKT)).unwrap();
-        assert_eq!(v.wkt_crs.as_deref(), Some(WGS84_WKT));
+        assert_eq!(v.wkt_crs, Some([WGS84_WKT, b"\0"].concat()));
+    }
+
+    /// Library callers get the same stored WKT as the CLI: no BOM or
+    /// surrounding whitespace/NULs, NUL-terminated.
+    #[test]
+    fn assigned_wkt_is_normalised() {
+        let expected = [WGS84_WKT, b"\0"].concat();
+        for input in [
+            WGS84_WKT.to_vec(),
+            [WGS84_WKT, b"\0"].concat(),
+            [b"\xEF\xBB\xBF".as_slice(), WGS84_WKT, b"\r\n"].concat(),
+            [b"  \n".as_slice(), WGS84_WKT, b"\n\0\0"].concat(),
+        ] {
+            assert_eq!(normalize_assigned_wkt(&input).unwrap(), expected);
+        }
+    }
+
+    /// Bad assigned CRS bytes are refused before any point is read.
+    #[test]
+    fn assigned_wkt_rejects_what_cannot_be_a_crs() {
+        for bad in [
+            b"".to_vec(),
+            b" \n\0".to_vec(),
+            b"EPSG:28992".to_vec(),
+            b"{\"type\": \"ProjectedCRS\"}".to_vec(),
+            vec![0x4c, 0x41, 0x53, 0x46, 0xff, 0xfe],
+            [b"PROJCRS[\"x\",".as_slice(), &vec![b'a'; 70_000], b"]"].concat(),
+        ] {
+            assert!(
+                normalize_assigned_wkt(&bad).is_err(),
+                "{:?}",
+                &bad[..bad.len().min(20)]
+            );
+        }
+        let files = vec![PathBuf::from("a.laz")];
+        let results = vec![make_result(None, 7)];
+        assert!(validate(&files, &results, None, None, None, Some(b"EPSG:28992")).is_err());
     }
 
     /// Assigning a CRS lifts only the CRS comparison.

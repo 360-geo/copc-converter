@@ -256,8 +256,9 @@ pub struct PipelineConfig {
     /// compared nor carried over, so inputs whose records disagree, are
     /// missing or are wrong still merge. Coordinates are never reprojected:
     /// this only labels them. Use it when the caller knows which CRS every
-    /// input is in. The bytes are written as given; LAS 1.4 asks for a
-    /// NUL-terminated string.
+    /// input is in. `validate` stores it as LAS 1.4 asks (trimmed,
+    /// NUL-terminated) and rejects empty or non-WKT bytes and WKT longer than
+    /// a VLR can hold.
     pub assign_wkt_crs: Option<Vec<u8>>,
 }
 
