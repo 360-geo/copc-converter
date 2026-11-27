@@ -15,6 +15,7 @@
 //!     chunk_target_override: None,
 //!     temp_compression: copc_converter::TempCompression::None,
 //!     node_storage: copc_converter::NodeStorage::Files,
+//!     assign_wkt_crs: None,
 //! };
 //! let files = copc_converter::collect_input_files("input.laz".into()).unwrap();
 //!
@@ -249,6 +250,15 @@ pub struct PipelineConfig {
     pub temp_compression: TempCompression,
     /// Storage layout for per-node point data during build.
     pub node_storage: NodeStorage,
+    /// WKT CRS to write into the output instead of the inputs' own CRS.
+    ///
+    /// When set, the inputs' CRS records (WKT or GeoTIFF) are neither
+    /// compared nor carried over, so inputs whose records disagree, are
+    /// missing or are wrong still merge. Coordinates are never reprojected:
+    /// this only labels them. Use it when the caller knows which CRS every
+    /// input is in. The bytes are written as given; LAS 1.4 asks for a
+    /// NUL-terminated string.
+    pub assign_wkt_crs: Option<Vec<u8>>,
 }
 
 impl PipelineConfig {
@@ -310,6 +320,7 @@ impl Pipeline<Scanned> {
     }
 
     /// Validate that all input files are consistent (CRS, point format).
+    /// The CRS is not compared when [`PipelineConfig::assign_wkt_crs`] is set.
     pub fn validate(mut self) -> Result<Pipeline<Validated>> {
         info!("=== Validating inputs ===");
         let validated = validate::validate(
@@ -318,6 +329,7 @@ impl Pipeline<Scanned> {
             self.inner.canonical_wkt.take(),
             self.inner.canonical_extra_bytes_vlr.take(),
             self.inner.config.temporal_index,
+            self.inner.config.assign_wkt_crs.as_deref(),
         )?;
         self.inner.validated = Some(validated);
         Ok(Pipeline {

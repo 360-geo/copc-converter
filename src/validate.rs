@@ -75,20 +75,25 @@ fn crs_kinds_compatible(a: CrsKind, b: CrsKind, canonical_wkt: Option<&[u8]>) ->
 
 /// Check that all scanned files agree on CRS and point format,
 /// and derive the COPC output point format.
+///
+/// With `assigned_wkt` the output carries that CRS and the inputs' CRS
+/// records are not compared.
 pub fn validate(
     input_files: &[PathBuf],
     results: &[ScanResult],
     canonical_wkt: Option<Vec<u8>>,
     canonical_extra_bytes_vlr: Option<Vec<u8>>,
     temporal_index: Option<u32>,
+    assigned_wkt: Option<&[u8]>,
 ) -> crate::Result<ValidatedInputs> {
-    // If no input file carried a WKT CRS but at least one carried a
-    // GeoTIFF EPSG, synthesize a canonical WKT from the registry. The
-    // vertical component (if any) is discarded since `crs-definitions`
-    // only covers horizontal codes.
-    let canonical_wkt = match canonical_wkt {
-        Some(w) => Some(w),
-        None => results
+    // An assigned CRS wins. Otherwise, if no input file carried a WKT CRS
+    // but at least one carried a GeoTIFF EPSG, synthesize a canonical WKT
+    // from the registry. The vertical component (if any) is discarded since
+    // `crs-definitions` only covers horizontal codes.
+    let canonical_wkt = match (assigned_wkt, canonical_wkt) {
+        (Some(assigned), _) => Some(assigned.to_vec()),
+        (None, Some(w)) => Some(w),
+        (None, None) => results
             .iter()
             .find_map(|r| match r.crs {
                 Some(CrsKind::GeoTiffEpsg(h, v)) => Some((h, v)),
@@ -125,7 +130,7 @@ pub fn validate(
 
     // First pass: CRS + point format consistency.
     for (i, r) in results.iter().enumerate() {
-        if i != crs_file_index {
+        if assigned_wkt.is_none() && i != crs_file_index {
             let (equal, dropped_vertical) = match (reference_crs, r.crs) {
                 (None, None) => (true, false),
                 (Some(a), Some(b)) => crs_kinds_compatible(a, b, canonical_wkt.as_deref()),
@@ -310,6 +315,8 @@ mod tests {
     const WGS84_WKT: &[u8] = br#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]]"#;
     const EPSG3006_WKT: &[u8] = br#"PROJCRS["SWEREF99 TM",BASEGEOGCRS["SWEREF99",DATUM["SWEREF99",ELLIPSOID["GRS 1980",6378137,298.257222101,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4619]],CONVERSION["SWEREF99 TM",METHOD["Transverse Mercator",ID["EPSG",9807]],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",15,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.9996,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",500000,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],CS[Cartesian,2],AXIS["northing (N)",north,ORDER[1],LENGTHUNIT["metre",1]],AXIS["easting (E)",east,ORDER[2],LENGTHUNIT["metre",1]],USAGE[SCOPE["Topographic mapping (medium and small scale)."],AREA["Sweden - onshore and offshore."],BBOX[54.96,10.03,69.07,24.17]],ID["EPSG",3006]]"#;
 
+    const RD_NEW_WKT: &[u8] = br#"PROJCS["Amersfoort / RD New",GEOGCS["Amersfoort",DATUM["Amersfoort",SPHEROID["Bessel 1841",6377397.155,299.1528128,AUTHORITY["EPSG","7004"]],AUTHORITY["EPSG","6289"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4289"]],PROJECTION["Oblique_Stereographic"],PARAMETER["latitude_of_origin",52.1561605555556],PARAMETER["central_meridian",5.38763888888889],PARAMETER["scale_factor",0.9999079],PARAMETER["false_easting",155000],PARAMETER["false_northing",463000],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH],AUTHORITY["EPSG","28992"]]"#;
+
     /// Build a minimal one-field Extra Bytes VLR payload with the given
     /// data type and per-axis min/max. Mirrors the helper in
     /// `extra_bytes::tests`, kept here so the validate tests can
@@ -381,7 +388,7 @@ mod tests {
     fn validate_single_file() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 3)];
-        let v = validate(&files, &results, None, None, None).unwrap();
+        let v = validate(&files, &results, None, None, None, None).unwrap();
         assert_eq!(v.point_format, 7);
         assert!(v.wkt_crs.is_none());
         assert!(v.extra_bytes_vlr.is_none());
@@ -396,7 +403,7 @@ mod tests {
             make_result(Some(CrsKind::WktHash(h)), 8),
             make_result(Some(CrsKind::WktHash(h)), 8),
         ];
-        let v = validate(&files, &results, Some(WGS84_WKT.to_vec()), None, None).unwrap();
+        let v = validate(&files, &results, Some(WGS84_WKT.to_vec()), None, None, None).unwrap();
         assert_eq!(v.point_format, 8);
         assert_eq!(v.wkt_crs.as_deref(), Some(WGS84_WKT));
     }
@@ -408,7 +415,15 @@ mod tests {
             make_result(Some(CrsKind::WktHash(bytes_hash(EPSG3006_WKT))), 7),
             make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7),
         ];
-        let v = validate(&files, &results, Some(EPSG3006_WKT.to_vec()), None, None).unwrap();
+        let v = validate(
+            &files,
+            &results,
+            Some(EPSG3006_WKT.to_vec()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(v.wkt_crs.as_deref(), Some(EPSG3006_WKT));
     }
 
@@ -421,7 +436,15 @@ mod tests {
         ];
         // canonical_wkt comes from the WKT file (file 1), even though the
         // GeoTIFF file is listed first.
-        let v = validate(&files, &results, Some(EPSG3006_WKT.to_vec()), None, None).unwrap();
+        let v = validate(
+            &files,
+            &results,
+            Some(EPSG3006_WKT.to_vec()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(v.wkt_crs.as_deref(), Some(EPSG3006_WKT));
     }
 
@@ -432,7 +455,7 @@ mod tests {
             make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7),
             make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7),
         ];
-        let v = validate(&files, &results, None, None, None).unwrap();
+        let v = validate(&files, &results, None, None, None, None).unwrap();
         // The registry returns *some* WKT for EPSG:3006; we don't pin
         // the exact bytes (depends on crs-definitions version).
         assert!(v.wkt_crs.is_some());
@@ -447,15 +470,83 @@ mod tests {
             make_result(Some(CrsKind::WktHash(bytes_hash(WGS84_WKT))), 7),
             make_result(Some(CrsKind::WktHash(bytes_hash(EPSG3006_WKT))), 7),
         ];
-        let err = validate(&files, &results, Some(WGS84_WKT.to_vec()), None, None).unwrap_err();
+        let err =
+            validate(&files, &results, Some(WGS84_WKT.to_vec()), None, None, None).unwrap_err();
         assert!(matches!(err, Error::CrsMismatch { .. }));
+    }
+
+    /// An assigned CRS is what the output carries, whatever the inputs say:
+    /// records that disagree, a file without one, a GeoTIFF key.
+    #[test]
+    fn validate_assigned_crs_ignores_the_inputs_records() {
+        let files = vec![
+            PathBuf::from("a.laz"),
+            PathBuf::from("b.laz"),
+            PathBuf::from("c.laz"),
+            PathBuf::from("d.laz"),
+        ];
+        let results = vec![
+            make_result(Some(CrsKind::WktHash(bytes_hash(WGS84_WKT))), 7),
+            make_result(Some(CrsKind::WktHash(bytes_hash(EPSG3006_WKT))), 7),
+            make_result(None, 7),
+            make_result(Some(CrsKind::GeoTiffEpsg(28992, None)), 7),
+        ];
+        let v = validate(
+            &files,
+            &results,
+            Some(WGS84_WKT.to_vec()),
+            None,
+            None,
+            Some(EPSG3006_WKT),
+        )
+        .unwrap();
+        assert_eq!(v.wkt_crs.as_deref(), Some(EPSG3006_WKT));
+    }
+
+    /// The assigned CRS replaces the one synthesized from GeoTIFF keys too.
+    #[test]
+    fn validate_assigned_crs_replaces_geotiff_keys() {
+        let files = vec![PathBuf::from("a.laz")];
+        let results = vec![make_result(Some(CrsKind::GeoTiffEpsg(3006, None)), 7)];
+        let v = validate(&files, &results, None, None, None, Some(WGS84_WKT)).unwrap();
+        assert_eq!(v.wkt_crs.as_deref(), Some(WGS84_WKT));
+    }
+
+    /// Assigning a CRS lifts only the CRS comparison.
+    #[test]
+    fn validate_assigned_crs_still_compares_point_formats() {
+        let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
+        let results = vec![make_result(None, 7), make_result(None, 0)];
+        let err = validate(&files, &results, None, None, None, Some(WGS84_WKT)).unwrap_err();
+        assert!(matches!(err, Error::PointFormatMismatch { .. }));
+    }
+
+    /// RD New (EPSG:28992) as WKT beside the same code as GeoTIFF keys: the
+    /// trailing-code parse must read all five digits.
+    #[test]
+    fn validate_crs_wkt_and_geotiff_with_a_five_digit_code() {
+        let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
+        let results = vec![
+            make_result(Some(CrsKind::WktHash(bytes_hash(RD_NEW_WKT))), 7),
+            make_result(Some(CrsKind::GeoTiffEpsg(28992, None)), 7),
+        ];
+        let v = validate(
+            &files,
+            &results,
+            Some(RD_NEW_WKT.to_vec()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v.wkt_crs.as_deref(), Some(RD_NEW_WKT));
     }
 
     #[test]
     fn validate_format_mismatch() {
         let files = vec![PathBuf::from("a.laz"), PathBuf::from("b.laz")];
         let results = vec![make_result(None, 3), make_result(None, 7)];
-        let err = validate(&files, &results, None, None, None).unwrap_err();
+        let err = validate(&files, &results, None, None, None, None).unwrap_err();
         assert!(matches!(err, Error::PointFormatMismatch { .. }));
     }
 
@@ -463,7 +554,7 @@ mod tests {
     fn validate_temporal_index_requires_gps_time() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 0)];
-        let err = validate(&files, &results, None, None, Some(1000)).unwrap_err();
+        let err = validate(&files, &results, None, None, Some(1000), None).unwrap_err();
         assert!(matches!(err, Error::NoGpsTime { .. }));
     }
 
@@ -471,7 +562,7 @@ mod tests {
     fn validate_temporal_index_with_gps_time() {
         let files = vec![PathBuf::from("a.laz")];
         let results = vec![make_result(None, 1)];
-        let v = validate(&files, &results, None, None, Some(1000)).unwrap();
+        let v = validate(&files, &results, None, None, Some(1000), None).unwrap();
         assert_eq!(v.point_format, 6);
     }
 
@@ -484,7 +575,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 8, 3),
             make_result_with_extras(None, parsed_b, 8, 3),
         ];
-        let v = validate(&files, &results, None, Some(canonical), None).unwrap();
+        let v = validate(&files, &results, None, Some(canonical), None, None).unwrap();
         assert_eq!(v.num_extra_bytes, 8);
         let merged = ParsedExtraBytes::parse(v.extra_bytes_vlr.as_ref().unwrap()).unwrap();
         assert_eq!(merged.stats[0].min[0], -1.0);
@@ -504,7 +595,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 8, 3),
             make_result_with_extras(None, parsed_b, 8, 3),
         ];
-        let v = validate(&files, &results, None, Some(canonical), None).unwrap();
+        let v = validate(&files, &results, None, Some(canonical), None, None).unwrap();
         let merged = ParsedExtraBytes::parse(v.extra_bytes_vlr.as_ref().unwrap()).unwrap();
         // Output stats must be the union: min from a, max from b.
         assert_eq!(merged.stats[0].min[0], -4.5);
@@ -520,7 +611,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 2, 3),
             make_result_with_extras(None, parsed_b, 4, 3),
         ];
-        let err = validate(&files, &results, None, Some(canonical), None).unwrap_err();
+        let err = validate(&files, &results, None, Some(canonical), None, None).unwrap_err();
         let Error::ExtraBytesMismatch {
             file_a,
             file_b,
@@ -553,7 +644,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 8, 3),
             make_result(None, 3), // no extras
         ];
-        let err = validate(&files, &results, None, Some(canonical), None).unwrap_err();
+        let err = validate(&files, &results, None, Some(canonical), None, None).unwrap_err();
         let Error::ExtraBytesMismatch { detail, .. } = err else {
             panic!("expected ExtraBytesMismatch");
         };
@@ -579,7 +670,7 @@ mod tests {
             make_result_with_extras(None, parsed_a, 2, 3),
             make_result_with_extras(None, parsed_b, 4, 3),
         ];
-        let err = validate(&files, &results, None, Some(canonical), None).unwrap_err();
+        let err = validate(&files, &results, None, Some(canonical), None, None).unwrap_err();
         let Error::ExtraBytesMismatch { detail, .. } = err else {
             panic!("expected ExtraBytesMismatch");
         };

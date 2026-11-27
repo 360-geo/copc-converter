@@ -77,6 +77,27 @@ struct Args {
     /// overwrites during merge leak dead space into the packs.
     #[arg(long, value_enum, default_value_t = NodeStorageArg::Files)]
     node_storage: NodeStorageArg,
+
+    /// Write the CRS in this WKT file into the output instead of the inputs'
+    /// own CRS records, which are then not compared. Coordinates are not
+    /// reprojected. For inputs that are all in one known CRS but whose
+    /// records disagree, are missing or are wrong.
+    #[arg(long, value_name = "WKT_FILE")]
+    assign_crs: Option<PathBuf>,
+}
+
+/// The WKT in `path`, NUL-terminated as LAS 1.4 asks, without the trailing
+/// whitespace a text editor leaves.
+fn read_wkt_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    let text = std::fs::read(path).with_context(|| format!("Cannot read {path:?}"))?;
+    let end = text
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace() && *b != 0)
+        .map_or(0, |i| i + 1);
+    anyhow::ensure!(end > 0, "{path:?} holds no WKT");
+    let mut wkt = text[..end].to_vec();
+    wkt.push(0);
+    Ok(wkt)
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -526,6 +547,7 @@ fn main() -> Result<()> {
     }
 
     let input_files = collect_input_files(args.input)?;
+    let assign_wkt_crs = args.assign_crs.as_deref().map(read_wkt_file).transpose()?;
 
     let output = if args.output.is_dir() {
         args.output.join("output.copc.laz")
@@ -582,6 +604,7 @@ fn main() -> Result<()> {
         chunk_target_override: args.chunk_target,
         temp_compression: args.temp_compression.into(),
         node_storage: args.node_storage.into(),
+        assign_wkt_crs,
     };
 
     let distributed = Pipeline::scan(&input_files, config)?

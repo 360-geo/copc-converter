@@ -548,6 +548,75 @@ fn mixed_gps_time_types_are_rejected() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Write a small format-6 LAS 1.4 file whose CRS record is `wkt`.
+fn write_wkt_las(path: &Path, wkt: &[u8]) {
+    let mut builder = las::Builder::from((1, 4));
+    builder.point_format = las::point::Format::new(6).unwrap();
+    builder.has_wkt_crs = true;
+    builder.vlrs.push(las::Vlr {
+        user_id: "LASF_Projection".into(),
+        record_id: 2112,
+        description: "OGC WKT".into(),
+        data: wkt.to_vec(),
+    });
+    let mut writer = las::Writer::from_path(path, builder.into_header().unwrap()).unwrap();
+    for i in 0..50 {
+        writer
+            .write_point(las::Point {
+                x: f64::from(i),
+                y: f64::from(i),
+                z: 0.0,
+                return_number: 1,
+                number_of_returns: 1,
+                gps_time: Some(f64::from(i)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+}
+
+#[test]
+fn assigned_crs_replaces_records_that_disagree() {
+    let dir = std::env::temp_dir().join(format!("copc_assign_crs_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    write_wkt_las(&dir.join("a.las"), b"LOCAL_CS[\"metre\"]\0");
+    write_wkt_las(
+        &dir.join("b.las"),
+        b"PROJCRS[\"WGS 84 / UTM zone 31N\",ID[\"EPSG\",32631]]\0",
+    );
+    let output = dir.join("out.copc.laz");
+
+    let refused = Command::new(converter_bin())
+        .arg(&dir)
+        .arg(&output)
+        .args(["--progress", "plain"])
+        .output()
+        .expect("failed to run copc_converter");
+    assert!(!refused.status.success(), "records that disagree must fail");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("CRS mismatch"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // A text editor's trailing newline is dropped and the NUL added.
+    let wkt_file = std::env::temp_dir().join(format!("copc_assign_crs_{}.wkt", std::process::id()));
+    std::fs::write(
+        &wkt_file,
+        "PROJCRS[\"Amersfoort / RD New\",ID[\"EPSG\",28992]]\n",
+    )
+    .unwrap();
+    run_converter_with_args(&dir, &output, &["--assign-crs", wkt_file.to_str().unwrap()]);
+    let data = read_file(&output);
+    assert_eq!(
+        find_vlr(&data, "LASF_Projection", 2112).as_deref(),
+        Some(&b"PROJCRS[\"Amersfoort / RD New\",ID[\"EPSG\",28992]]\0"[..])
+    );
+    let _ = std::fs::remove_file(&wkt_file);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn empty_input_writes_readable_hierarchy() {
     // Readers start at the root hierarchy entry; with no points there must
