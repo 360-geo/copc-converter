@@ -80,6 +80,7 @@ scripts/ci/memory-limits.sh known-issues   # inputs known to exceed the limit to
 
 ## Releasing
 
+0. **Check the docs first.** Read `README.md` (and this file) against everything in `## [Unreleased]`: new or changed flags in the options table and `--help`, the library example's `PipelineConfig` fields, "How it works", examples, and any benchmark numbers the changes affect. Fix them before releasing: crates.io shows the README of the published version, so a README fix after a release needs another release.
 1. Move `## [Unreleased]` entries in `CHANGELOG.md` into a new `## [X.Y.Z] - YYYY-MM-DD` section and update the link references at the bottom. Leave an empty `## [Unreleased]` heading at the top for the next cycle.
 2. Commit and push to `master`
 3. Create and push a git tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
@@ -98,4 +99,4 @@ scripts/ci/memory-limits.sh known-issues   # inputs known to exceed the limit to
 
 ## Changelog
 
-User-visible changes go in `CHANGELOG.md` under `## [Unreleased]` as part of the same commit that makes the change. Use Keep a Changelog groups (`Added`, `Changed`, `Fixed`, `Removed`, `Deprecated`, `Security`). Skip internal-only changes (refactors, test infra, dep bumps that don't affect users).
+User-visible changes go in `CHANGELOG.md` under `## [Unreleased]` as part of the same commit that makes the change, and so do the `README.md` updates they need (flags, behaviour, examples). Use Keep a Changelog groups (`Added`, `Changed`, `Fixed`, `Removed`, `Deprecated`, `Security`). Skip internal-only changes (refactors, test infra, dep bumps that don't affect users).
