@@ -1329,19 +1329,26 @@ pub fn get_epsg_from_wkt_crs_bytes(bytes: &[u8]) -> Option<(u16, Option<u16>)> {
         // EPSG codes sit at the end of the substring (e.g. `…AUTHORITY["EPSG","4326"]]`).
         // Walk backwards collecting digits; bail if we never find any in the
         // last ~10 bytes (codes are 4–5 digits starting 2–3 bytes from the back).
-        let mut code: u16 = 0;
+        // Accumulate in u32: a u16 place value overflows on the step after
+        // a fifth digit (10^5 > u16::MAX), which made every five-digit code
+        // such as EPSG:28992 unreadable.
+        let mut code: u32 = 0;
         let mut started = false;
-        let mut power: u16 = 1;
+        let mut power: u32 = 1;
         for byte in bytes.trim_ascii_end().iter().rev().take(10) {
             if byte.is_ascii_digit() {
                 started = true;
-                code = code.checked_add(power.checked_mul((byte - b'0') as u16)?)?;
+                code = code.checked_add(power.checked_mul(u32::from(byte - b'0'))?)?;
                 power = power.checked_mul(10)?;
             } else if started {
                 break;
             }
         }
-        if started { Some(code) } else { None }
+        if started {
+            u16::try_from(code).ok()
+        } else {
+            None
+        }
     }
 
     let (horizontal_part, vertical_part) = if let Some(split) = wkt.split_once("VERTCRS") {
@@ -3456,6 +3463,35 @@ impl Drop for OctreeBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epsg_codes_of_four_and_five_digits_are_read_from_wkt() {
+        assert_eq!(
+            get_epsg_from_wkt_crs_bytes(br#"GEOGCS["WGS 84",AUTHORITY["EPSG","4326"]]"#),
+            Some((4326, None))
+        );
+        // WKT1 and WKT2 spellings of RD New.
+        assert_eq!(
+            get_epsg_from_wkt_crs_bytes(
+                br#"PROJCS["Amersfoort / RD New",AUTHORITY["EPSG","28992"]]"#
+            ),
+            Some((28992, None))
+        );
+        assert_eq!(
+            get_epsg_from_wkt_crs_bytes(br#"PROJCRS["Amersfoort / RD New",ID["EPSG",28992]]"#),
+            Some((28992, None))
+        );
+        // The NUL terminator LAS 1.4 asks for.
+        assert_eq!(
+            get_epsg_from_wkt_crs_bytes(b"PROJCRS[\"ETRS89 / UTM 31N\",ID[\"EPSG\",25831]]\0"),
+            Some((25831, None))
+        );
+        // Outside the GeoTIFF key range.
+        assert_eq!(
+            get_epsg_from_wkt_crs_bytes(br#"PROJCS["x",AUTHORITY["ESRI","102100"]]"#),
+            None
+        );
+    }
 
     /// copc.js-style bounds of `index` at `depth` along one axis.
     fn stepped_bounds(center: f64, halfsize: f64, index: i32, depth: u32) -> (f64, f64) {

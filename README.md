@@ -68,6 +68,7 @@ copc_converter ./tiles/ merged.copc.laz
 | `--progress` | Progress output format: `bar`, `plain`, or `json` | `bar` |
 | `--temp-compression` | Compress scratch temp files: `none` or `lz4` | `none` |
 | `--node-storage` | Per-node temp layout: `files` or `packed` | `files` |
+| `--assign-crs` | WKT file whose CRS the output carries instead of the inputs' own records, which are then not compared. Labels the coordinates; does not reproject them | inputs' CRS |
 
 #### Temp file compression and node storage layout
 
@@ -138,6 +139,7 @@ let config = PipelineConfig {
     chunk_target_override: None,
     temp_compression: TempCompression::None,
     node_storage: NodeStorage::Files,
+    assign_wkt_crs: None, // or Some(wkt_bytes) to label the output's CRS
 };
 
 Pipeline::scan(&files, config)?
@@ -182,7 +184,7 @@ Prints chunk count, target size, grid resolution, and per-chunk size distributio
 ## How it works
 
 1. **Scan** — reads headers from all input files in parallel to determine point count, point format, CRS (WKT or GeoTIFF), GPS time type, any LAS Extra Bytes schema, and provisional bounds.
-2. **Validate** — checks that all input files share the same CRS, point format, GPS time type, and Extra Bytes schema, and selects the appropriate COPC output format (6, 7, or 8). Per-file Extra Bytes min/max stats are merged into a single canonical VLR at this stage.
+2. **Validate** — checks that all input files share the same CRS (unless `--assign-crs` gives it), point format, GPS time type, and Extra Bytes schema, and selects the appropriate COPC output format (6, 7, or 8). Per-file Extra Bytes min/max stats are merged into a single canonical VLR at this stage.
 3. **Count** — first full pass over the input: populates an occupancy grid used by the chunk planner to carve the dataset into chunks sized to be built in memory, and measures the points' actual extents. If the input headers turn out to be inaccurate, the octree is refitted to the actual extents and the pass is repeated.
 4. **Distribute** — second full pass over the input: streams every point (including any trailing Extra Bytes) into its chunk's scratch file on disk, bounded by the configured memory budget.
 5. **Build** — each chunk's sub-octree is built in parallel, then merged at coarse levels up to a single global root, thinning points at each level to produce multi-resolution LODs. Data too dense to split within the budget (e.g. coincident points) is streamed rather than loaded, and the merge samples one child node at a time.

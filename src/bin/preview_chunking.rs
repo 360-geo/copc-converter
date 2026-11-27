@@ -365,6 +365,7 @@ fn main() -> Result<()> {
         chunk_target_override: None,
         temp_compression: copc_converter::TempCompression::None,
         node_storage: copc_converter::NodeStorage::Files,
+        assign_wkt_crs: None,
     };
 
     // Run scan + validate via the standard pipeline so the analyzer sees the

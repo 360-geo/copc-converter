@@ -51,7 +51,7 @@ Pipeline::scan(&files, config)?  -> Pipeline<Scanned>
 - **Point formats**: automatically selects LAS point format 6, 7, or 8 based on input — uses the `las` crate for reading and `laz` for compression
 - **Parallelism**: uses rayon throughout for reading, octree building, and LAZ compression
 - **LOD thinning**: 128 grid cells per axis (matching untwine's CellCount) for good progressive rendering, declared in the spec-mandated `CopcInfo.spacing` as `2 × halfsize / 128`
-- **CRS detection**: WKT VLRs are preferred; if absent, GeoTIFF EPSG codes are translated to WKT via the `crs-definitions` registry. Cross-format mismatches are caught via a best-effort trailing-EPSG parse on the WKT side
+- **CRS detection**: WKT VLRs are preferred; if absent, GeoTIFF EPSG codes are translated to WKT via the `crs-definitions` registry. Cross-format mismatches are caught via a best-effort trailing-EPSG parse on the WKT side. `PipelineConfig::assign_wkt_crs` (`--assign-crs`) skips the comparison and writes the caller's WKT instead
 - **LAS Extra Bytes pass-through**: per-point trailing bytes and the Extra Bytes VLR are preserved end-to-end. Validation compares only the *structural* parts of the schema across inputs (field count, types, scale/offset) — per-file min/max/no_data stats are merged honestly (union of mins and maxes) into the output VLR
 - **Node storage backends**: build-stage point data goes to either one file per octree node (`FileNodeStore`, default) or a small number of append-only pack files with an in-memory index (`PackedNodeStore`) when filesystem inode budgets matter
 - **Temp compression**: scratch batches can be wrapped in self-contained LZ4 frames (`TempCompression::Lz4`) to cut disk footprint on network filesystems
