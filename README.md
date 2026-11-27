@@ -12,7 +12,7 @@ A fast, memory-efficient converter that turns LAS/LAZ point cloud files into [CO
 - Out-of-core processing with a configurable memory budget — handles datasets larger than RAM
 - Stays within its memory limit even on adversarial input (millions of coincident points, volumetric data, very large Extra Bytes, LAZ files written as one huge chunk); in a container the limit is detected from its cgroup
 - Parallel reading, octree construction, and LAZ compression via rayon
-- Preserves WKT and GeoTIFF CRS from input files (GeoTIFF EPSG codes are translated to WKT for the output)
+- Preserves WKT and GeoTIFF CRS from input files (GeoTIFF EPSG codes are translated to WKT for the output), or labels the output with a CRS you give (`--assign-crs EPSG:28992`) when the inputs' own records are missing, wrong or disagree
 - Preserves LAS Extra Bytes (per-point user-defined attributes such as classification probabilities, intensity ratios, or producer-specific labels) end-to-end, with per-file min/max stats merged honestly into the output VLR
 - Optional temporal index for GPS-time-based filtering ([spec](https://github.com/360-geo/copc/blob/master/copc-temporal/docs/temporal-index-spec.md))
 - Output checked in CI: every test conversion is decoded and validated against the COPC 1.0 / LAS 1.4 specs, and also read by PDAL and [copc-validator](https://github.com/hobuinc/copc-validator)
@@ -91,8 +91,10 @@ shape the temp directory's footprint:
 
 Both flags can be combined freely.
 
-**Measured on a 750M-point / 5.0 GB LAZ input** (three overlapping mobile-mapping
-recordings, point format 7), 32 GB limit (24 GB budget), 10-core Apple M1 Pro with local NVMe:
+**Measured with v0.16.0 on a 750M-point / 5.0 GB LAZ input** (three overlapping
+mobile-mapping recordings, point format 7), 32 GB limit (24 GB budget), 10-core Apple
+M1 Pro with local NVMe. Later releases change the octree layout slightly, so exact
+counts differ; the trade-offs don't:
 
 | `--node-storage` | `--temp-compression` | wall   | peak inodes | peak temp bytes | output   |
 |------------------|----------------------|--------|-------------|-----------------|----------|
@@ -119,6 +121,10 @@ copc_converter ./my_survey/ survey.copc.laz --memory-limit 8G
 # With temporal index (useful for multi-pass mobile mapping data),
 # sampling every 1000th point
 copc_converter ./my_survey/ survey.copc.laz --temporal-index 1000
+
+# Tiles known to be in RD New whose own CRS records are missing or disagree:
+# label the output instead of failing on the mismatch (no reprojection)
+copc_converter ./tiles/ merged.copc.laz --assign-crs EPSG:28992
 ```
 
 ## Library usage
@@ -185,7 +191,7 @@ Prints chunk count, target size, grid resolution, and per-chunk size distributio
 
 1. **Scan** — reads headers from all input files in parallel to determine point count, point format, CRS (WKT or GeoTIFF), GPS time type, any LAS Extra Bytes schema, and provisional bounds.
 2. **Validate** — checks that all input files share the same CRS (unless `--assign-crs` gives it), point format, GPS time type, and Extra Bytes schema, and selects the appropriate COPC output format (6, 7, or 8). Per-file Extra Bytes min/max stats are merged into a single canonical VLR at this stage.
-3. **Count** — first full pass over the input: populates an occupancy grid used by the chunk planner to carve the dataset into chunks sized to be built in memory, and measures the points' actual extents. If the input headers turn out to be inaccurate, the octree is refitted to the actual extents and the pass is repeated.
+3. **Count** — first full pass over the input: populates an occupancy grid used by the chunk planner to carve the dataset into chunks sized to be built in memory, and measures the points' actual extents. If the input headers turn out to be inaccurate, the octree is refitted to the actual extents and the pass is repeated. The octree cube's minimum corner is aligned with the data's minimum, as untwine and PotreeConverter do, so flat datasets aren't split vertically at coarse levels.
 4. **Distribute** — second full pass over the input: streams every point (including any trailing Extra Bytes) into its chunk's scratch file on disk, bounded by the configured memory budget.
 5. **Build** — each chunk's sub-octree is built in parallel, then merged at coarse levels up to a single global root, thinning points at each level to produce multi-resolution LODs. Data too dense to split within the budget (e.g. coincident points) is streamed rather than loaded, and the merge samples one child node at a time.
 6. **Write** — sorts each node's points by GPS time, compresses nodes in parallel in batches sized to the memory budget, and writes a single COPC file with a paged hierarchy EVLR for spatial indexing. The header records the points' actual extents.
