@@ -1332,19 +1332,28 @@ pub fn get_epsg_from_wkt_crs_bytes(bytes: &[u8]) -> Option<(u16, Option<u16>)> {
         // Accumulate in u32: a u16 place value overflows on the step after
         // a fifth digit (10^5 > u16::MAX), which made every five-digit code
         // such as EPSG:28992 unreadable.
+        // Trailing NULs count as padding like whitespace (LAS writers pad
+        // the VLR), and a number the window cuts off is no number at all:
+        // reading its tail would yield a wrong code.
+        let end = bytes
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace() && *b != 0)?
+            + 1;
         let mut code: u32 = 0;
         let mut started = false;
+        let mut finished = false;
         let mut power: u32 = 1;
-        for byte in bytes.trim_ascii_end().iter().rev().take(10) {
+        for byte in bytes[..end].iter().rev().take(10) {
             if byte.is_ascii_digit() {
                 started = true;
                 code = code.checked_add(power.checked_mul(u32::from(byte - b'0'))?)?;
                 power = power.checked_mul(10)?;
             } else if started {
+                finished = true;
                 break;
             }
         }
-        if started {
+        if started && finished {
             u16::try_from(code).ok()
         } else {
             None
@@ -1365,10 +1374,35 @@ pub fn get_epsg_from_wkt_crs_bytes(bytes: &[u8]) -> Option<(u16, Option<u16>)> {
     if !EPSG_RANGE.contains(&horizontal) {
         return None;
     }
+    // Read the vertical code from the vertical element itself: in a compound
+    // CRS the text after it ends with the compound's own code (e.g. 7415 for
+    // RD New + NAP, whose vertical CRS is 5709).
     let vertical = vertical_part
-        .and_then(|s| trailing_code(s.as_bytes()))
+        .and_then(|s| trailing_code(first_wkt_element(s).as_bytes()))
         .filter(|v| EPSG_RANGE.contains(v));
     Some((horizontal, vertical))
+}
+
+/// The leading bracketed element of `s` (e.g. `["NAP height",…]` after a
+/// `VERT_CS` keyword), up to its matching close bracket; all of `s` if it is
+/// unbalanced. Brackets inside quoted names don't count.
+fn first_wkt_element(s: &str) -> &str {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '[' | '(' if !quoted => depth += 1,
+            ']' | ')' if !quoted => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &s[..=i];
+                }
+            }
+            _ => {}
+        }
+    }
+    s
 }
 
 /// Builds a COPC octree from scanned input files.
@@ -3491,6 +3525,31 @@ mod tests {
             get_epsg_from_wkt_crs_bytes(br#"PROJCS["x",AUTHORITY["ESRI","102100"]]"#),
             None
         );
+        // Padding after the WKT: a CRLF before the NUL, and runs of NULs,
+        // must neither truncate the code nor hide it.
+        for tail in ["\r\n\0", "\0\0\0\0", "\0\0\0\0\0\0\0\0", "\n\0\0\0"] {
+            let wkt = format!(r#"PROJCS["Amersfoort / RD New",AUTHORITY["EPSG","28992"]]{tail}"#);
+            assert_eq!(
+                get_epsg_from_wkt_crs_bytes(wkt.as_bytes()),
+                Some((28992, None)),
+                "tail {tail:?}"
+            );
+        }
+        // A number longer than the window is rejected, not read in part.
+        assert_eq!(
+            get_epsg_from_wkt_crs_bytes(br#"PROJCS["x",AUTHORITY["EPSG","123456789"]]"#),
+            None
+        );
+    }
+
+    #[test]
+    fn compound_wkt_vertical_code_comes_from_the_vertical_element() {
+        // WKT1 and WKT2 RD New + NAP height: the compound's own code (7415)
+        // trails the vertical CRS's (5709) and must not be read as it.
+        let wkt1 = br#"COMPD_CS["Amersfoort / RD New + NAP height",PROJCS["Amersfoort / RD New",AUTHORITY["EPSG","28992"]],VERT_CS["NAP height",VERT_DATUM["Normaal Amsterdams Peil",2005,AUTHORITY["EPSG","5109"]],AUTHORITY["EPSG","5709"]],AUTHORITY["EPSG","7415"]]"#;
+        assert_eq!(get_epsg_from_wkt_crs_bytes(wkt1), Some((28992, Some(5709))));
+        let wkt2 = br#"COMPOUNDCRS["Amersfoort / RD New + NAP height",PROJCRS["Amersfoort / RD New",ID["EPSG",28992]],VERTCRS["NAP height",VDATUM["Normaal Amsterdams Peil"],ID["EPSG",5709]],ID["EPSG",7415]]"#;
+        assert_eq!(get_epsg_from_wkt_crs_bytes(wkt2), Some((28992, Some(5709))));
     }
 
     /// copc.js-style bounds of `index` at `depth` along one axis.

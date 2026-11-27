@@ -86,18 +86,22 @@ struct Args {
     assign_crs: Option<PathBuf>,
 }
 
-/// The WKT in `path`, NUL-terminated as LAS 1.4 asks, without the trailing
-/// whitespace a text editor leaves.
+/// Largest `--assign-crs` file read: a generous multiple of the 64 KiB a
+/// LAS VLR can hold, so a wrong path (say, a LAZ file) fails immediately
+/// instead of being read whole.
+const MAX_WKT_FILE_BYTES: u64 = 1 << 20;
+
+/// The raw contents of a `--assign-crs` file; the pipeline validates and
+/// normalises the WKT.
 fn read_wkt_file(path: &std::path::Path) -> Result<Vec<u8>> {
-    let text = std::fs::read(path).with_context(|| format!("Cannot read {path:?}"))?;
-    let end = text
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace() && *b != 0)
-        .map_or(0, |i| i + 1);
-    anyhow::ensure!(end > 0, "{path:?} holds no WKT");
-    let mut wkt = text[..end].to_vec();
-    wkt.push(0);
-    Ok(wkt)
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("Cannot read {path:?}"))?
+        .len();
+    anyhow::ensure!(
+        len <= MAX_WKT_FILE_BYTES,
+        "{path:?} is {len} bytes, too large to be a WKT CRS file"
+    );
+    std::fs::read(path).with_context(|| format!("Cannot read {path:?}"))
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]

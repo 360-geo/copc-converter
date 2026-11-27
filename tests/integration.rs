@@ -613,6 +613,18 @@ fn assigned_crs_replaces_records_that_disagree() {
         find_vlr(&data, "LASF_Projection", 2112).as_deref(),
         Some(&b"PROJCRS[\"Amersfoort / RD New\",ID[\"EPSG\",28992]]\0"[..])
     );
+
+    // A Windows editor's byte-order mark and CRLF are dropped too.
+    std::fs::write(
+        &wkt_file,
+        "\u{feff}PROJCRS[\"Amersfoort / RD New\",ID[\"EPSG\",28992]]\r\n",
+    )
+    .unwrap();
+    run_converter_with_args(&dir, &output, &["--assign-crs", wkt_file.to_str().unwrap()]);
+    assert_eq!(
+        find_vlr(&read_file(&output), "LASF_Projection", 2112).as_deref(),
+        Some(&b"PROJCRS[\"Amersfoort / RD New\",ID[\"EPSG\",28992]]\0"[..])
+    );
     let _ = std::fs::remove_file(&wkt_file);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -15,14 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing or are wrong (a `LOCAL_CS`, GeoTIFF keys naming nothing) merge
   when the caller knows which CRS they are all in. Coordinates are not
   reprojected. Point format, Extra Bytes and GPS time type are still
-  compared.
+  compared. The WKT is stored trimmed (including a byte-order mark) and
+  NUL-terminated; empty or non-WKT content, or WKT too long for a LAS VLR,
+  is refused before any point is read.
+
+### Changed
+
+- **Breaking (library):** `PipelineConfig` has a new public field,
+  `assign_wkt_crs`. Code that builds it with a struct literal must add
+  `assign_wkt_crs: None`.
 
 ### Fixed
 
 - A WKT CRS ending in a five-digit EPSG code (RD New's 28992, any UTM zone)
   now matches GeoTIFF keys naming the same code. The trailing-code parse
   overflowed after the fifth digit and read no code, so those inputs were
-  refused as a CRS mismatch.
+  refused as a CRS mismatch. WKT padded with several NULs, or ending in a
+  CRLF before its NUL, is read correctly too, instead of yielding no code
+  or a truncated one.
+- For a compound CRS, the vertical EPSG code is now read from the vertical
+  CRS itself rather than from the compound's own code (e.g. 5709, not 7415,
+  for RD New + NAP height), so matching inputs no longer warn that their
+  vertical CRS differs.
 
 ## [0.17.0] - 2026-11-20
 
