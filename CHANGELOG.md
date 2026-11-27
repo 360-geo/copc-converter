@@ -9,15 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `--assign-crs <WKT_FILE>` (library: `PipelineConfig::assign_wkt_crs`)
+- `--assign-crs <EPSG:CODE|WKT_FILE>` (library: `PipelineConfig::assign_wkt_crs`)
   writes the given CRS into the output instead of the inputs' own CRS
   records, which are then not compared. Inputs whose records disagree, are
   missing or are wrong (a `LOCAL_CS`, GeoTIFF keys naming nothing) merge
   when the caller knows which CRS they are all in. Coordinates are not
   reprojected. Point format, Extra Bytes and GPS time type are still
-  compared. The WKT is stored trimmed (including a byte-order mark) and
-  NUL-terminated; empty or non-WKT content, or WKT too long for a LAS VLR,
-  is refused before any point is read.
+  compared. `EPSG:<code>` is looked up in the bundled EPSG registry (~7,500
+  codes, compound ones such as `EPSG:7415` included). The WKT is stored
+  trimmed (including a byte-order mark) and NUL-terminated; empty or
+  non-WKT content, or WKT too long for a LAS VLR, is refused before any
+  point is read.
 
 ### Changed
 

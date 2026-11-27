@@ -630,6 +630,56 @@ fn assigned_crs_replaces_records_that_disagree() {
 }
 
 #[test]
+fn assigned_crs_from_an_epsg_code() {
+    // `--assign-crs EPSG:<code>` takes the WKT from the bundled registry,
+    // any case, including compound codes; unknown or malformed codes fail
+    // before any point is read.
+    let dir = std::env::temp_dir().join(format!("copc_assign_epsg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    write_wkt_las(&dir.join("a.las"), b"LOCAL_CS[\"metre\"]\0");
+    let output = dir.join("out.copc.laz");
+
+    for (arg, code) in [("EPSG:28992", 28992u16), ("epsg:7415", 7415)] {
+        run_converter_with_args(&dir, &output, &["--assign-crs", arg]);
+        let expected = [
+            crs_definitions::from_code(code).unwrap().wkt.as_bytes(),
+            b"\0",
+        ]
+        .concat();
+        assert_eq!(
+            find_vlr(&read_file(&output), "LASF_Projection", 2112),
+            Some(expected),
+            "{arg}"
+        );
+    }
+
+    for (arg, message) in [
+        ("EPSG:1", "not in the bundled EPSG registry"),
+        ("EPSG:rd", "not a valid EPSG code"),
+    ] {
+        let result = Command::new(converter_bin())
+            .arg(&dir)
+            .arg(&output)
+            .args(["--progress", "plain", "--assign-crs", arg])
+            .output()
+            .expect("failed to run copc_converter");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{arg} must be refused");
+        assert!(
+            stderr.contains(message),
+            "{arg}: unexpected error: {stderr}"
+        );
+        // Progress (stdout) shows no stage started.
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            !stdout.contains("Scanning"),
+            "{arg} must fail before any input is read: {stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn empty_input_writes_readable_hierarchy() {
     // Readers start at the root hierarchy entry; with no points there must
     // still be one (as a zero-point node) or the file can't be opened.
