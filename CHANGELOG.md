@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-27
+
+### Changed
+
+- Documentation only, no code changes: the README (also shown on
+  crates.io) now covers `--assign-crs` with an `EPSG:<code>` example and
+  the minimum-corner octree cube from 0.17.0, and dates its storage
+  benchmark.
+
 ## [0.18.0] - 2026-11-27
 
 ### Added
@@ -370,7 +379,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validation enforces an identical VLR and uniform `num_extra_bytes` across
   inputs.
 
-[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/360-geo/copc-converter/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/360-geo/copc-converter/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/360-geo/copc-converter/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/360-geo/copc-converter/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/360-geo/copc-converter/compare/v0.15.0...v0.16.0
